@@ -1,0 +1,18 @@
+# Copyright (c) 2026, Michael Grier
+
+[package]
+name = "tpu-mcp"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "tpu-mcp"
+path = "src/main.rs"
+
+[dependencies]
+tpu         = { path = "../tpu" }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,39 @@
+{
+    "name": "tpu-mcp",
+    "displayName": "tpu-mcp",
+    "description": "MCP server for encoding-aware file I/O: read, write, replace, search, and validate files with correct handling of UTF-8, UTF-16LE/BE, Windows-1252, Shift-JIS, and CRLF/LF/CR line endings.",
+    "version": "0.1.0",
+    "publisher": "ms-azurecompute",
+    "license": "SEE LICENSE IN LICENSE",
+    "engines": {
+        "vscode": "^1.99.0"
+    },
+    "categories": [
+        "Other"
+    ],
+    "activationEvents": [
+        "onStartupFinished"
+    ],
+    "main": "./out/extension.js",
+    "contributes": {
+        "configuration": {
+            "title": "tpu-mcp",
+            "properties": {
+                "tpu-mcp.verifyDelayMs": {
+                    "type": "number",
+                    "default": 100,
+                    "description": "Delay in ms after writes for verification (set 0 with Defender exclusion)."
+                }
+            }
+        }
+    },
+    "scripts": {
+        "compile": "tsc -p ./",
+        "package": "vsce package"
+    },
+    "devDependencies": {
+        "@types/vscode": "^1.99.0",
+        "typescript": "^5.4.0",
+        "@vscode/vsce": "^3.0.0"
+    }
+}
