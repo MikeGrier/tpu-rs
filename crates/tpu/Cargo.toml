@@ -1,0 +1,37 @@
+# Copyright (c) 2026, Michael Grier
+
+[package]
+name = "tpu"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "tpu"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tpu"
+path = "src/main.rs"
+
+[dependencies]
+harrier     = "0.1.2"
+redwing     = "0.3.0"
+anstream    = { workspace = true }
+anstyle     = { workspace = true }
+clap        = { workspace = true }
+encoding_rs = "0.8"
+memmap2     = "0.9"
+regex       = "1"
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+tempfile    = "3"
+similar = "2.7.0"
+md-5 = "0.10"
+crc32fast = "1"
+globset = "0.4"
+walkdir = "2"
+
+[dev-dependencies]
+encoding_rs = "0.8"
+md-5 = "0.10"
+crc32fast = "1"
