@@ -6,6 +6,13 @@ on:
     branches: [main]
   pull_request:
 
+# Opt every JavaScript-action step into the Node.js 24 runtime ahead of
+# GitHub's June 2, 2026 forced cutover. Surfaces any action-vs-runtime
+# incompatibilities under our control rather than discovering them on the
+# day GitHub flips the default.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   encoding:
     name: encoding sanity check
