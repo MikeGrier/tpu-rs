@@ -179,7 +179,8 @@ pub fn run(
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
 
-    if !file.exists() {
+    let file_exists = file.try_exists()?;
+    if !file_exists {
         fs::create_dir_all(dir)?;
     }
 
@@ -187,7 +188,7 @@ pub fn run(
     tmp.write_all(&output_bytes)?;
     tmp.flush()?;
 
-    if file.exists() {
+    if file_exists {
         let bak = PathBuf::from(format!("{}.bak", file.display()));
         fs::rename(file, &bak)?;
         if let Err(e) = tmp.persist(file) {
