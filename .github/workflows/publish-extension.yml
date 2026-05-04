@@ -52,7 +52,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install Rust toolchain (${{ matrix.rust_target }})
         uses: dtolnay/rust-toolchain@stable
@@ -99,7 +99,7 @@ jobs:
           "Staged tpu-mcp $ver for ${{ matrix.vscode_target }}"
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
 
@@ -116,7 +116,7 @@ jobs:
         run: npx vsce package --target ${{ matrix.vscode_target }} --no-dependencies
 
       - name: Upload VSIX artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: tpu-mcp-${{ matrix.vscode_target }}
           path: crates/tpu-mcp/extension/*.vsix
@@ -134,10 +134,10 @@ jobs:
 
     steps:
       - name: Checkout (for README, vsce metadata)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: "22"
 
@@ -149,7 +149,7 @@ jobs:
         run: npm ci --no-audit --no-fund
 
       - name: Download VSIX artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: vsix
           # Each matrix leg uploaded as `tpu-mcp-<vscode_target>`; download
