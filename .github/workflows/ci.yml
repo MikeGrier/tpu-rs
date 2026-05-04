@@ -23,7 +23,12 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      # `--frozen` (= `--locked` + `--offline`) makes CI fail if Cargo would
+      # need to update Cargo.lock or hit the network for a registry refresh.
+      # CI must build the exact dependency graph that was committed; any
+      # version drift should happen in a developer's local edit, not silently
+      # in CI.
       - name: cargo build
-        run: cargo build --workspace --all-targets
+        run: cargo build --workspace --all-targets --frozen
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --frozen
