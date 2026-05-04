@@ -50,16 +50,18 @@ jobs:
         with:
           key: ${{ matrix.rust_target }}
 
-      # `--frozen` keeps CI honest: it must build the exact Cargo.lock that
-      # was committed, with no implicit registry updates.
+      # `--locked` keeps CI honest: it must build the exact Cargo.lock that
+      # was committed, with no implicit lockfile updates. (We avoid
+      # `--frozen` because it also disables network access, which would
+      # break the initial registry fetch on a cold cache.)
       - name: cargo build --release tpu-mcp
-        run: cargo build --release -p tpu-mcp --target ${{ matrix.rust_target }} --frozen
+        run: cargo build --release -p tpu-mcp --target ${{ matrix.rust_target }} --locked
 
       # tpu-mcp tests only need to run on the host architecture (x64); the
       # arm64 binary is cross-compiled and cannot execute on the runner.
       - name: cargo test tpu-mcp (host arch only)
         if: matrix.rust_target == 'x86_64-pc-windows-msvc'
-        run: cargo test -p tpu-mcp --target ${{ matrix.rust_target }} --frozen
+        run: cargo test -p tpu-mcp --target ${{ matrix.rust_target }} --locked
 
       - name: Stage binary into extension/bin/
         shell: pwsh
