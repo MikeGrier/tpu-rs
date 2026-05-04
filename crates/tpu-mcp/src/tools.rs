@@ -111,7 +111,14 @@ pub fn list() -> Value {
                  encoding (UTF-8, UTF-16LE/BE, Windows-1252, …) and line endings \
                  (LF or CRLF). For new files, UTF-8/LF is used. The original file is \
                  atomically backed up to <file>.bak before writing. Prefer this over \
-                 PowerShell Set-Content or Out-File to avoid encoding corruption.",
+                 PowerShell Set-Content or Out-File to avoid encoding corruption.\n\n\
+                 ESCAPING: 'content' is the LITERAL text to write. The JSON-RPC \
+                 transport already handles JSON string escaping; do not add a second \
+                 layer. To insert a newline put a real newline in the JSON string \
+                 (encoded by JSON as \\n on the wire). To insert the two literal \
+                 characters backslash + n, send a literal backslash followed by 'n' \
+                 (encoded by JSON as \\\\n). When in doubt, treat 'content' as if you \
+                 were typing directly into the file.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -186,7 +193,19 @@ pub fn list() -> Value {
                  $0 (whole match), $1/$2/…, $name. Use $$ for a literal dollar sign. \
                  The original file is backed up to <file>.bak before writing. \
                  Use count:true to count matches without modifying the file. \
-                 Use dry_run:true to preview changes as a unified diff without writing.",
+                 Use dry_run:true to preview changes as a unified diff without writing.\n\n\
+                 ESCAPING — RECOMMENDED DEFAULT: when the search target is literal text \
+                 (code, JSON, structured data, anything containing . ( ) [ ] { } * + ? | ^ $ \\), \
+                 set fixed_strings:true and send the unescaped text. This avoids regex \
+                 escaping entirely and is almost always what you want.\n\n\
+                 ESCAPING — 'pattern' (regex mode, fixed_strings:false): escape ONLY \
+                 regex metacharacters. Do NOT add an extra layer for JSON; the transport \
+                 already handles that.\n\n\
+                 ESCAPING — 'replacement': capture refs use $1, $name, $$ (literal $). \
+                 The sequences \\n, \\r, \\t, \\\\ are expanded to LF / CR / TAB / \\ \
+                 before substitution; all other \\X pass through unchanged. Either a \
+                 real newline in the JSON string OR the two characters backslash+n will \
+                 produce a newline in the output — both are accepted.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -282,6 +301,12 @@ pub fn list() -> Value {
                  text mode, 0-based byte offsets in binary mode). All operation positions \
                  reference the original file; multiple ops in one call are applied without \
                  interference. The original file is backed up to <file>.bak before writing.\n\n\
+                 ESCAPING (text mode): each op's 'data' is LITERAL text. The JSON \
+                 transport already handles escaping; do not add a second layer. Put a \
+                 real newline in the JSON string for a newline in the file. CRLF/CR in \
+                 'data' is normalised to LF before the edit, then re-encoded to match \
+                 the file's line-ending convention. In binary mode, 'data' is raw bytes \
+                 (or hex/base64 if data_format is set) with no escaping or normalisation.\n\n\
                  Each entry in 'ops' must have:\n\
                    op          — 'delete', 'insert', or 'splice'\n\
                    range       — 'N' or 'N-M' (required for delete/splice)\n\
@@ -471,7 +496,11 @@ pub fn list() -> Value {
                    md5:OFFSET-END    — MD5 of [OFFSET, END) must equal value (32 hex chars)\n\
                    crc32:OFFSET-END  — CRC32 of [OFFSET, END) must equal value (8 hex chars)\n\n\
                  OFFSET and END are 0-based byte offsets (decimal or 0x-prefixed hex); \
-                 use $ or EOF for end-of-file.",
+                 use $ or EOF for end-of-file.\n\n\
+                 ESCAPING — 'value': for line: and line-contains: selectors, this is \
+                 LITERAL text (the JSON transport handles string escaping; do not add \
+                 a second layer). For bytes:, md5:, and crc32: selectors, 'value' is a \
+                 lowercase hex string with no separators or 0x prefix.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -685,7 +714,13 @@ pub fn list() -> Value {
                  denormalised to match the file's convention.  The original file is atomically \
                  backed up to <file>.bak before writing. \n\n\
                  Use tpu_write_file to create new files; tpu_append_file requires the file to \
-                 already exist.",
+                 already exist.\n\n\
+                 ESCAPING: 'content' is the LITERAL text to append. The JSON-RPC transport \
+                 already handles JSON string escaping; do not add a second layer. To append \
+                 a newline, put a real newline in the JSON string. Note that the file's \
+                 last line may or may not already end in a newline — if you need a clean \
+                 separation between the existing content and your appended text, prepend \
+                 a newline to 'content' yourself.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
