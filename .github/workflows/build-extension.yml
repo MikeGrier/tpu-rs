@@ -23,6 +23,11 @@ on:
 permissions:
   contents: read
 
+# Opt every JavaScript-action step into the Node.js 24 runtime ahead of
+# GitHub's June 2, 2026 forced cutover.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
   package:
     name: package (${{ matrix.vscode_target }})
@@ -84,7 +89,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: npm ci (extension)
         working-directory: crates/tpu-mcp/extension
