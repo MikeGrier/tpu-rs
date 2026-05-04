@@ -1,4 +1,20 @@
+# Source / build artefacts -- excluded from the .vsix
 src/
 node_modules/
 tsconfig.json
 *.vsix
+**/*.ts
+!out/**/*.d.ts
+**/*.map
+**/tsconfig.json
+**/.eslintrc*
+
+# Backups, scratch, OS junk
+*.bak
+.DS_Store
+Thumbs.db
+.gitignore
+.gitkeep
+**/.gitkeep
+
+# Keep: out/**, bin/**, package.json, README.md, LICENSE

@@ -98,3 +98,81 @@ a timestamp minutes or hours in the past) while accommodating minor rounding on 
 local filesystems.  On filesystems with coarser resolution the stamp-and-verify step
 may report false positives; setting `--verify-delay-ms=0` disables it for those
 environments.
+
+
+---
+
+## VS Code extension distribution
+
+crates/tpu-mcp/extension/ is a VS Code extension (TypeScript, `commonjs` /
+`ES2020`) that bundles a per-platform `tpu-mcp` binary and registers it
+with VS Code's MCP discovery API so Copilot Chat picks it up with no
+`.vscode/mcp.json` editing required.
+
+### Mechanism
+
+The extension calls `vscode.lm.registerMcpServerDefinitionProvider` (stable
+since VS Code 1.101) with id `tpu-mcp`. This id MUST match the entry in
+`contributes.mcpServerDefinitionProviders` in `package.json`. The
+provider returns a single `McpStdioServerDefinition` whose `command` is
+the absolute path to the bundled binary at
+`<extensionPath>/bin/tpu-mcp[.exe]` and whose `args` reflect the current
+`tpu-mcp.verifyDelayMs` (always passed explicitly so the binary's
+compiled-in default never matters) plus any user-supplied
+`tpu-mcp.extraArgs`.
+
+The provider also fires `onDidChangeMcpServerDefinitions` on any
+`tpu-mcp.*` configuration change so VS Code re-pulls the definition with
+fresh args without requiring a window reload.
+
+### Why `McpServerDefinitionProvider` (and not `registerTool`)
+
+`vscode.lm.registerTool` is the Language Model Tools API and runs the
+tool in-process as TypeScript. It is the wrong abstraction for `tpu-mcp`,
+which is a separate Rust process that speaks JSON-RPC 2.0 over stdio. The
+MCP server-definition-provider API is exactly the right shape: it tells
+VS Code *how to spawn* an MCP server; VS Code then handles the spawn,
+restart, output capture, and tool-list refresh itself.
+
+### Per-platform packaging
+
+The Marketplace supports per-platform VSIXes via
+`vsce package --target <vscode-target>` and `vsce publish --target
+<vscode-target>`. Targets shipped from this repository:
+
+| VS Code target  | Rust target triple              |
+|-----------------|---------------------------------|
+| `win32-x64`   | `x86_64-pc-windows-msvc`      |
+| `win32-arm64` | `aarch64-pc-windows-msvc`     |
+
+VS Code installs only the VSIX matching the user's machine, so end users
+get a small, single-binary install with no userspace dispatching logic
+required.
+
+### Binary location and `bin/VERSION`
+
+CI populates `extension/bin/` with the platform-appropriate binary plus
+a one-line `VERSION` text file. The extension reads `bin/VERSION` to
+report the bundled binary's version (used by the
+`tpu-mcp: Show bundled server version` command and the `version`
+field on the `McpStdioServerDefinition`). When `bin/VERSION` is
+absent (e.g. local dev with a hand-copied binary), the extension's own
+`package.json` version is reported instead.
+
+The `tpu-mcp.binaryPath` setting overrides the bundled binary; this is
+used during local extension development against a freshly-built
+`cargo build` output without rebuilding the VSIX.
+
+### Publish gating
+
+Publishing is performed by a GitHub Actions workflow triggered on tags
+matching `tpu-mcp-v*`. The workflow's publish job declares
+`environment: marketplace`, which in turn requires manual approval from
+a configured reviewer. The Azure DevOps PAT (`VSCE_PAT`) and Open VSX
+token (`OVSX_PAT`) are scoped to that environment and are therefore
+unavailable to any other workflow run on the repo, including PRs from
+forks. Combined with the publisher PAT being limited to the
+`Marketplace -> Manage` scope, the worst-case blast radius of a
+leaked secret is bounded to "malicious publish to the `reirGleahciM`
+publisher namespace" -- it cannot pivot to any other Azure DevOps or
+GitHub resource.

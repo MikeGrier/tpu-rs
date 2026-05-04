@@ -1,0 +1,111 @@
+# Copyright (c) 2026, Michael Grier
+name: build-extension
+
+# Build per-platform VSIXes for the tpu-mcp VS Code extension on every push
+# and PR. This workflow does NOT publish; publishing happens in
+# `publish-extension.yml` which is gated behind a required-reviewer
+# environment and only fires on `tpu-mcp-v*` tags.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/tpu/**"
+      - "crates/tpu-mcp/**"
+      - ".github/workflows/build-extension.yml"
+  pull_request:
+    paths:
+      - "crates/tpu/**"
+      - "crates/tpu-mcp/**"
+      - ".github/workflows/build-extension.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: package (${{ matrix.vscode_target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vscode_target: win32-x64
+            rust_target: x86_64-pc-windows-msvc
+          - vscode_target: win32-arm64
+            rust_target: aarch64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.rust_target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust_target }}
+
+      - name: cargo build --release tpu-mcp
+        run: cargo build --release -p tpu-mcp --target ${{ matrix.rust_target }}
+
+      # tpu-mcp tests only need to run on the host architecture (x64); the
+      # arm64 binary is cross-compiled and cannot execute on the runner.
+      - name: cargo test tpu-mcp (host arch only)
+        if: matrix.rust_target == 'x86_64-pc-windows-msvc'
+        run: cargo test -p tpu-mcp --target ${{ matrix.rust_target }}
+
+      - name: Stage binary into extension/bin/
+        shell: pwsh
+        run: |
+          $src = "target/${{ matrix.rust_target }}/release/tpu-mcp.exe"
+          $dst = "crates/tpu-mcp/extension/bin/tpu-mcp.exe"
+          Copy-Item $src $dst -Force
+          # Read the crate version from Cargo.toml (single source of truth).
+          $cargo = Get-Content crates/tpu-mcp/Cargo.toml -Raw
+          if ($cargo -match '(?m)^version\s*=\s*"([^"]+)"') {
+              $ver = $Matches[1]
+          } else {
+              throw "Could not parse version from crates/tpu-mcp/Cargo.toml"
+          }
+          Set-Content -NoNewline -Encoding ascii `
+              -Path crates/tpu-mcp/extension/bin/VERSION -Value $ver
+          "Staged tpu-mcp $ver for ${{ matrix.vscode_target }}"
+          Get-ChildItem crates/tpu-mcp/extension/bin
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: npm install (extension)
+        working-directory: crates/tpu-mcp/extension
+        run: npm install --no-audit --no-fund
+
+      - name: Compile TypeScript
+        working-directory: crates/tpu-mcp/extension
+        run: npm run compile
+
+      - name: vsce package --target ${{ matrix.vscode_target }}
+        working-directory: crates/tpu-mcp/extension
+        run: npx --yes @vscode/vsce@^3.0.0 package --target ${{ matrix.vscode_target }} --no-dependencies
+
+      - name: Verify VSIX was produced
+        shell: pwsh
+        working-directory: crates/tpu-mcp/extension
+        run: |
+          $vsix = Get-ChildItem -Filter "*.vsix" | Select-Object -First 1
+          if (-not $vsix) { throw "No .vsix produced" }
+          "Built: $($vsix.Name) ($([math]::Round($vsix.Length / 1KB, 1)) KB)"
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpu-mcp-${{ matrix.vscode_target }}
+          path: crates/tpu-mcp/extension/*.vsix
+          if-no-files-found: error
+          retention-days: 30
