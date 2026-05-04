@@ -15,8 +15,16 @@ redirection from Copilot to avoid encoding corruption.
 
 ## Installation
 
-Install from the VS Code Marketplace. The extension auto-registers itself
-as an MCP server on startup; no `.vscode/mcp.json` editing is required.
+Install from the VS Code Marketplace:
+
+```
+code --install-extension MikeGrierTools.tpu-mcp
+```
+
+or search for **tpu-mcp** in the Extensions view.
+
+The extension auto-registers itself as an MCP server on startup; no
+`.vscode/mcp.json` editing is required.
 
 After install, reload the window (Command Palette \u2192 **Developer: Reload
 Window**) and the `tpu-mcp` server will appear under

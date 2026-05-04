@@ -67,7 +67,7 @@ design discussion.
 - [x] M2-4: `npm install` + `npm run compile` + `npx vsce package
       --target <vscode-target>`; upload the per-target VSIX as a
       workflow artifact on every push and PR.
-- [ ] M2-5: Add status badge to the top-level README.
+- [x] M2-5: Add status badge to the top-level README.
 
 ### M3 \u2014 Publish workflow (gated by environment)
 
@@ -82,12 +82,14 @@ design discussion.
 - [ ] M3-3: Add `.github/workflows/publish-extension.yml` triggered
       on tags matching `tpu-mcp-v*`. Job uses
       `environment: marketplace` so the publish step blocks on the
-      required reviewer's approval.
+      required reviewer's approval. **(Workflow committed; awaiting
+      M3-1/M3-2 operator setup before first tag push.)**
 - [ ] M3-4: Workflow downloads VSIXes built by M2 (or rebuilds
       them), runs `npx vsce publish --packagePath <vsix> --pat
       $VSCE_PAT` once per target, and creates a GitHub Release for
-      the tag with the VSIXes attached.
-- [ ] M3-5: Add a "Marketplace install" section to the extension
+      the tag with the VSIXes attached. **(Implemented as rebuild
+      from tag SHA; gated behind `marketplace` environment.)**
+- [x] M3-5: Add a "Marketplace install" section to the extension
       README and to the top-level README.
 
 ### M4 \u2014 Open VSX mirror
