@@ -92,7 +92,11 @@ jobs:
 
       - name: vsce package --target ${{ matrix.vscode_target }}
         working-directory: crates/tpu-mcp/extension
-        run: npx --yes @vscode/vsce@^3.0.0 package --target ${{ matrix.vscode_target }} --no-dependencies
+        # Use the locally installed @vscode/vsce (locked by package-lock.json)
+        # rather than `npx --yes @vscode/vsce@<range>`, which would fetch a
+        # potentially different version on each run and undermine build
+        # reproducibility.
+        run: npx vsce package --target ${{ matrix.vscode_target }} --no-dependencies
 
       - name: Verify VSIX was produced
         shell: pwsh

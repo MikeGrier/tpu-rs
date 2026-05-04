@@ -80,11 +80,23 @@ class TpuMcpServerProvider
     private readonly _onDidChange = new vscode.EventEmitter<void>();
     public readonly onDidChangeMcpServerDefinitions = this._onDidChange.event;
 
+    /**
+     * Tracks whether we have already shown the "binary not found" toast
+     * during this VS Code session. `provideMcpServerDefinitions` may be
+     * invoked repeatedly (e.g. on configuration changes or client refresh),
+     * and we do not want to spam a modal warning on every call.
+     */
+    private missingBinaryWarned = false;
+
     constructor(private readonly context: vscode.ExtensionContext) {
         // Re-fire when any tpu-mcp.* setting changes so VS Code re-pulls the
         // definition with the updated args.
         const sub = vscode.workspace.onDidChangeConfiguration((e) => {
             if (e.affectsConfiguration("tpu-mcp")) {
+                // A configuration change may have supplied a valid
+                // `binaryPath`; allow the warning to fire again if the
+                // binary is still missing on the next probe.
+                this.missingBinaryWarned = false;
                 this._onDidChange.fire();
             }
         });
@@ -98,12 +110,15 @@ class TpuMcpServerProvider
         if (binary === undefined) {
             // Returning [] is the documented way to say "no servers right
             // now"; surfacing an error here would block extension activation.
-            // We instead show a one-shot warning so the user knows why
-            // nothing appeared in the MCP server list.
-            void vscode.window.showWarningMessage(
-                "tpu-mcp: bundled server binary not found. " +
-                    "Reinstall the extension or set 'tpu-mcp.binaryPath'.",
-            );
+            // Show the warning only once per session (reset on config change)
+            // so that repeated provider invocations do not spam the user.
+            if (!this.missingBinaryWarned) {
+                this.missingBinaryWarned = true;
+                void vscode.window.showWarningMessage(
+                    "tpu-mcp: bundled server binary not found. " +
+                        "Reinstall the extension or set 'tpu-mcp.binaryPath'.",
+                );
+            }
             return [];
         }
 

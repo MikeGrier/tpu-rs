@@ -61,7 +61,7 @@ mod code {
 // ── event loop ────────────────────────────────────────────────────────────────
 
 fn main() {
-    let config = parse_config();
+    let (config, startup_warnings) = parse_config();
 
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -85,6 +85,12 @@ fn main() {
         &mut out,
         format!("advertising {} tools: {}", names.len(), quoted.join(", ")),
     );
+
+    // Replay any warnings collected during CLI parsing through the same
+    // log channel (warning level) now that the stdout writer is available.
+    for w in startup_warnings {
+        log_warn(&mut out, w);
+    }
 
     for line in stdin.lock().lines() {
         let line = match line {
@@ -120,7 +126,7 @@ fn main() {
             Some(v) => v,
         };
 
-        let body = dispatch(msg.method.as_str(), msg.params, &config);
+        let body = dispatch(msg.method.as_str(), msg.params, &config, &mut out);
         if config.trace {
             log_info(&mut out, format!("dispatched '{}'", msg.method));
         }
@@ -137,7 +143,12 @@ fn main() {
 
 // ── dispatch ──────────────────────────────────────────────────────────────────
 
-fn dispatch(method: &str, params: Option<Value>, config: &tools::ServerConfig) -> ResponseBody {
+fn dispatch(
+    method: &str,
+    params: Option<Value>,
+    config: &tools::ServerConfig,
+    out: &mut impl io::Write,
+) -> ResponseBody {
     match method {
         "initialize" => ResponseBody::Ok {
             result: serde_json::json!({
@@ -179,12 +190,18 @@ fn dispatch(method: &str, params: Option<Value>, config: &tools::ServerConfig) -
                         "content": [{ "type": "text", "text": text }]
                     }),
                 },
-                Err(e) => ResponseBody::Ok {
-                    result: serde_json::json!({
-                        "content": [{ "type": "text", "text": format!("error: {e}") }],
-                        "isError": true
-                    }),
-                },
+                Err(e) => {
+                    // Surface a server-side log entry for tool failures so
+                    // operators have a trail in the MCP output channel even
+                    // when the client only displays the `isError` payload.
+                    log_warn(out, format!("tool '{name}' failed: {e}"));
+                    ResponseBody::Ok {
+                        result: serde_json::json!({
+                            "content": [{ "type": "text", "text": format!("error: {e}") }],
+                            "isError": true
+                        }),
+                    }
+                }
             }
         }
 
@@ -272,6 +289,19 @@ fn log_info(out: &mut impl io::Write, message: impl Into<String>) {
     );
 }
 
+/// Send a `warning`-level log notification with `logger = "tpu-mcp"`.
+fn log_warn(out: &mut impl io::Write, message: impl Into<String>) {
+    send_notification(
+        out,
+        "notifications/message",
+        serde_json::json!({
+            "level": "warning",
+            "logger": "tpu-mcp",
+            "data": message.into(),
+        }),
+    );
+}
+
 // -- startup configuration ----------------------------------------------------
 
 /// Parse `--verify-delay-ms=N` and `--quiet` from the process arguments.
@@ -280,24 +310,35 @@ fn log_info(out: &mut impl io::Write, message: impl Into<String>) {
 /// forward-compatible with future flags without breaking existing `mcp.json`
 /// configurations. `--quiet` may also be enabled by setting the
 /// `TPU_MCP_QUIET` environment variable to a non-empty value.
-fn parse_config() -> tools::ServerConfig {
+///
+/// Returns the parsed config plus any deferred warning messages collected
+/// during parsing. Callers should emit these via [`log_warn`] *after* the
+/// stdout writer is available so they appear in the client's MCP output
+/// channel at `warning` level rather than as `[warning]`-tagged stderr.
+fn parse_config() -> (tools::ServerConfig, Vec<String>) {
     let mut verify_delay_ms: u64 = 100;
     let mut quiet: bool = std::env::var_os("TPU_MCP_QUIET")
         .is_some_and(|v| !v.is_empty());
+    let mut warnings: Vec<String> = Vec::new();
     for arg in std::env::args_os().skip(1) {
         let s = arg.to_string_lossy();
         if let Some(rest) = s.strip_prefix("--verify-delay-ms=") {
             if let Ok(n) = rest.parse::<u64>() {
                 verify_delay_ms = n;
             } else {
-                eprintln!("tpu-mcp: ignoring invalid --verify-delay-ms value: {rest:?}");
+                warnings.push(format!(
+                    "ignoring invalid --verify-delay-ms value: {rest:?}"
+                ));
             }
         } else if s == "--quiet" {
             quiet = true;
         }
     }
-    tools::ServerConfig {
-        verify_delay_ms,
-        trace: !quiet,
-    }
+    (
+        tools::ServerConfig {
+            verify_delay_ms,
+            trace: !quiet,
+        },
+        warnings,
+    )
 }
