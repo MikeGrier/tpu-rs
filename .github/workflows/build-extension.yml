@@ -82,9 +82,12 @@ jobs:
         with:
           node-version: "20"
 
-      - name: npm install (extension)
+      - name: npm ci (extension)
         working-directory: crates/tpu-mcp/extension
-        run: npm install --no-audit --no-fund
+        # Use `npm ci` rather than `npm install`: package-lock.json is
+        # checked in, and `npm ci` is both faster and stricter (it fails
+        # if the lockfile and package.json have drifted out of sync).
+        run: npm ci --no-audit --no-fund
 
       - name: Compile TypeScript
         working-directory: crates/tpu-mcp/extension

@@ -35,8 +35,9 @@ use serde_json::Value;
 ///
 /// Maintained as a static slice so that the startup banner ([`tool_names`])
 /// does not pay the cost of constructing the full `tools/list` JSON payload
-/// just to extract names. A debug-build assertion in the tests keeps this in
-/// sync with [`list()`].
+/// just to extract names. The unit test `tool_names_match_list_payload`
+/// (runs in both debug and release test builds) keeps this in sync with
+/// [`list()`].
 pub const TOOL_NAMES: &[&str] = &[
     "tpu_read_file",
     "tpu_write_file",

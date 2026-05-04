@@ -122,7 +122,7 @@ class TpuMcpServerProvider
             return [];
         }
 
-        const version = readBundledVersion(this.context);
+        const version = readBinaryVersion(this.context, binary);
 
         return [
             new vscode.McpStdioServerDefinition(
@@ -146,13 +146,49 @@ class TpuMcpServerProvider
 }
 
 /**
- * Best-effort lookup of the bundled `tpu-mcp` binary's version. We read it
- * from a `bin/VERSION` text file (a single line, e.g. `0.1.0`) emitted by
- * the CI packaging step. If the file is absent (e.g. local dev), the
- * extension's own `package.json` version is returned as a fallback.
+ * Resolve the version string to advertise for `binary`.
+ *
+ * Resolution order, mirroring [`resolveBinaryPath`]:
+ *   1. If `binary` lives inside the extension's bundled `bin/` directory,
+ *      read `<extensionPath>/bin/VERSION` (written by CI). Falling back to
+ *      the extension's own `package.json` version when the file is absent
+ *      (local dev with a hand-copied binary) is reasonable, because in that
+ *      case the binary and the extension are expected to track together.
+ *   2. Otherwise the user has overridden `tpu-mcp.binaryPath`. In that case
+ *      we cannot trust the bundled `VERSION` file \u2014 it describes a
+ *      different binary. Look for a sibling `VERSION` file next to the
+ *      override binary, and otherwise label the version as `override` so
+ *      that consumers (and the `Show server version` command) do not
+ *      misreport the spawned binary's identity.
  */
-function readBundledVersion(context: vscode.ExtensionContext): string {
-    const versionFile = path.join(context.extensionPath, "bin", "VERSION");
+function readBinaryVersion(context: vscode.ExtensionContext, binary: string): string {
+    const bundledDir = path.join(context.extensionPath, "bin");
+    const isBundled =
+        path.normalize(path.dirname(binary)).toLowerCase() ===
+        path.normalize(bundledDir).toLowerCase();
+
+    if (isBundled) {
+        const v = readVersionFile(path.join(bundledDir, "VERSION"));
+        if (v !== undefined) {
+            return v;
+        }
+        return context.extension.packageJSON.version ?? "0.0.0";
+    }
+
+    // Override binary: trust only a sibling VERSION file, never the
+    // bundled one (which would lie about the actually-spawned binary).
+    const sibling = readVersionFile(path.join(path.dirname(binary), "VERSION"));
+    if (sibling !== undefined) {
+        return `${sibling} (override)`;
+    }
+    return "override";
+}
+
+/**
+ * Read a single-line VERSION text file. Returns `undefined` if the file is
+ * absent, unreadable, or empty after trimming.
+ */
+function readVersionFile(versionFile: string): string | undefined {
     try {
         if (fs.existsSync(versionFile)) {
             const v = fs.readFileSync(versionFile, "utf8").trim();
@@ -161,9 +197,9 @@ function readBundledVersion(context: vscode.ExtensionContext): string {
             }
         }
     } catch {
-        // fall through to fallback
+        // fall through
     }
-    return context.extension.packageJSON.version ?? "0.0.0";
+    return undefined;
 }
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -190,8 +226,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
     context.subscriptions.push(
         vscode.commands.registerCommand("tpu-mcp.showServerVersion", async () => {
-            const version = readBundledVersion(context);
-            const binary = resolveBinaryPath(context) ?? "(not found)";
+            const binary = resolveBinaryPath(context);
+            if (binary === undefined) {
+                await vscode.window.showInformationMessage(
+                    "tpu-mcp server: binary not found",
+                );
+                return;
+            }
+            const version = readBinaryVersion(context, binary);
             await vscode.window.showInformationMessage(
                 `tpu-mcp server version ${version} \u2014 ${binary}`,
             );
