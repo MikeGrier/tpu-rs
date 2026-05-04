@@ -81,12 +81,22 @@ impl McpSession {
     }
 
     fn recv_raw(&mut self) -> Value {
-        let mut line = String::new();
-        self.stdout
-            .read_line(&mut line)
-            .expect("read from tpu-mcp stdout");
-        assert!(!line.is_empty(), "tpu-mcp closed stdout unexpectedly");
-        serde_json::from_str(line.trim()).expect("tpu-mcp response is not valid JSON")
+        // Skip server-initiated notifications (no `id`); we only return when
+        // we see a response message. tpu-mcp emits `notifications/message`
+        // log lines for the startup banner and per-request dispatch trace.
+        loop {
+            let mut line = String::new();
+            self.stdout
+                .read_line(&mut line)
+                .expect("read from tpu-mcp stdout");
+            assert!(!line.is_empty(), "tpu-mcp closed stdout unexpectedly");
+            let v: Value =
+                serde_json::from_str(line.trim()).expect("tpu-mcp response is not valid JSON");
+            if v.get("id").is_some() {
+                return v;
+            }
+            // else: notification \u2014 keep reading.
+        }
     }
 
     /// Send a request and wait for its response.  Panics on RPC error.

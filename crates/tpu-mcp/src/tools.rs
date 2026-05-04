@@ -31,6 +31,39 @@ use serde_json::Value;
 
 // -- tool list -----------------------------------------------------------------
 
+/// Names of every tool exposed by [`list()`], in advertising order.
+///
+/// Maintained as a static slice so that the startup banner ([`tool_names`])
+/// does not pay the cost of constructing the full `tools/list` JSON payload
+/// just to extract names. The unit test `tool_names_match_list_payload`
+/// (runs in both debug and release test builds) keeps this in sync with
+/// [`list()`].
+pub const TOOL_NAMES: &[&str] = &[
+    "tpu_read_file",
+    "tpu_write_file",
+    "tpu_replace_in_file",
+    "tpu_edit_file",
+    "tpu_read_file_binary",
+    "tpu_read_file_escaped",
+    "tpu_validate_file",
+    "tpu_read_head",
+    "tpu_read_tail",
+    "tpu_count_file",
+    "tpu_append_file",
+    "tpu_find",
+    "tpu_stat_file",
+];
+
+/// Return the names (in advertising order) of every tool exposed by [`list()`].
+///
+/// Used by `main` to emit a startup `advertising tools: ...` log line so the
+/// user can see at a glance which tools the running server actually exposes
+/// without having to wait for the client's `tools/list` round-trip. Cheap:
+/// returns a fixed static slice, no allocation or JSON construction.
+pub fn tool_names() -> &'static [&'static str] {
+    TOOL_NAMES
+}
+
 /// Return the MCP `tools/list` payload (an array of tool descriptors).
 pub fn list() -> Value {
     serde_json::json!([
@@ -1544,12 +1577,20 @@ pub struct ServerConfig {
     /// Set to 0 to skip the stamp-and-verify cycle entirely, e.g. when a
     /// Defender exclusion has been configured for the binary or workspace.
     pub verify_delay_ms: u64,
+
+    /// When true, emit a one-line `dispatched '<method>'` log notification
+    /// for every JSON-RPC request. On by default; suppress with `--quiet` or
+    /// `TPU_MCP_QUIET=1`. Trace lines are sent via MCP `notifications/message`
+    /// (level `info`), not stderr, so they appear in the client's MCP output
+    /// channel as informational rather than warnings.
+    pub trace: bool,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
         ServerConfig {
             verify_delay_ms: 100,
+            trace: true,
         }
     }
 }
@@ -1905,6 +1946,26 @@ mod tests {
         normalize_file_path(s)
     }
 
+    /// Guard: `TOOL_NAMES` must stay in sync with the `name` fields embedded
+    /// in [`list()`]. If a tool is added to `list()` without updating
+    /// `TOOL_NAMES` (or vice versa) this test catches it.
+    #[test]
+    fn tool_names_match_list_payload() {
+        let from_list: Vec<String> = list()
+            .as_array()
+            .expect("list() returns an array")
+            .iter()
+            .map(|t| {
+                t.get("name")
+                    .and_then(|n| n.as_str())
+                    .expect("each tool has a string `name`")
+                    .to_owned()
+            })
+            .collect();
+        let from_const: Vec<String> = TOOL_NAMES.iter().map(|s| (*s).to_owned()).collect();
+        assert_eq!(from_const, from_list, "TOOL_NAMES out of sync with list()");
+    }
+
     // -- file:// URI stripping --
 
     #[test]
@@ -2224,7 +2285,14 @@ mod integration_tests {
     /// Zero-delay wrapper so existing tests call the real `call()` without
     /// needing to supply a `ServerConfig` argument explicitly.
     fn call(name: &str, args: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
-        super::call(name, args, &ServerConfig { verify_delay_ms: 0 })
+        super::call(
+            name,
+            args,
+            &ServerConfig {
+                verify_delay_ms: 0,
+                trace: false,
+            },
+        )
     }
 
     /// SF-IT-14: `tpu_find` MCP tool integration.
