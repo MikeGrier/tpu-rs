@@ -11,3 +11,18 @@ anstyle     = "1"
 clap        = { version = "4", features = ["derive"] }
 serde       = { version = "1", features = ["derive"] }
 serde_json  = "1"
+
+# Release profile applies to all workspace crates. Tuned for shipped
+# binary size (notably the `tpu-mcp.exe` we bundle inside the VS Code
+# extension VSIX) without sacrificing correctness.
+#
+# - `strip = "symbols"` removes debug symbols from the final artifact;
+#   typically halves a Rust Windows binary.
+# - `lto = "thin"` enables cross-crate inlining/dead-code elimination
+#   at link time. "thin" keeps link times reasonable.
+# - `codegen-units = 1` lets LLVM see the whole crate at once for
+#   better optimization at the cost of slower compiles.
+[profile.release]
+strip         = "symbols"
+lto           = "thin"
+codegen-units = 1
