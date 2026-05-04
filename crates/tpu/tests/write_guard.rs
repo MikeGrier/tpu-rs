@@ -259,7 +259,33 @@ fn write_that_adds_new_mojibake_to_corrupt_file_is_rejected() {
     assert_eq!(read(&path), original.as_bytes());
 }
 
-// ── (7) extra: brand-new file with allow-marker is allowed ──────────────────
+// ── (7) write to nested path creates parent directories ─────────────────────
+
+#[test]
+fn write_to_nested_path_creates_parent_directories() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Do NOT pre-create a/b — the write command must create them.
+    let path = dir.path().join("a").join("b").join("c.txt");
+    assert!(!path.exists());
+
+    let content = "hello from nested path\n";
+    tpu::cmd::write::run(
+        &path,
+        content,
+        tpu::encoding::OutputEncoding::Preserve,
+        tpu::encoding::BomPolicy::default(),
+        None,
+        None,
+        tpu::IoMode::Buffered,
+        tpu::mojibake::WritePolicy::default(),
+    )
+    .expect("write to nested path must succeed");
+
+    assert!(path.exists(), "file must exist after write");
+    assert_eq!(read(&path), content.as_bytes());
+}
+
+// ── (8) extra: brand-new file with allow-marker is allowed ──────────────────
 
 #[test]
 fn write_new_file_with_allow_marker_succeeds_even_with_mojibake() {

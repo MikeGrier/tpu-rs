@@ -172,16 +172,23 @@ pub fn run(
     };
 
     // Write atomically via a temp file in the same directory (same filesystem).
+    // For new files, ensure parent directories exist before creating the temp
+    // file (NamedTempFile::new_in fails if the directory doesn't exist yet).
     let dir = file
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
 
+    let file_exists = file.try_exists()?;
+    if !file_exists {
+        fs::create_dir_all(dir)?;
+    }
+
     let mut tmp = NamedTempFile::new_in(dir)?;
     tmp.write_all(&output_bytes)?;
     tmp.flush()?;
 
-    if file.exists() {
+    if file_exists {
         let bak = PathBuf::from(format!("{}.bak", file.display()));
         fs::rename(file, &bak)?;
         if let Err(e) = tmp.persist(file) {
@@ -189,10 +196,6 @@ pub fn run(
             return Err(e.error.into());
         }
     } else {
-        if let Some(parent) = file.parent()
-            && !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
         tmp.persist(file).map_err(|e| e.error)?;
     }
 
