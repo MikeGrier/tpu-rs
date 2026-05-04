@@ -1,0 +1,198 @@
+# Copyright (c) 2026, Michael Grier
+name: publish-extension
+
+# Publish per-platform VSIXes for the tpu-mcp VS Code extension to the
+# public Marketplace and attach them to a GitHub Release.
+#
+# Trigger:
+#   - Pushing a tag matching `tpu-mcp-v*` (e.g. `tpu-mcp-v0.1.0`).
+#   - `workflow_dispatch` for manual rehearsal (publish step still gated).
+#
+# Gating:
+#   - The `publish` job uses `environment: marketplace`. That GitHub
+#     environment is configured (one-time, by the operator) with
+#     `MikeGrier` as a required reviewer and the `VSCE_PAT` secret set to
+#     a Marketplace PAT (Azure DevOps -> User settings -> PATs, scope
+#     `Marketplace -> Manage`). The publish step blocks on approval.
+#
+# Why rebuild instead of downloading from `build-extension.yml`?
+#   - Tag pushes do not carry artifacts from arbitrary prior runs, and
+#     `actions/download-artifact` cross-workflow needs extra plumbing
+#     (artifact retention, run-id discovery) that is brittle around
+#     branch-vs-tag SHAs. Rebuilding from the tagged commit is hermetic
+#     and matches what `build-extension.yml` already validated on the
+#     merge commit.
+
+on:
+  push:
+    tags:
+      - "tpu-mcp-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+jobs:
+  package:
+    name: package (${{ matrix.vscode_target }})
+    runs-on: windows-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - vscode_target: win32-x64
+            rust_target: x86_64-pc-windows-msvc
+          - vscode_target: win32-arm64
+            rust_target: aarch64-pc-windows-msvc
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (${{ matrix.rust_target }})
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-${{ matrix.rust_target }}
+
+      - name: cargo build --release tpu-mcp
+        run: cargo build --release -p tpu-mcp --target ${{ matrix.rust_target }} --locked
+
+      - name: cargo test tpu-mcp (host arch only)
+        if: matrix.rust_target == 'x86_64-pc-windows-msvc'
+        run: cargo test -p tpu-mcp --target ${{ matrix.rust_target }} --locked
+
+      - name: Stage binary into extension/bin/
+        shell: pwsh
+        run: |
+          $src = "target/${{ matrix.rust_target }}/release/tpu-mcp.exe"
+          $dst = "crates/tpu-mcp/extension/bin/tpu-mcp.exe"
+          Copy-Item $src $dst -Force
+          $cargo = Get-Content crates/tpu-mcp/Cargo.toml -Raw
+          if ($cargo -match '(?m)^version\s*=\s*"([^"]+)"') {
+              $ver = $Matches[1]
+          } else {
+              throw "Could not parse version from crates/tpu-mcp/Cargo.toml"
+          }
+          # Cross-check: the tag must agree with the crate version, otherwise
+          # we'd publish an extension whose advertised version disagrees with
+          # the tag the operator pushed. `github.ref_name` is the tag name
+          # (e.g. `tpu-mcp-v0.1.0`) on a tag push.
+          $tag = "${{ github.ref_name }}"
+          if ($tag -like "tpu-mcp-v*") {
+              $tagVer = $tag.Substring("tpu-mcp-v".Length)
+              if ($tagVer -ne $ver) {
+                  throw "Tag '$tag' implies version '$tagVer' but Cargo.toml has '$ver'. Bump the crate, retag, and try again."
+              }
+          }
+          Set-Content -NoNewline -Encoding ascii `
+              -Path crates/tpu-mcp/extension/bin/VERSION -Value $ver
+          "Staged tpu-mcp $ver for ${{ matrix.vscode_target }}"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: npm ci (extension)
+        working-directory: crates/tpu-mcp/extension
+        run: npm ci --no-audit --no-fund
+
+      - name: Compile TypeScript
+        working-directory: crates/tpu-mcp/extension
+        run: npm run compile
+
+      - name: vsce package --target ${{ matrix.vscode_target }}
+        working-directory: crates/tpu-mcp/extension
+        run: npx vsce package --target ${{ matrix.vscode_target }} --no-dependencies
+
+      - name: Upload VSIX artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tpu-mcp-${{ matrix.vscode_target }}
+          path: crates/tpu-mcp/extension/*.vsix
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish to Marketplace
+    needs: package
+    runs-on: ubuntu-latest
+    # `marketplace` is a GitHub Actions environment with `MikeGrier` as a
+    # required reviewer and `VSCE_PAT` configured as a secret. The job
+    # pauses here until a maintainer approves it in the GitHub UI.
+    environment: marketplace
+
+    steps:
+      - name: Checkout (for README, vsce metadata)
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install @vscode/vsce
+        working-directory: crates/tpu-mcp/extension
+        # We only need vsce here; `npm ci` to get the same locked version
+        # that built the VSIXes (avoids accidental version skew between
+        # packaging and publishing).
+        run: npm ci --no-audit --no-fund
+
+      - name: Download VSIX artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: vsix
+          # Each matrix leg uploaded as `tpu-mcp-<vscode_target>`; download
+          # them all into `vsix/<artifact-name>/*.vsix`.
+
+      - name: List VSIXes
+        shell: bash
+        run: |
+          set -euo pipefail
+          find vsix -name '*.vsix' -print
+          test "$(find vsix -name '*.vsix' | wc -l)" -ge 1
+
+      - name: vsce publish (per VSIX)
+        working-directory: crates/tpu-mcp/extension
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${VSCE_PAT:-}" ]; then
+              echo "::error::VSCE_PAT secret is not set on the 'marketplace' environment"
+              exit 1
+          fi
+          # Publish each per-target VSIX. `vsce publish --packagePath`
+          # uploads an already-built VSIX rather than repackaging, which
+          # is exactly what we want here -- the binary inside was built
+          # and tested by the matching `package` matrix leg.
+          shopt -s nullglob
+          published=0
+          for vsix in ../../../vsix/*/*.vsix; do
+              echo "Publishing $vsix"
+              npx vsce publish --packagePath "$vsix" --pat "$VSCE_PAT"
+              published=$((published + 1))
+          done
+          if [ "$published" -eq 0 ]; then
+              echo "::error::No VSIX files found to publish"
+              exit 1
+          fi
+          echo "Published $published VSIX(es)"
+
+      - name: Create GitHub Release with VSIX attachments
+        # Only on tag pushes. `workflow_dispatch` runs publish to
+        # Marketplace but does not create a Release (no tag to attach to).
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/tpu-mcp-v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: vsix/*/*.vsix
+          fail_on_unmatched_files: true
