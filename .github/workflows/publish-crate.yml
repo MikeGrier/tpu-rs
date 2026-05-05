@@ -4,7 +4,8 @@ name: publish-crate
 # Publish the `tpu` crate to crates.io and attach a GitHub Release.
 #
 # Trigger:
-#   - Pushing a tag matching `tpu-v*` (e.g. `tpu-v0.1.3`).
+#   - Pushing a tag matching `v*` (e.g. `v0.1.3`); created automatically
+#     by release-please when the Release PR is merged.
 #   - `workflow_dispatch` for manual rehearsal: only the `verify` job
 #     runs, which includes a `cargo publish --dry-run`.  The `publish`
 #     job is skipped entirely on manual dispatch, so the `crates-io`
@@ -19,10 +20,10 @@ name: publish-crate
 #     blocks on approval.
 #
 # Tag/version cross-check:
-#   - The `verify` job parses the crate version from `crates/tpu/Cargo.toml`
-#     and asserts it matches the pushed tag. This prevents accidentally
-#     publishing the wrong version if someone forgets to bump the crate
-#     before tagging.
+#   - The `verify` job parses the workspace version from the root
+#     `Cargo.toml` ([workspace.package].version) and asserts it matches
+#     the pushed tag. This prevents accidentally publishing the wrong
+#     version if a tag is pushed without a matching release-please bump.
 
 on:
   push:
