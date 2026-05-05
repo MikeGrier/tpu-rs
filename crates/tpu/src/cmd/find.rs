@@ -145,6 +145,17 @@ pub fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn std::er
         } else {
             let p = PathBuf::from(spec);
             if p.is_dir() {
+                if p.is_absolute() {
+                    // The glob walker starts at "." and only matches relative
+                    // paths, so an absolute glob would never match anything.
+                    // Give a tailored message instead of a broken suggestion.
+                    return Err(format!(
+                        "find: {:?} is a directory — pass individual file \
+                         paths or a relative glob pattern instead",
+                        spec,
+                    )
+                    .into());
+                }
                 // Normalize the example: strip a leading "./" or ".\\" and any
                 // trailing separators so the suggested glob matches what the
                 // walker sees after strip_prefix(".").
@@ -153,11 +164,19 @@ pub fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn std::er
                     .or_else(|| spec.strip_prefix(".\\"))
                     .unwrap_or(spec)
                     .trim_end_matches(['/', '\\']);
+                // Guard: when the user passes "." or "./" (the walker root),
+                // `normalized` is empty or a bare "." — suggest "**" to match
+                // all files.  (The walker strips the leading "." from paths
+                // before matching, so "./**" would never match anything.)
+                let example = if normalized.is_empty() || normalized == "." {
+                    "**".to_string()
+                } else {
+                    format!("{normalized}/**")
+                };
                 return Err(format!(
                     "find: {:?} is a directory — pass a glob pattern to search \
                      recursively, e.g. {:?}",
-                    spec,
-                    format!("{normalized}/**"),
+                    spec, example,
                 )
                 .into());
             }
@@ -878,6 +897,74 @@ mod tests {
         assert!(
             lines.iter().any(|l| l.starts_with("6-")),
             "after-context should use '-'; output:\n{out}"
+        );
+    }
+
+    // ── expand_paths: directory-spec error behavior ───────────────────────────
+
+    #[test]
+    fn expand_paths_dot_slash_suggests_star_star() {
+        // "./" normalises to "" after stripping the "./" prefix; the suggested
+        // glob should be "**" (not the broken "/**").
+        let err = expand_paths(&["./"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("is a directory"), "got: {msg}");
+        assert!(
+            msg.contains("\"**\""),
+            "expected '\"**\"' in suggestion; got: {msg}"
+        );
+        assert!(
+            !msg.contains("\"/**\""),
+            "must not suggest '\"/**\"'; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn expand_paths_dot_alone_suggests_star_star() {
+        // "." is the walker root; same rule as "./" applies.
+        let err = expand_paths(&["."]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("is a directory"), "got: {msg}");
+        assert!(
+            msg.contains("\"**\""),
+            "expected '\"**\"' in suggestion; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn expand_paths_relative_dir_suggests_subdir_glob() {
+        // Create a temporary subdirectory inside the current directory so we
+        // can pass a relative name to expand_paths.
+        let dir = tempfile::Builder::new()
+            .prefix("tpu_test_expand_")
+            .tempdir_in(".")
+            .unwrap();
+        let dirname = dir.path().file_name().unwrap().to_str().unwrap().to_owned();
+        let err = expand_paths(&[dirname.as_str()]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("is a directory"), "got: {msg}");
+        // The suggestion should end with "/**" and not start with "/"
+        assert!(
+            msg.contains(&format!("\"{dirname}/**\"")),
+            "expected '{dirname}/**' in suggestion; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn expand_paths_absolute_dir_gives_tailored_message() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let abs = dir.path().to_str().unwrap();
+        let err = expand_paths(&[abs]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("is a directory"), "got: {msg}");
+        // Should NOT contain a glob suggestion (it would be non-functional)
+        assert!(
+            !msg.contains("/**"),
+            "absolute dir should not suggest a glob; got: {msg}"
+        );
+        assert!(
+            msg.contains("relative glob"),
+            "should mention 'relative glob'; got: {msg}"
         );
     }
 }

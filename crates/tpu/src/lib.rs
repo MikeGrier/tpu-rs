@@ -77,10 +77,10 @@ pub fn read_raw_bytes(path: &Path, mode: IoMode) -> io::Result<Vec<u8>> {
     }
 }
 
-/// Retry a closure that returns [`io::Result<T>`] up to 5 times on transient
+/// Retry a closure that returns [`io::Result<T>`] up to 5 retries on transient
 /// Windows AV/Defender errors (sharing violation or access denied), sleeping
-/// 25 ms between attempts.  Returns immediately on any other error or after
-/// exhausting all retries.
+/// 25 ms between attempts (6 total attempts).  Returns immediately on any
+/// other error or after exhausting all retries.
 ///
 /// The minimum practical Windows sleep quantum is ~15 ms; 25 ms is chosen to
 /// comfortably clear a single AV scan window.  Five retries add at most 125 ms,
@@ -109,7 +109,14 @@ pub fn retry_io<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
 fn is_transient_io_error(e: &io::Error) -> bool {
     #[cfg(windows)]
     {
-        matches!(e.raw_os_error(), Some(5) | Some(32))
+        // Named constants for the two Windows error codes that can appear
+        // transiently while AV/Defender is scanning a file.
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        matches!(
+            e.raw_os_error(),
+            Some(ERROR_ACCESS_DENIED) | Some(ERROR_SHARING_VIOLATION)
+        )
     }
     #[cfg(not(windows))]
     {
