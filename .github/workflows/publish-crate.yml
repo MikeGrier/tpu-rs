@@ -66,6 +66,12 @@ jobs:
           fi
           echo "Version check passed: $ver"
 
+      - name: Check text encoding
+        run: pwsh -File tools/check-encoding.ps1
+
+      - name: cargo build --workspace --all-targets --locked
+        run: cargo build --workspace --all-targets --locked
+
       - name: cargo test --workspace --locked
         run: cargo test --workspace --locked
 
