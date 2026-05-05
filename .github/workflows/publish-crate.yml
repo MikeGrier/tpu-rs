@@ -108,7 +108,24 @@ jobs:
         with:
           key: publish-crate
 
+      - name: Create GitHub Release
+        # Create the release first. softprops/action-gh-release is
+        # idempotent (updates an existing draft/release rather than
+        # failing), so this step is safe to retry. Doing it before
+        # `cargo publish` means a transient release-step failure can be
+        # recovered by rerunning the job — if publish ran first its
+        # "version already exists" error would prevent any retry from
+        # reaching release creation.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+
       - name: cargo publish -p tpu
+        # Publish last: cargo publish is irreversible for a given
+        # version, so it runs only after the retriable steps above have
+        # already succeeded.
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         shell: bash
@@ -119,10 +136,3 @@ jobs:
               exit 1
           fi
           cargo publish -p tpu --locked
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
-          generate_release_notes: true
