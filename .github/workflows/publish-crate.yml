@@ -5,7 +5,9 @@ name: publish-crate
 #
 # Trigger:
 #   - Pushing a tag matching `tpu-v*` (e.g. `tpu-v0.1.3`).
-#   - `workflow_dispatch` for manual rehearsal (publish step still gated).
+#   - `workflow_dispatch` for manual rehearsal: the publish step runs
+#     `cargo publish --dry-run` so no real release is created.  Only a
+#     tag push can trigger a real publish.
 #
 # Gating:
 #   - The `publish` job uses `environment: crates-io`. That GitHub
@@ -99,7 +101,19 @@ jobs:
       - name: cargo publish -p tpu
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p tpu --locked
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+              echo "::error::CARGO_REGISTRY_TOKEN secret is not set on the 'crates-io' environment"
+              exit 1
+          fi
+          dry_run_flag=""
+          if [[ "${{ github.event_name }}" != "push" ]]; then
+              dry_run_flag="--dry-run"
+              echo "workflow_dispatch: running cargo publish --dry-run (no tag push — skipping real publish)"
+          fi
+          cargo publish -p tpu --locked ${dry_run_flag}
 
       - name: Create GitHub Release
         # Only on tag pushes. `workflow_dispatch` runs publish to
