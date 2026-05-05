@@ -80,7 +80,9 @@ jobs:
           set -euo pipefail
           ver="${{ steps.workspace-version.outputs.version }}"
           tag="${GITHUB_REF_NAME}"
-          if [[ "$tag" == v* ]]; then
+          # Only cross-check when an actual tag was pushed (not on
+          # workflow_dispatch from a branch whose name starts with "v").
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "$tag" == v* ]]; then
               tag_ver="${tag#v}"
               if [[ "$tag_ver" != "$ver" ]]; then
                   echo "::error::Tag '$tag' implies version '$tag_ver' but Cargo.toml has '$ver'. Update [workspace.package] version in the root Cargo.toml (or rerun release-please), retag, and try again."
@@ -160,8 +162,12 @@ jobs:
                 combined_pattern="$tpu_ws_deps"
               fi
               if [ -n "$combined_pattern" ]; then
+                # Anchor each name to the start of a TOML key assignment so
+                # that `serde` does not match `serde_json` or `serde_path_to_error`.
+                # Each diff line begins with `+` or `-`, then the key name,
+                # then optional whitespace and `=`.
                 cargo_structural=$(echo "$root_diff" \
-                  | grep -E "(${combined_pattern})" || true)
+                  | grep -E "^[+-](${combined_pattern})[[:space:]]*=" || true)
               fi
             fi
             if [ -n "$tpu_src" ] || [ -n "$cargo_structural" ]; then

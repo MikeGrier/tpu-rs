@@ -29,14 +29,14 @@ on:
 permissions:
   contents: read
 
-# Cancel any in-progress run on the same branch when a new commit is pushed.
-# On `push` to main github.head_ref is empty → github.run_id is used (unique,
-# no cancellation).  On pull_request github.head_ref is the branch name, so a
-# newer push cancels the stale run.  This pairs with the `update-lockfile` job
-# in release-please.yml: when that job pushes a fresh Cargo.lock to the Release
+# Cancel any in-progress run for the same workflow and PR/push when a newer
+# commit arrives.  PR number is used on pull_request events (unique per PR,
+# fork-safe).  On non-PR events github.run_id is used (unique per run → no
+# cross-run cancellation).  This pairs with the `update-lockfile` job in
+# release-please.yml: when that job pushes a fresh Cargo.lock to the Release
 # PR branch, the earlier (--locked-failing) run is cancelled automatically.
 concurrency:
-  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true
 
 # Opt every JavaScript-action step into the Node.js 24 runtime ahead of
