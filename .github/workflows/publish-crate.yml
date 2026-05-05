@@ -111,22 +111,45 @@ jobs:
           else
             # Source changes in crates/tpu/ (Rust code, crate Cargo.toml, tests).
             tpu_src=$(git diff --name-only "$prev_tag" HEAD -- crates/tpu/)
-            # Structural changes in the root Cargo.toml beyond the workspace
-            # version bump.  Every release-please PR updates the `version = `
-            # line there, so we filter that line out before deciding whether
-            # a structural change (e.g. a new shared dependency) affects the
-            # packaged crate.
-            cargo_structural=$(git diff "$prev_tag" HEAD -- Cargo.toml \
-              | grep '^[+-]' \
-              | grep -v '^---' | grep -v '^+++' \
-              | grep -vE '^(\+|-)version[[:space:]]*=')
+            # Workspace-level changes that affect the tpu crate specifically:
+            #   - [workspace.package] metadata beyond the version bump
+            #     (e.g. an edition or rust-version change), OR
+            #   - [workspace.dependencies] entries for deps that
+            #     crates/tpu/Cargo.toml declares with `workspace = true`.
+            # Changes to workspace deps only used by crates/tpu-mcp/ are
+            # excluded to avoid forcing a crates.io publish on extension-only
+            # releases.
+            #
+            # Build an alternation pattern from tpu's workspace-dep names,
+            # then filter the Cargo.toml diff to only relevant lines.
+            # `|| true` on the grep steps prevents exit code 1 (no match)
+            # from aborting the script under set -euo pipefail — no match is
+            # the normal result for an extension-only release.
+            tpu_ws_deps=$(grep -E '^[a-zA-Z0-9_-]+[[:space:]]*=' \
+                crates/tpu/Cargo.toml \
+              | grep -E 'workspace[[:space:]]*=[[:space:]]*true' \
+              | grep -oE '^[a-zA-Z0-9_-]+' \
+              | tr '\n' '|' | sed 's/|$//' || true)
+            root_diff=$(git diff "$prev_tag" HEAD -- Cargo.toml \
+              | grep '^[+-]' | grep -v '^---' | grep -v '^+++' \
+              | grep -vE '^(\+|-)version[[:space:]]*=' || true)
+            cargo_structural=""
+            if [ -n "$root_diff" ]; then
+              if [ -n "$tpu_ws_deps" ]; then
+                cargo_structural=$(echo "$root_diff" \
+                  | grep -E "(${tpu_ws_deps}|edition|rust-version)" || true)
+              else
+                cargo_structural=$(echo "$root_diff" \
+                  | grep -E "(edition|rust-version)" || true)
+              fi
+            fi
             if [ -n "$tpu_src" ] || [ -n "$cargo_structural" ]; then
-              echo "tpu crate or structural workspace-root change detected since $prev_tag:"
+              echo "tpu crate changes detected since $prev_tag:"
               [ -n "$tpu_src" ] && echo "$tpu_src"
-              [ -n "$cargo_structural" ] && echo "(Cargo.toml structural change)"
+              [ -n "$cargo_structural" ] && echo "(Cargo.toml: relevant workspace changes)"
               echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
             else
-              echo "No changes in crates/tpu/ or Cargo.toml (beyond version bump) since $prev_tag — crates.io publish will be skipped"
+              echo "No tpu-relevant changes since $prev_tag — crates.io publish will be skipped"
               echo "tpu_changed=false" >> "$GITHUB_OUTPUT"
             fi
           fi

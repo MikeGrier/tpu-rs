@@ -36,7 +36,7 @@ permissions:
 # in release-please.yml: when that job pushes a fresh Cargo.lock to the Release
 # PR branch, the earlier (--locked-failing) run is cancelled automatically.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 # Opt every JavaScript-action step into the Node.js 24 runtime ahead of

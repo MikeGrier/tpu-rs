@@ -17,7 +17,7 @@ permissions:
 # commit to the Release PR branch, the earlier (stale-lockfile) run is
 # cancelled and only the fresh run with the correct Cargo.lock proceeds.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 
 # Opt every JavaScript-action step into the Node.js 24 runtime ahead of
