@@ -53,6 +53,11 @@ jobs:
       # a cold cache.)
       - name: cargo build
         run: cargo build --workspace --all-targets --locked
+      # Backtraces + --no-fail-fast make intermittent test failures actionable.
+      # RUST_LIB_BACKTRACE is what libtest's own panic capture reads (without
+      # it some panics still print "note: run with `RUST_BACKTRACE=1` ..."),
+      # and --no-fail-fast ensures one failing crate doesn't mask backtraces
+      # from later test binaries in the workspace.
       - name: cargo test
         env:
           RUST_BACKTRACE: 1
