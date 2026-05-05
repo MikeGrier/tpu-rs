@@ -4,7 +4,8 @@ name: publish-crate
 # Publish the `tpu` crate to crates.io and attach a GitHub Release.
 #
 # Trigger:
-#   - Pushing a tag matching `tpu-v*` (e.g. `tpu-v0.1.3`).
+#   - Pushing a tag matching `v*` (e.g. `v0.1.3`); created automatically
+#     by release-please when the Release PR is merged.
 #   - `workflow_dispatch` for manual rehearsal: only the `verify` job
 #     runs, which includes a `cargo publish --dry-run`.  The `publish`
 #     job is skipped entirely on manual dispatch, so the `crates-io`
@@ -19,15 +20,23 @@ name: publish-crate
 #     blocks on approval.
 #
 # Tag/version cross-check:
-#   - The `verify` job parses the crate version from `crates/tpu/Cargo.toml`
-#     and asserts it matches the pushed tag. This prevents accidentally
-#     publishing the wrong version if someone forgets to bump the crate
-#     before tagging.
+#   - The `verify` job parses the workspace version from the root
+#     `Cargo.toml` ([workspace.package].version) and asserts it matches
+#     the pushed tag. This prevents accidentally publishing the wrong
+#     version if a tag is pushed without a matching release-please bump.
+#
+# Selective publish:
+#   - Because the workspace uses a single shared version, a release that
+#     only touches the VS Code extension (crates/tpu-mcp/**) or workflow
+#     files would otherwise force a crates.io version bump for `tpu`
+#     despite no Rust API change. The `verify` job therefore diffs
+#     `crates/tpu/` against the previous tag and sets `tpu_changed`.
+#     The `publish` job only runs when `tpu_changed == 'true'`.
 
 on:
   push:
     tags:
-      - "tpu-v*"
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -42,10 +51,20 @@ jobs:
   verify:
     name: verify + test
     runs-on: ubuntu-latest
+    outputs:
+      tpu_changed: ${{ steps.detect-changes.outputs.tpu_changed }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # Full history + tags are needed by the detect-changes step to
+          # compare crates/tpu/ against the previous release tag.
+          fetch-depth: 0
+
+      - name: Read workspace version
+        id: workspace-version
+        uses: ./.github/actions/workspace-version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -59,16 +78,108 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ver=$(grep -m1 '^version' crates/tpu/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          ver="${{ steps.workspace-version.outputs.version }}"
           tag="${GITHUB_REF_NAME}"
-          if [[ "$tag" == tpu-v* ]]; then
-              tag_ver="${tag#tpu-v}"
+          # Only cross-check when an actual tag was pushed (not on
+          # workflow_dispatch from a branch whose name starts with "v").
+          if [[ "${GITHUB_REF_TYPE}" == "tag" && "$tag" == v* ]]; then
+              tag_ver="${tag#v}"
               if [[ "$tag_ver" != "$ver" ]]; then
-                  echo "::error::Tag '$tag' implies version '$tag_ver' but crates/tpu/Cargo.toml has '$ver'. Bump the crate, retag, and try again."
+                  echo "::error::Tag '$tag' implies version '$tag_ver' but Cargo.toml has '$ver'. Update [workspace.package] version in the root Cargo.toml (or rerun release-please), retag, and try again."
                   exit 1
               fi
           fi
           echo "Version check passed: $ver"
+
+      - name: Detect tpu crate changes
+        id: detect-changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Find the previous release tag reachable from HEAD's parent.
+          # We prefer the new `v*` scheme; during the migration period
+          # (first `v*` release after the old `tpu-v*` / `tpu-mcp-v*`
+          # scheme) there may be no prior `v*` tag, so we fall back to
+          # `tpu-v*`.  Both `2>/dev/null || true` calls handle the two
+          # expected failure cases:
+          #   1. Initial commit: HEAD^ does not exist → git describe fails.
+          #   2. No matching tag exists at all → git describe fails.
+          # If neither pattern matches, prev_tag is left empty and we fall
+          # through to the "first release" branch below.
+          # NOTE: `fetch-depth: 0` on the Checkout step above ensures the full
+          # tag history is available, so HEAD^ and all prior tags are reachable.
+          prev_tag=$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null \
+            || git describe --tags --abbrev=0 --match 'tpu-v*' HEAD^ 2>/dev/null \
+            || true)
+          if [ -z "$prev_tag" ]; then
+            echo "No previous release tag found — publishing as first release"
+            echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            # Source changes in crates/tpu/ (Rust code, crate Cargo.toml, tests).
+            tpu_src=$(git diff --name-only "$prev_tag" HEAD -- crates/tpu/)
+            # Workspace-level changes that affect the tpu crate specifically:
+            #   - [workspace.package] metadata keys that crates/tpu/Cargo.toml
+            #     inherits via `<key>.workspace = true` dotted-key syntax
+            #     (e.g. edition, rust-version, license, …) — excluding `version`
+            #     which is bumped on every release-please PR and is not a
+            #     signal that the published crate has structurally changed.
+            #   - [workspace.dependencies] entries for deps that
+            #     crates/tpu/Cargo.toml declares with `workspace = true`.
+            # Changes to workspace deps/metadata only used by crates/tpu-mcp/
+            # are excluded to avoid forcing a crates.io publish on
+            # extension-only releases.
+            #
+            # `|| true` on the grep steps prevents exit code 1 (no match)
+            # from aborting the script under set -euo pipefail — no match is
+            # the normal result for an extension-only release.
+            #
+            # Dynamically read inherited package keys (e.g. edition, rust-version)
+            # from crates/tpu/Cargo.toml rather than a static list so that new
+            # `<key>.workspace = true` entries are automatically covered.
+            tpu_ws_pkg_keys=$(grep -E '^[a-zA-Z0-9_-]+\.workspace[[:space:]]*=[[:space:]]*true' \
+                crates/tpu/Cargo.toml \
+              | sed 's/\.workspace.*//' \
+              | grep -v '^version$' \
+              | tr '\n' '|' | sed 's/|$//' || true)
+            tpu_ws_deps=$(grep -E '^[a-zA-Z0-9_-]+[[:space:]]*=' \
+                crates/tpu/Cargo.toml \
+              | grep -E 'workspace[[:space:]]*=[[:space:]]*true' \
+              | grep -oE '^[a-zA-Z0-9_-]+' \
+              | tr '\n' '|' | sed 's/|$//' || true)
+            root_diff=$(git diff "$prev_tag" HEAD -- Cargo.toml \
+              | grep '^[+-]' | grep -v '^---' | grep -v '^+++' \
+              | grep -vE '^(\+|-)version[[:space:]]*=' || true)
+            cargo_structural=""
+            if [ -n "$root_diff" ]; then
+              # Build combined pattern from inherited package keys + workspace dep names.
+              # Either or both may be empty; join with `|` only when both are present
+              # so we never produce a trailing `|` that would match every line.
+              if [ -n "$tpu_ws_pkg_keys" ] && [ -n "$tpu_ws_deps" ]; then
+                combined_pattern="${tpu_ws_pkg_keys}|${tpu_ws_deps}"
+              elif [ -n "$tpu_ws_pkg_keys" ]; then
+                combined_pattern="$tpu_ws_pkg_keys"
+              else
+                combined_pattern="$tpu_ws_deps"
+              fi
+              if [ -n "$combined_pattern" ]; then
+                # Anchor each name to the start of a TOML key assignment so
+                # that `serde` does not match `serde_json` or `serde_path_to_error`.
+                # Each diff line begins with `+` or `-`, then the key name,
+                # then optional whitespace and `=`.
+                cargo_structural=$(echo "$root_diff" \
+                  | grep -E "^[+-](${combined_pattern})[[:space:]]*=" || true)
+              fi
+            fi
+            if [ -n "$tpu_src" ] || [ -n "$cargo_structural" ]; then
+              echo "tpu crate changes detected since $prev_tag:"
+              [ -n "$tpu_src" ] && echo "$tpu_src"
+              [ -n "$cargo_structural" ] && echo "(Cargo.toml: relevant workspace changes)"
+              echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "No tpu-relevant changes since $prev_tag — crates.io publish will be skipped"
+              echo "tpu_changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
       - name: Check text encoding
         run: pwsh -File tools/check-encoding.ps1
@@ -88,9 +199,12 @@ jobs:
     name: publish to crates.io
     needs: verify
     runs-on: ubuntu-latest
-    # Only run on real tag pushes.  workflow_dispatch never reaches this job,
-    # so the crates-io environment gate is never presented on manual runs.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/tpu-v')
+    # Only run on real tag pushes where the tpu crate itself changed.
+    # workflow_dispatch never reaches this job (so the crates-io environment
+    # gate is never presented on manual runs).  Extension-only releases that
+    # do not touch crates/tpu/ are also skipped here to avoid publishing a
+    # semver-bumped crate with no corresponding Rust API change.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.verify.outputs.tpu_changed == 'true'
     # `crates-io` is a GitHub Actions environment with `MikeGrier` as a
     # required reviewer and `CARGO_REGISTRY_TOKEN` configured as a secret.
     # The job pauses here until a maintainer approves it in the GitHub UI.

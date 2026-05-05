@@ -4,24 +4,40 @@ name: build-extension
 # Build per-platform VSIXes for the tpu-mcp VS Code extension on every push
 # and PR. This workflow does NOT publish; publishing happens in
 # `publish-extension.yml` which is gated behind a required-reviewer
-# environment and only fires on `tpu-mcp-v*` tags.
+# environment and only fires on `v*` tags.
 
 on:
   push:
     branches: [main]
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "crates/tpu/**"
       - "crates/tpu-mcp/**"
+      - ".github/actions/workspace-version/**"
       - ".github/workflows/build-extension.yml"
   pull_request:
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "crates/tpu/**"
       - "crates/tpu-mcp/**"
+      - ".github/actions/workspace-version/**"
       - ".github/workflows/build-extension.yml"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+# Cancel any in-progress run for the same workflow and PR/push when a newer
+# commit arrives.  PR number is used on pull_request events (unique per PR,
+# fork-safe).  On non-PR events github.run_id is used (unique per run → no
+# cross-run cancellation).  This pairs with the `update-lockfile` job in
+# release-please.yml: when that job pushes a fresh Cargo.lock to the Release
+# PR branch, the earlier (--locked-failing) run is cancelled automatically.
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 # Opt every JavaScript-action step into the Node.js 24 runtime ahead of
 # GitHub's June 2, 2026 forced cutover.
@@ -68,19 +84,29 @@ jobs:
         if: matrix.rust_target == 'x86_64-pc-windows-msvc'
         run: cargo test -p tpu-mcp --target ${{ matrix.rust_target }} --locked
 
+      - name: Read workspace version
+        id: workspace-version
+        uses: ./.github/actions/workspace-version
+
+      - name: Verify package.json version matches workspace version
+        shell: pwsh
+        run: |
+          $pkg = Get-Content -Raw crates/tpu-mcp/extension/package.json | ConvertFrom-Json
+          $pkgVer = $pkg.version
+          $wsVer = "${{ steps.workspace-version.outputs.version }}"
+          if ($pkgVer -ne $wsVer) {
+              Write-Error "package.json version '$pkgVer' does not match workspace version '$wsVer'. Ensure release-please (or a manual edit) has updated package.json in sync with Cargo.toml."
+              exit 1
+          }
+          Write-Host "package.json version OK: $pkgVer"
+
       - name: Stage binary into extension/bin/
         shell: pwsh
         run: |
           $src = "target/${{ matrix.rust_target }}/release/tpu-mcp.exe"
           $dst = "crates/tpu-mcp/extension/bin/tpu-mcp.exe"
           Copy-Item $src $dst -Force
-          # Read the crate version from Cargo.toml (single source of truth).
-          $cargo = Get-Content crates/tpu-mcp/Cargo.toml -Raw
-          if ($cargo -match '(?m)^version\s*=\s*"([^"]+)"') {
-              $ver = $Matches[1]
-          } else {
-              throw "Could not parse version from crates/tpu-mcp/Cargo.toml"
-          }
+          $ver = "${{ steps.workspace-version.outputs.version }}"
           Set-Content -NoNewline -Encoding ascii `
               -Path crates/tpu-mcp/extension/bin/VERSION -Value $ver
           "Staged tpu-mcp $ver for ${{ matrix.vscode_target }}"

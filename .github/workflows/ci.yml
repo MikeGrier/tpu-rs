@@ -9,6 +9,18 @@ on:
 permissions:
   contents: read
 
+# Cancel any in-progress run for the same workflow and PR/push when a newer
+# commit arrives.  PR number is used on pull_request events (unique per PR,
+# fork-safe — two forks can share a branch name but never the same PR number).
+# On push-to-main and other non-PR events the PR number is absent, so
+# github.run_id is used (unique per run → no cross-run cancellation).  This
+# ensures that when the release-please `update-lockfile` job pushes a
+# Cargo.lock fix commit to the Release PR branch, the earlier
+# (stale-lockfile) run is cancelled and only the fresh run proceeds.
+concurrency:
+  group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 # Opt every JavaScript-action step into the Node.js 24 runtime ahead of
 # GitHub's June 2, 2026 forced cutover. Surfaces any action-vs-runtime
 # incompatibilities under our control rather than discovering them on the

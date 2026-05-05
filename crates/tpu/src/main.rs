@@ -19,7 +19,7 @@ use shell::Shell;
 use tpu::IoMode;
 // Re-export library functions so that cmd modules (which are compiled in both
 // the lib and bin crate contexts) can use `crate::open_as_branch` etc.
-pub use tpu::{open_as_branch, read_raw_bytes};
+pub use tpu::{open_as_branch, read_raw_bytes, retry_io};
 
 /// Text Processing Utility — encoding-aware file tools for command-line and
 /// agent (Copilot) use.

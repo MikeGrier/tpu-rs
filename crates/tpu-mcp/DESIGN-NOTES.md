@@ -166,7 +166,8 @@ used during local extension development against a freshly-built
 ### Publish gating
 
 Publishing is performed by a GitHub Actions workflow triggered on tags
-matching `tpu-mcp-v*`. The workflow's publish job declares
+matching `v*` (created automatically by release-please when the Release PR
+is merged). The workflow's publish job declares
 `environment: marketplace`, which in turn requires manual approval from
 a configured reviewer. The Azure DevOps PAT (`VSCE_PAT`) and Open VSX
 token (`OVSX_PAT`) are scoped to that environment and are therefore
