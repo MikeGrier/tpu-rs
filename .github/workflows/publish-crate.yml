@@ -1,0 +1,145 @@
+# Copyright (c) 2026, Michael Grier
+name: publish-crate
+
+# Publish the `tpu` crate to crates.io and attach a GitHub Release.
+#
+# Trigger:
+#   - Pushing a tag matching `tpu-v*` (e.g. `tpu-v0.1.3`).
+#   - `workflow_dispatch` for manual rehearsal: only the `verify` job
+#     runs, which includes a `cargo publish --dry-run`.  The `publish`
+#     job is skipped entirely on manual dispatch, so the `crates-io`
+#     environment gate is never presented and no real release can occur.
+#
+# Gating:
+#   - On tag pushes the `publish` job uses `environment: crates-io`.
+#     That GitHub environment must be configured (one-time, by the
+#     operator) with `MikeGrier` as a required reviewer and the
+#     `CARGO_REGISTRY_TOKEN` secret set to a crates.io API token scoped
+#     to "Publish new crates" and "Publish updates".  The publish step
+#     blocks on approval.
+#
+# Tag/version cross-check:
+#   - The `verify` job parses the crate version from `crates/tpu/Cargo.toml`
+#     and asserts it matches the pushed tag. This prevents accidentally
+#     publishing the wrong version if someone forgets to bump the crate
+#     before tagging.
+
+on:
+  push:
+    tags:
+      - "tpu-v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write   # needed to create the GitHub Release
+
+# Opt every JavaScript-action step into the Node.js 24 runtime ahead of
+# GitHub's June 2, 2026 forced cutover.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  verify:
+    name: verify + test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-crate
+
+      - name: Cross-check tag vs. crate version
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver=$(grep -m1 '^version' crates/tpu/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          tag="${GITHUB_REF_NAME}"
+          if [[ "$tag" == tpu-v* ]]; then
+              tag_ver="${tag#tpu-v}"
+              if [[ "$tag_ver" != "$ver" ]]; then
+                  echo "::error::Tag '$tag' implies version '$tag_ver' but crates/tpu/Cargo.toml has '$ver'. Bump the crate, retag, and try again."
+                  exit 1
+              fi
+          fi
+          echo "Version check passed: $ver"
+
+      - name: Check text encoding
+        run: pwsh -File tools/check-encoding.ps1
+
+      - name: cargo build --workspace --all-targets --locked
+        run: cargo build --workspace --all-targets --locked
+
+      - name: cargo test --workspace --locked
+        run: cargo test --workspace --locked
+
+      - name: cargo publish --dry-run
+        # Smoke-test that the crate is publish-ready on every run
+        # (tag push and manual dispatch alike). Never touches crates.io.
+        run: cargo publish -p tpu --locked --dry-run
+
+  publish:
+    name: publish to crates.io
+    needs: verify
+    runs-on: ubuntu-latest
+    # Only run on real tag pushes.  workflow_dispatch never reaches this job,
+    # so the crates-io environment gate is never presented on manual runs.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/tpu-v')
+    # `crates-io` is a GitHub Actions environment with `MikeGrier` as a
+    # required reviewer and `CARGO_REGISTRY_TOKEN` configured as a secret.
+    # The job pauses here until a maintainer approves it in the GitHub UI.
+    environment: crates-io
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: publish-crate
+
+      - name: Check CARGO_REGISTRY_TOKEN
+        # Fail fast before creating any public release artifact.
+        # If the secret is missing or misnamed this surfaces the problem
+        # immediately with an actionable message, before the GitHub
+        # Release is created and before cargo publish is attempted.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+              echo "::error::CARGO_REGISTRY_TOKEN secret is not set on the 'crates-io' environment. Add it under Settings → Environments → crates-io → Secrets."
+              exit 1
+          fi
+
+      - name: Create GitHub Release
+        # Create the release after the token check passes but before
+        # cargo publish. softprops/action-gh-release is idempotent
+        # (updates an existing release rather than failing), so this
+        # step is safe to retry. Putting it before the irreversible
+        # cargo publish means a transient release-step failure can be
+        # recovered by rerunning the job.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+
+      - name: cargo publish -p tpu
+        # Publish last: cargo publish is irreversible for a given
+        # version, so it runs only after all retriable steps above have
+        # already succeeded.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p tpu --locked
