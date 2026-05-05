@@ -92,7 +92,7 @@ pub fn run(
     let need_old_bytes = diff_out.is_some()
         || (policy.reject_introduced_mojibake && file.exists());
     let old_bytes: Option<Vec<u8>> = if need_old_bytes && file.exists() {
-        Some(fs::read(file)?)
+        Some(crate::retry_io(|| fs::read(file))?)
     } else {
         None
     };
@@ -190,13 +190,28 @@ pub fn run(
 
     if file_exists {
         let bak = PathBuf::from(format!("{}.bak", file.display()));
-        fs::rename(file, &bak)?;
-        if let Err(e) = tmp.persist(file) {
-            let _ = fs::rename(&bak, file); // attempt to restore
-            return Err(e.error.into());
-        }
+        crate::retry_io(|| fs::rename(file, &bak))?;
+        let mut tmp = Some(tmp);
+        crate::retry_io(|| {
+            let t = tmp.take().expect("persist retry: temp file already consumed");
+            match t.persist(file) {
+                Ok(_) => Ok(()),
+                Err(e) => { tmp = Some(e.file); Err(e.error) }
+            }
+        })
+        .map_err(|e| {
+            let _ = crate::retry_io(|| fs::rename(&bak, file)); // attempt to restore
+            e
+        })?;
     } else {
-        tmp.persist(file).map_err(|e| e.error)?;
+        let mut tmp = Some(tmp);
+        crate::retry_io(|| {
+            let t = tmp.take().expect("persist retry: temp file already consumed");
+            match t.persist(file) {
+                Ok(_) => Ok(()),
+                Err(e) => { tmp = Some(e.file); Err(e.error) }
+            }
+        })?;
     }
 
     // Emit the text diff after a successful write.
@@ -218,7 +233,7 @@ fn detect_target(
         return Ok((encoding_rs::UTF_8, LineEnding::Lf, false));
     }
 
-    let f = fs::File::open(file)?;
+    let f = crate::retry_io(|| fs::File::open(file))?;
     // Check length before opening; mapping a 0-byte file is platform-dependent.
     if f.metadata()?.len() == 0 {
         return Ok((encoding_rs::UTF_8, LineEnding::Lf, false));

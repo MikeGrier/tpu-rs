@@ -222,11 +222,19 @@ fn run_binary(
     tmp.write_all(&out_bytes)?;
 
     let bak_path = format!("{}.bak", file.display());
-    fs::rename(file, &bak_path)?;
-    if let Err(e) = tmp.persist(file) {
-        let _ = fs::rename(&bak_path, file); // best-effort restore
-        return Err(e.error.into());
-    }
+    crate::retry_io(|| fs::rename(file, &bak_path))?;
+    let mut tmp = Some(tmp);
+    crate::retry_io(|| {
+        let t = tmp.take().expect("persist retry: temp file already consumed");
+        match t.persist(file) {
+            Ok(_) => Ok(()),
+            Err(e) => { tmp = Some(e.file); Err(e.error) }
+        }
+    })
+    .map_err(|e| {
+        let _ = crate::retry_io(|| fs::rename(&bak_path, file)); // best-effort restore
+        e
+    })?;
 
     Ok(op_count)
 }
@@ -386,11 +394,19 @@ fn run_line(
     tmp.write_all(&out_bytes)?;
 
     let bak_path = format!("{}.bak", file.display());
-    fs::rename(file, &bak_path)?;
-    if let Err(e) = tmp.persist(file) {
-        let _ = fs::rename(&bak_path, file); // best-effort restore
-        return Err(e.error.into());
-    }
+    crate::retry_io(|| fs::rename(file, &bak_path))?;
+    let mut tmp = Some(tmp);
+    crate::retry_io(|| {
+        let t = tmp.take().expect("persist retry: temp file already consumed");
+        match t.persist(file) {
+            Ok(_) => Ok(()),
+            Err(e) => { tmp = Some(e.file); Err(e.error) }
+        }
+    })
+    .map_err(|e| {
+        let _ = crate::retry_io(|| fs::rename(&bak_path, file)); // best-effort restore
+        e
+    })?;
 
     // Emit the unified text diff after a successful write.
     if let (Some(out), Some(old)) = (diff_out, old_norm) {
