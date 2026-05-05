@@ -94,37 +94,51 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # Find the previous v* release tag reachable from HEAD's parent.
-          # `--match 'v*'` restricts to release tags only, avoiding noise
-          # from other tag patterns.  `2>/dev/null || true` handles two
+          # Find the previous release tag reachable from HEAD's parent.
+          # We prefer the new `v*` scheme; during the migration period
+          # (first `v*` release after the old `tpu-v*` / `tpu-mcp-v*`
+          # scheme) there may be no prior `v*` tag, so we fall back to
+          # `tpu-v*`.  Both `2>/dev/null || true` calls handle the two
           # expected failure cases:
           #   1. Initial commit: HEAD^ does not exist → git describe fails.
-          #   2. No previous v* tag exists yet → git describe fails.
-          # In both cases prev_tag is left empty and we fall through to the
-          # "first release" branch below.
+          #   2. No matching tag exists at all → git describe fails.
+          # If neither pattern matches, prev_tag is left empty and we fall
+          # through to the "first release" branch below.
           # NOTE: `fetch-depth: 0` on the Checkout step above ensures the full
           # tag history is available, so HEAD^ and all prior tags are reachable.
-          prev_tag=$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)
+          prev_tag=$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null \
+            || git describe --tags --abbrev=0 --match 'tpu-v*' HEAD^ 2>/dev/null \
+            || true)
           if [ -z "$prev_tag" ]; then
-            echo "No previous v* tag found — publishing as first release"
+            echo "No previous release tag found — publishing as first release"
             echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
           else
             # Source changes in crates/tpu/ (Rust code, crate Cargo.toml, tests).
             tpu_src=$(git diff --name-only "$prev_tag" HEAD -- crates/tpu/)
             # Workspace-level changes that affect the tpu crate specifically:
-            #   - [workspace.package] metadata beyond the version bump
-            #     (e.g. an edition or rust-version change), OR
+            #   - [workspace.package] metadata keys that crates/tpu/Cargo.toml
+            #     inherits via `<key>.workspace = true` dotted-key syntax
+            #     (e.g. edition, rust-version, license, …) — excluding `version`
+            #     which is bumped on every release-please PR and is not a
+            #     signal that the published crate has structurally changed.
             #   - [workspace.dependencies] entries for deps that
             #     crates/tpu/Cargo.toml declares with `workspace = true`.
-            # Changes to workspace deps only used by crates/tpu-mcp/ are
-            # excluded to avoid forcing a crates.io publish on extension-only
-            # releases.
+            # Changes to workspace deps/metadata only used by crates/tpu-mcp/
+            # are excluded to avoid forcing a crates.io publish on
+            # extension-only releases.
             #
-            # Build an alternation pattern from tpu's workspace-dep names,
-            # then filter the Cargo.toml diff to only relevant lines.
             # `|| true` on the grep steps prevents exit code 1 (no match)
             # from aborting the script under set -euo pipefail — no match is
             # the normal result for an extension-only release.
+            #
+            # Dynamically read inherited package keys (e.g. edition, rust-version)
+            # from crates/tpu/Cargo.toml rather than a static list so that new
+            # `<key>.workspace = true` entries are automatically covered.
+            tpu_ws_pkg_keys=$(grep -E '^[a-zA-Z0-9_-]+\.workspace[[:space:]]*=[[:space:]]*true' \
+                crates/tpu/Cargo.toml \
+              | sed 's/\.workspace.*//' \
+              | grep -v '^version$' \
+              | tr '\n' '|' | sed 's/|$//' || true)
             tpu_ws_deps=$(grep -E '^[a-zA-Z0-9_-]+[[:space:]]*=' \
                 crates/tpu/Cargo.toml \
               | grep -E 'workspace[[:space:]]*=[[:space:]]*true' \
@@ -135,12 +149,19 @@ jobs:
               | grep -vE '^(\+|-)version[[:space:]]*=' || true)
             cargo_structural=""
             if [ -n "$root_diff" ]; then
-              if [ -n "$tpu_ws_deps" ]; then
-                cargo_structural=$(echo "$root_diff" \
-                  | grep -E "(${tpu_ws_deps}|edition|rust-version)" || true)
+              # Build combined pattern from inherited package keys + workspace dep names.
+              # Either or both may be empty; join with `|` only when both are present
+              # so we never produce a trailing `|` that would match every line.
+              if [ -n "$tpu_ws_pkg_keys" ] && [ -n "$tpu_ws_deps" ]; then
+                combined_pattern="${tpu_ws_pkg_keys}|${tpu_ws_deps}"
+              elif [ -n "$tpu_ws_pkg_keys" ]; then
+                combined_pattern="$tpu_ws_pkg_keys"
               else
+                combined_pattern="$tpu_ws_deps"
+              fi
+              if [ -n "$combined_pattern" ]; then
                 cargo_structural=$(echo "$root_diff" \
-                  | grep -E "(edition|rust-version)" || true)
+                  | grep -E "(${combined_pattern})" || true)
               fi
             fi
             if [ -n "$tpu_src" ] || [ -n "$cargo_structural" ]; then

@@ -88,6 +88,18 @@ jobs:
         id: workspace-version
         uses: ./.github/actions/workspace-version
 
+      - name: Verify package.json version matches workspace version
+        shell: pwsh
+        run: |
+          $pkg = Get-Content crates/tpu-mcp/extension/package.json | ConvertFrom-Json
+          $pkgVer = $pkg.version
+          $wsVer = "${{ steps.workspace-version.outputs.version }}"
+          if ($pkgVer -ne $wsVer) {
+              Write-Error "package.json version '$pkgVer' does not match workspace version '$wsVer'. Ensure release-please (or a manual edit) has updated package.json in sync with Cargo.toml."
+              exit 1
+          }
+          Write-Host "package.json version OK: $pkgVer"
+
       - name: Stage binary into extension/bin/
         shell: pwsh
         run: |
