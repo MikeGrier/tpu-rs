@@ -75,11 +75,11 @@ jobs:
           $dst = "crates/tpu-mcp/extension/bin/tpu-mcp.exe"
           Copy-Item $src $dst -Force
           # Read the crate version from Cargo.toml (single source of truth).
-          $cargo = Get-Content crates/tpu-mcp/Cargo.toml -Raw
+          $cargo = Get-Content Cargo.toml -Raw
           if ($cargo -match '(?m)^version\s*=\s*"([^"]+)"') {
               $ver = $Matches[1]
           } else {
-              throw "Could not parse version from crates/tpu-mcp/Cargo.toml"
+              throw "Could not parse version from Cargo.toml"
           }
           Set-Content -NoNewline -Encoding ascii `
               -Path crates/tpu-mcp/extension/bin/VERSION -Value $ver

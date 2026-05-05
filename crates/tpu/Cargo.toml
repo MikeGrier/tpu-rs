@@ -2,8 +2,8 @@
 
 [package]
 name = "tpu"
-version = "0.1.3"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 
 [lib]
 name = "tpu"

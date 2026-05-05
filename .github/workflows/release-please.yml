@@ -1,0 +1,82 @@
+# Copyright (c) 2026, Michael Grier
+name: release-please
+
+# Creates or updates a "Release PR" on every push to main.
+# When the Release PR is merged it creates the tag + GitHub Release,
+# which triggers publish-extension.yml and publish-crate.yml.
+#
+# Commit message conventions that drive version bumps:
+#   fix: ...             → patch  (0.1.3 → 0.1.4)
+#   feat: ...            → minor  (0.1.3 → 0.2.0)
+#   feat!: ...           → major  (0.1.3 → 1.0.0)
+#   BREAKING CHANGE: ... → major  (in the commit footer)
+#
+# What the Release PR updates automatically:
+#   - [workspace.package].version in Cargo.toml  (both Rust crates inherit
+#     it via `version.workspace = true`)
+#   - Cargo.lock (updated by the `update-lockfile` job below)
+#   - version in crates/tpu-mcp/extension/package.json
+#   - version in crates/tpu-mcp/extension/package-lock.json (root + packages[""])
+#   - CHANGELOG.md
+#
+# After merging the Release PR the tag v{version} is created.
+# publish-extension.yml and publish-crate.yml both trigger on `v*` tags.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      pr: ${{ steps.release.outputs.pr }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # After release-please creates or updates the Release PR, run
+  # `cargo check --workspace` (without --locked) so that Cargo.lock is
+  # regenerated to reflect the new [workspace.package].version.  Without
+  # this step the CI on the Release PR would fail because Cargo.lock would
+  # still reference the old workspace-member versions.
+  update-lockfile:
+    name: update Cargo.lock on release PR
+    runs-on: ubuntu-latest
+    needs: release-please
+    if: ${{ needs.release-please.outputs.pr != '' }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Update Cargo.lock for version bump
+        # Running without --locked lets cargo update the workspace-member
+        # entries (tpu, tpu-mcp) to match the new version while preserving
+        # the locked versions of all external dependencies.
+        run: cargo check --workspace
+
+      - name: Commit updated Cargo.lock
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.lock
+          git diff --staged --quiet || git commit -m "chore: update Cargo.lock for version bump"
+          git push
