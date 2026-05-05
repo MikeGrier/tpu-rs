@@ -80,10 +80,10 @@ pub fn read_raw_bytes(path: &Path, mode: IoMode) -> io::Result<Vec<u8>> {
 /// Retry a closure that returns [`io::Result<T>`] up to 5 times on transient
 /// Windows AV/Defender errors (sharing violation or access denied), sleeping
 /// 25 ms between attempts.  Returns immediately on any other error or after
-/// the fifth failure.
+/// exhausting all retries.
 ///
 /// The minimum practical Windows sleep quantum is ~15 ms; 25 ms is chosen to
-/// comfortably clear a single AV scan window.  Five retries adds at most 125 ms,
+/// comfortably clear a single AV scan window.  Five retries add at most 125 ms,
 /// which is imperceptible in practice and far less disruptive than the operation
 /// failing outright.
 pub fn retry_io<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {

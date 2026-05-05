@@ -145,11 +145,19 @@ pub fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn std::er
         } else {
             let p = PathBuf::from(spec);
             if p.is_dir() {
+                // Normalize the example: strip a leading "./" or ".\\" and any
+                // trailing separators so the suggested glob matches what the
+                // walker sees after strip_prefix(".").
+                let normalized = spec
+                    .strip_prefix("./")
+                    .or_else(|| spec.strip_prefix(".\\"))
+                    .unwrap_or(spec)
+                    .trim_end_matches(['/', '\\']);
                 return Err(format!(
                     "find: {:?} is a directory — pass a glob pattern to search \
                      recursively, e.g. {:?}",
                     spec,
-                    format!("{}/**", spec.trim_end_matches(['/', '\\'])),
+                    format!("{normalized}/**"),
                 )
                 .into());
             }
