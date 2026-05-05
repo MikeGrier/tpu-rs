@@ -1,0 +1,39 @@
+# Copyright (c) 2026, Michael Grier
+name: Read workspace version
+description: >
+  Reads [workspace.package].version from the root Cargo.toml (the single
+  source of truth after workspace version inheritance) and exposes it as an
+  output so callers do not have to duplicate the Cargo.toml parsing logic.
+
+outputs:
+  version:
+    description: Workspace version string (e.g. "0.1.3")
+    value: ${{ steps.read.outputs.version }}
+
+runs:
+  using: composite
+  steps:
+    - id: read
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Read the version only from the [workspace.package] section:
+        #   1. Set `in_section=1` when entering [workspace.package].
+        #   2. Reset `in_section=0` when any other section header is seen.
+        #   3. Capture the version string only while in_section is set.
+        # This avoids accidentally matching a `version = "..."` line that
+        # might appear in another TOML section before [workspace.package].
+        ver=$(awk '
+          /^\[workspace\.package\]/ { in_section=1; next }
+          /^\[/                      { in_section=0 }
+          in_section && /^version[[:space:]]*=/ {
+            match($0, /"([^"]+)"/, a)
+            print a[1]
+            exit
+          }
+        ' Cargo.toml)
+        if [ -z "$ver" ]; then
+          echo "::error::Could not parse [workspace.package].version from Cargo.toml"
+          exit 1
+        fi
+        echo "version=$ver" >> "$GITHUB_OUTPUT"
