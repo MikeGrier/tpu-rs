@@ -109,18 +109,24 @@ jobs:
             echo "No previous v* tag found — publishing as first release"
             echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
           else
-            # Include the root Cargo.toml in the diff: it is the workspace
-            # manifest that controls shared dependencies and the edition that
-            # both crates inherit.  A shared dependency bump or edition change
-            # in the root manifest affects what `cargo publish -p tpu` packages,
-            # so it must count as a tpu change even if crates/tpu/ is untouched.
-            changed=$(git diff --name-only "$prev_tag" HEAD -- crates/tpu/ Cargo.toml)
-            if [ -n "$changed" ]; then
-              echo "tpu crate or workspace root changed since $prev_tag:"
-              echo "$changed"
+            # Source changes in crates/tpu/ (Rust code, crate Cargo.toml, tests).
+            tpu_src=$(git diff --name-only "$prev_tag" HEAD -- crates/tpu/)
+            # Structural changes in the root Cargo.toml beyond the workspace
+            # version bump.  Every release-please PR updates the `version = `
+            # line there, so we filter that line out before deciding whether
+            # a structural change (e.g. a new shared dependency) affects the
+            # packaged crate.
+            cargo_structural=$(git diff "$prev_tag" HEAD -- Cargo.toml \
+              | grep '^[+-]' \
+              | grep -v '^---' | grep -v '^+++' \
+              | grep -vE '^(\+|-)version[[:space:]]*=')
+            if [ -n "$tpu_src" ] || [ -n "$cargo_structural" ]; then
+              echo "tpu crate or structural workspace-root change detected since $prev_tag:"
+              [ -n "$tpu_src" ] && echo "$tpu_src"
+              [ -n "$cargo_structural" ] && echo "(Cargo.toml structural change)"
               echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
             else
-              echo "No changes in crates/tpu/ or Cargo.toml since $prev_tag — crates.io publish will be skipped"
+              echo "No changes in crates/tpu/ or Cargo.toml (beyond version bump) since $prev_tag — crates.io publish will be skipped"
               echo "tpu_changed=false" >> "$GITHUB_OUTPUT"
             fi
           fi

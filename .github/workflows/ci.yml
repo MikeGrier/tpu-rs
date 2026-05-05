@@ -9,6 +9,17 @@ on:
 permissions:
   contents: read
 
+# Cancel any in-progress run on the same branch when a new commit is pushed.
+# On `push` to main github.head_ref is empty, so github.run_id is used
+# (unique per run → no cancellation).  On pull_request github.head_ref is
+# the branch name, so a newer push cancels the older run.  This ensures
+# that when the release-please `update-lockfile` job pushes a Cargo.lock fix
+# commit to the Release PR branch, the earlier (stale-lockfile) run is
+# cancelled and only the fresh run with the correct Cargo.lock proceeds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
 # Opt every JavaScript-action step into the Node.js 24 runtime ahead of
 # GitHub's June 2, 2026 forced cutover. Surfaces any action-vs-runtime
 # incompatibilities under our control rather than discovering them on the
