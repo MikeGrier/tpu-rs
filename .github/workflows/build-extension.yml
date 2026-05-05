@@ -10,11 +10,15 @@ on:
   push:
     branches: [main]
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "crates/tpu/**"
       - "crates/tpu-mcp/**"
       - ".github/workflows/build-extension.yml"
   pull_request:
     paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
       - "crates/tpu/**"
       - "crates/tpu-mcp/**"
       - ".github/workflows/build-extension.yml"

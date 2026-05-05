@@ -64,7 +64,7 @@ jobs:
           if [[ "$tag" == v* ]]; then
               tag_ver="${tag#v}"
               if [[ "$tag_ver" != "$ver" ]]; then
-                  echo "::error::Tag '$tag' implies version '$tag_ver' but Cargo.toml has '$ver'. Bump the crate, retag, and try again."
+                  echo "::error::Tag '$tag' implies version '$tag_ver' but Cargo.toml has '$ver'. Update [workspace.package] version in the root Cargo.toml (or rerun release-please), retag, and try again."
                   exit 1
               fi
           fi
