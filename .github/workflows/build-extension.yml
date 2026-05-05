@@ -4,7 +4,7 @@ name: build-extension
 # Build per-platform VSIXes for the tpu-mcp VS Code extension on every push
 # and PR. This workflow does NOT publish; publishing happens in
 # `publish-extension.yml` which is gated behind a required-reviewer
-# environment and only fires on `tpu-mcp-v*` tags.
+# environment and only fires on `v*` tags.
 
 on:
   push:

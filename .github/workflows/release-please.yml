@@ -26,6 +26,14 @@ on:
   push:
     branches: [main]
 
+# Serialize all runs so the `update-lockfile` job never races against a
+# concurrent run trying to push to the same release-PR branch.
+# `cancel-in-progress: false` lets an in-flight run finish; the next
+# queued run will then see a fully up-to-date release branch.
+concurrency:
+  group: release-please
+  cancel-in-progress: false
+
 permissions:
   contents: write
   pull-requests: write
@@ -43,7 +51,13 @@ jobs:
       - uses: googleapis/release-please-action@v4
         id: release
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # IMPORTANT: must be a PAT (personal access token) with `repo`
+          # scope, NOT `secrets.GITHUB_TOKEN`. GitHub suppresses workflow
+          # triggers for events (tags, pushes) created by GITHUB_TOKEN, so
+          # the v* tag that release-please creates on merge would never start
+          # publish-extension.yml or publish-crate.yml. Store a PAT as the
+          # `RELEASE_PLEASE_TOKEN` repository secret to enable those flows.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
 
@@ -61,7 +75,9 @@ jobs:
       - uses: actions/checkout@v5
         with:
           ref: ${{ fromJSON(needs.release-please.outputs.pr).headBranchName }}
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Use the same PAT so the committed Cargo.lock push is associated
+          # with the non-bot identity, ensuring CI triggers on the new commit.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN }}
 
       - uses: dtolnay/rust-toolchain@stable
 
