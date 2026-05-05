@@ -109,13 +109,18 @@ jobs:
             echo "No previous v* tag found — publishing as first release"
             echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
           else
-            changed=$(git diff --name-only "$prev_tag" HEAD -- crates/tpu/)
+            # Include the root Cargo.toml in the diff: it is the workspace
+            # manifest that controls shared dependencies and the edition that
+            # both crates inherit.  A shared dependency bump or edition change
+            # in the root manifest affects what `cargo publish -p tpu` packages,
+            # so it must count as a tpu change even if crates/tpu/ is untouched.
+            changed=$(git diff --name-only "$prev_tag" HEAD -- crates/tpu/ Cargo.toml)
             if [ -n "$changed" ]; then
-              echo "tpu crate changed since $prev_tag:"
+              echo "tpu crate or workspace root changed since $prev_tag:"
               echo "$changed"
               echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
             else
-              echo "No changes in crates/tpu/ since $prev_tag — crates.io publish will be skipped"
+              echo "No changes in crates/tpu/ or Cargo.toml since $prev_tag — crates.io publish will be skipped"
               echo "tpu_changed=false" >> "$GITHUB_OUTPUT"
             fi
           fi
