@@ -27,8 +27,10 @@ runs:
           /^\[workspace\.package\]/ { in_section=1; next }
           /^\[/                      { in_section=0 }
           in_section && /^version[[:space:]]*=/ {
-            match($0, /"([^"]+)"/, a)
-            print a[1]
+            # POSIX split() on " is universally supported (mawk, gawk, awk).
+            # Field [2] is the text between the first and second double-quote.
+            split($0, a, "\"")
+            print a[2]
             exit
           }
         ' Cargo.toml)

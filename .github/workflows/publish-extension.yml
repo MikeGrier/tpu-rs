@@ -83,16 +83,22 @@ jobs:
           $dst = "crates/tpu-mcp/extension/bin/tpu-mcp.exe"
           Copy-Item $src $dst -Force
           $ver = "${{ steps.workspace-version.outputs.version }}"
-          # Cross-check: the tag must agree with the crate version, otherwise
-          # we'd publish an extension whose advertised version disagrees with
-          # the tag the operator pushed. `github.ref_name` is the tag name
-          # (e.g. `v0.1.3`) on a tag push.
+          # Cross-check 1: tag must agree with the workspace Cargo version.
+          # Cross-check 2: package.json must agree with the workspace version.
+          # release-please keeps these in sync via extra-files, but this
+          # catches any drift (stale extra-file update, manual tag push, etc.)
+          # before vsce packages the wrong version.
           $tag = "${{ github.ref_name }}"
           if ($tag -like "v*") {
               $tagVer = $tag.Substring("v".Length)
               if ($tagVer -ne $ver) {
                   throw "Tag '$tag' implies version '$tagVer' but Cargo.toml has '$ver'. Update [workspace.package] version in the root Cargo.toml (or rerun release-please), retag, and try again."
               }
+          }
+          $pkgJson = Get-Content -Raw "crates/tpu-mcp/extension/package.json" | ConvertFrom-Json
+          $pkgVer = $pkgJson.version
+          if ($pkgVer -ne $ver) {
+              throw "package.json version '$pkgVer' does not match workspace version '$ver'. Ensure release-please updated package.json via extra-files, retag, and try again."
           }
           Set-Content -NoNewline -Encoding ascii `
               -Path crates/tpu-mcp/extension/bin/VERSION -Value $ver
