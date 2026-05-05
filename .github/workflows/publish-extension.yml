@@ -72,18 +72,17 @@ jobs:
         if: matrix.rust_target == 'x86_64-pc-windows-msvc'
         run: cargo test -p tpu-mcp --target ${{ matrix.rust_target }} --locked
 
+      - name: Read workspace version
+        id: workspace-version
+        uses: ./.github/actions/workspace-version
+
       - name: Stage binary into extension/bin/
         shell: pwsh
         run: |
           $src = "target/${{ matrix.rust_target }}/release/tpu-mcp.exe"
           $dst = "crates/tpu-mcp/extension/bin/tpu-mcp.exe"
           Copy-Item $src $dst -Force
-          $cargo = Get-Content Cargo.toml -Raw
-          if ($cargo -match '(?m)^version\s*=\s*"([^"]+)"') {
-              $ver = $Matches[1]
-          } else {
-              throw "Could not parse version from Cargo.toml"
-          }
+          $ver = "${{ steps.workspace-version.outputs.version }}"
           # Cross-check: the tag must agree with the crate version, otherwise
           # we'd publish an extension whose advertised version disagrees with
           # the tag the operator pushed. `github.ref_name` is the tag name

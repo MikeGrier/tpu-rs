@@ -24,6 +24,14 @@ name: publish-crate
 #     `Cargo.toml` ([workspace.package].version) and asserts it matches
 #     the pushed tag. This prevents accidentally publishing the wrong
 #     version if a tag is pushed without a matching release-please bump.
+#
+# Selective publish:
+#   - Because the workspace uses a single shared version, a release that
+#     only touches the VS Code extension (crates/tpu-mcp/**) or workflow
+#     files would otherwise force a crates.io version bump for `tpu`
+#     despite no Rust API change. The `verify` job therefore diffs
+#     `crates/tpu/` against the previous tag and sets `tpu_changed`.
+#     The `publish` job only runs when `tpu_changed == 'true'`.
 
 on:
   push:
@@ -43,10 +51,20 @@ jobs:
   verify:
     name: verify + test
     runs-on: ubuntu-latest
+    outputs:
+      tpu_changed: ${{ steps.detect-changes.outputs.tpu_changed }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+        with:
+          # Full history + tags are needed by the detect-changes step to
+          # compare crates/tpu/ against the previous release tag.
+          fetch-depth: 0
+
+      - name: Read workspace version
+        id: workspace-version
+        uses: ./.github/actions/workspace-version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -60,7 +78,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          ver=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          ver="${{ steps.workspace-version.outputs.version }}"
           tag="${GITHUB_REF_NAME}"
           if [[ "$tag" == v* ]]; then
               tag_ver="${tag#v}"
@@ -70,6 +88,37 @@ jobs:
               fi
           fi
           echo "Version check passed: $ver"
+
+      - name: Detect tpu crate changes
+        id: detect-changes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Find the previous v* release tag reachable from HEAD's parent.
+          # `--match 'v*'` restricts to release tags only, avoiding noise
+          # from other tag patterns.  `2>/dev/null || true` handles two
+          # expected failure cases:
+          #   1. Initial commit: HEAD^ does not exist → git describe fails.
+          #   2. No previous v* tag exists yet → git describe fails.
+          # In both cases prev_tag is left empty and we fall through to the
+          # "first release" branch below.
+          # NOTE: `fetch-depth: 0` on the Checkout step above ensures the full
+          # tag history is available, so HEAD^ and all prior tags are reachable.
+          prev_tag=$(git describe --tags --abbrev=0 --match 'v*' HEAD^ 2>/dev/null || true)
+          if [ -z "$prev_tag" ]; then
+            echo "No previous v* tag found — publishing as first release"
+            echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            changed=$(git diff --name-only "$prev_tag" HEAD -- crates/tpu/)
+            if [ -n "$changed" ]; then
+              echo "tpu crate changed since $prev_tag:"
+              echo "$changed"
+              echo "tpu_changed=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "No changes in crates/tpu/ since $prev_tag — crates.io publish will be skipped"
+              echo "tpu_changed=false" >> "$GITHUB_OUTPUT"
+            fi
+          fi
 
       - name: Check text encoding
         run: pwsh -File tools/check-encoding.ps1
@@ -89,9 +138,12 @@ jobs:
     name: publish to crates.io
     needs: verify
     runs-on: ubuntu-latest
-    # Only run on real tag pushes.  workflow_dispatch never reaches this job,
-    # so the crates-io environment gate is never presented on manual runs.
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    # Only run on real tag pushes where the tpu crate itself changed.
+    # workflow_dispatch never reaches this job (so the crates-io environment
+    # gate is never presented on manual runs).  Extension-only releases that
+    # do not touch crates/tpu/ are also skipped here to avoid publishing a
+    # semver-bumped crate with no corresponding Rust API change.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') && needs.verify.outputs.tpu_changed == 'true'
     # `crates-io` is a GitHub Actions environment with `MikeGrier` as a
     # required reviewer and `CARGO_REGISTRY_TOKEN` configured as a secret.
     # The job pauses here until a maintainer approves it in the GitHub UI.

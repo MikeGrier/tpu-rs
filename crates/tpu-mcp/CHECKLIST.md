@@ -80,7 +80,7 @@ design discussion.
       `MikeGrier` as a required reviewer; add the PAT to that
       environment as the secret `VSCE_PAT`.
 - [ ] M3-3: Add `.github/workflows/publish-extension.yml` triggered
-      on tags matching `tpu-mcp-v*`. Job uses
+      on tags matching `v*`. Job uses
       `environment: marketplace` so the publish step blocks on the
       required reviewer's approval. **(Workflow committed; awaiting
       M3-1/M3-2 operator setup before first tag push.)**

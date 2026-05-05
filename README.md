@@ -16,7 +16,7 @@ Once published, install it from the Marketplace:
 code --install-extension MikeGrierTools.tpu-mcp
 ```
 
-(Marketplace listing goes live with the first `tpu-mcp-v*` tag; until
+(Marketplace listing goes live with the first `v*` tag; until
 then, install a per-platform `.vsix` from a
 [build-extension](https://github.com/MikeGrier/tpu-rs/actions/workflows/build-extension.yml)
 run.)
