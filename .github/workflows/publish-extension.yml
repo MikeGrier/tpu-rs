@@ -5,7 +5,8 @@ name: publish-extension
 # public Marketplace and attach them to a GitHub Release.
 #
 # Trigger:
-#   - Pushing a tag matching `tpu-mcp-v*` (e.g. `tpu-mcp-v0.1.0`).
+#   - Pushing a tag matching `v*` (e.g. `v0.1.3`); created automatically
+#     by release-please when the Release PR is merged.
 #   - `workflow_dispatch` for manual rehearsal (publish step still gated).
 #
 # Gating:
@@ -26,7 +27,7 @@ name: publish-extension
 on:
   push:
     tags:
-      - "tpu-mcp-v*"
+      - "v*"
   workflow_dispatch:
 
 permissions:
@@ -71,28 +72,35 @@ jobs:
         if: matrix.rust_target == 'x86_64-pc-windows-msvc'
         run: cargo test -p tpu-mcp --target ${{ matrix.rust_target }} --locked
 
+      - name: Read workspace version
+        id: workspace-version
+        uses: ./.github/actions/workspace-version
+
       - name: Stage binary into extension/bin/
         shell: pwsh
         run: |
           $src = "target/${{ matrix.rust_target }}/release/tpu-mcp.exe"
           $dst = "crates/tpu-mcp/extension/bin/tpu-mcp.exe"
           Copy-Item $src $dst -Force
-          $cargo = Get-Content crates/tpu-mcp/Cargo.toml -Raw
-          if ($cargo -match '(?m)^version\s*=\s*"([^"]+)"') {
-              $ver = $Matches[1]
-          } else {
-              throw "Could not parse version from crates/tpu-mcp/Cargo.toml"
-          }
-          # Cross-check: the tag must agree with the crate version, otherwise
-          # we'd publish an extension whose advertised version disagrees with
-          # the tag the operator pushed. `github.ref_name` is the tag name
-          # (e.g. `tpu-mcp-v0.1.0`) on a tag push.
+          $ver = "${{ steps.workspace-version.outputs.version }}"
+          # Cross-check 1: tag must agree with the workspace Cargo version.
+          # Cross-check 2: package.json must agree with the workspace version.
+          # release-please keeps these in sync via extra-files, but this
+          # catches any drift (stale extra-file update, manual tag push, etc.)
+          # before vsce packages the wrong version.
           $tag = "${{ github.ref_name }}"
-          if ($tag -like "tpu-mcp-v*") {
-              $tagVer = $tag.Substring("tpu-mcp-v".Length)
+          # Only cross-check when an actual tag was pushed (not on workflow_dispatch
+          # from a branch whose name happens to start with "v").
+          if ("${{ github.ref_type }}" -eq "tag" -and $tag -like "v*") {
+              $tagVer = $tag.Substring("v".Length)
               if ($tagVer -ne $ver) {
-                  throw "Tag '$tag' implies version '$tagVer' but Cargo.toml has '$ver'. Bump the crate, retag, and try again."
+                  throw "Tag '$tag' implies version '$tagVer' but Cargo.toml has '$ver'. Update [workspace.package] version in the root Cargo.toml (or rerun release-please), retag, and try again."
               }
+          }
+          $pkgJson = Get-Content -Raw "crates/tpu-mcp/extension/package.json" | ConvertFrom-Json
+          $pkgVer = $pkgJson.version
+          if ($pkgVer -ne $ver) {
+              throw "package.json version '$pkgVer' does not match workspace version '$ver'. Ensure release-please updated package.json via extra-files, retag, and try again."
           }
           Set-Content -NoNewline -Encoding ascii `
               -Path crates/tpu-mcp/extension/bin/VERSION -Value $ver
@@ -193,7 +201,7 @@ jobs:
       - name: Create GitHub Release with VSIX attachments
         # Only on tag pushes. `workflow_dispatch` runs publish to
         # Marketplace but does not create a Release (no tag to attach to).
-        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/tpu-mcp-v')
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.ref_name }}
