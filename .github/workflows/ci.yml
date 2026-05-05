@@ -42,4 +42,7 @@ jobs:
       - name: cargo build
         run: cargo build --workspace --all-targets --locked
       - name: cargo test
-        run: cargo test --workspace --locked
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LIB_BACKTRACE: 1
+        run: cargo test --workspace --locked --no-fail-fast
