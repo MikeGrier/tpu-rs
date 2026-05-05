@@ -263,9 +263,9 @@ pub fn run(
         tmp.write_all(&out_bytes)?;
 
         let bak_path = format!("{}.bak", file.display());
-        fs::rename(file, &bak_path)?;
+        crate::retry_io(|| fs::rename(file, &bak_path))?;
         if let Err(e) = tmp.persist(file) {
-            let _ = fs::rename(&bak_path, file); // attempt to restore on failure
+            let _ = crate::retry_io(|| fs::rename(&bak_path, file)); // attempt to restore on failure
             return Err(e.error.into());
         }
     }

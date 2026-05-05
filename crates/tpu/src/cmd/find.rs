@@ -143,7 +143,17 @@ pub fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn std::er
                 return Err(format!("find: glob {:?} matched no files", spec).into());
             }
         } else {
-            paths.push(PathBuf::from(spec));
+            let p = PathBuf::from(spec);
+            if p.is_dir() {
+                return Err(format!(
+                    "find: {:?} is a directory — pass a glob pattern to search \
+                     recursively, e.g. {:?}",
+                    spec,
+                    format!("{}/**", spec.trim_end_matches(['/', '\\'])),
+                )
+                .into());
+            }
+            paths.push(p);
         }
     }
     Ok(paths)
@@ -368,7 +378,8 @@ pub fn run(
             prefix.as_deref(),
             out,
             io_mode,
-        )?;
+        )
+        .map_err(|e| format!("find: {}: {e}", file.display()))?;
         total_matches += n;
     }
 

@@ -11,7 +11,7 @@ pub mod rsp;
 pub mod shell;
 pub mod test_fixtures;
 
-use std::{error::Error, fs, io, path::Path, sync::Arc};
+use std::{error::Error, fs, io, path::Path, sync::Arc, time::Duration};
 
 use memmap2::MmapOptions;
 use redwing::Branch;
@@ -44,14 +44,14 @@ pub enum IoMode {
 pub fn open_as_branch(path: &Path, mode: IoMode) -> Result<Arc<dyn Branch>, Box<dyn Error>> {
     match mode {
         IoMode::Mmap => {
-            let f = fs::File::open(path)?;
+            let f = retry_io(|| fs::File::open(path))?;
             // SAFETY: bytes are accessed read-only through the Branch API.
             let mmap = unsafe { MmapOptions::new().map(&f) }?;
             drop(f);
             Ok(redwing::make_thicket_from_mmap(mmap).main())
         }
         IoMode::Buffered => {
-            let bytes = fs::read(path)?;
+            let bytes = retry_io(|| fs::read(path))?;
             Ok(redwing::make_thicket_from_bytes(bytes).main())
         }
     }
@@ -67,12 +67,53 @@ pub fn open_as_branch(path: &Path, mode: IoMode) -> Result<Arc<dyn Branch>, Box<
 pub fn read_raw_bytes(path: &Path, mode: IoMode) -> io::Result<Vec<u8>> {
     match mode {
         IoMode::Mmap => {
-            let f = fs::File::open(path)?;
+            let f = retry_io(|| fs::File::open(path))?;
             // SAFETY: bytes are accessed read-only and copied out immediately.
             let mmap = unsafe { MmapOptions::new().map(&f) }?;
             drop(f);
             Ok(mmap[..].to_vec())
         }
-        IoMode::Buffered => fs::read(path),
+        IoMode::Buffered => retry_io(|| fs::read(path)),
+    }
+}
+
+/// Retry a closure that returns [`io::Result<T>`] up to 5 times on transient
+/// Windows AV/Defender errors (sharing violation or access denied), sleeping
+/// 25 ms between attempts.  Returns immediately on any other error or after
+/// the fifth failure.
+///
+/// The minimum practical Windows sleep quantum is ~15 ms; 25 ms is chosen to
+/// comfortably clear a single AV scan window.  Five retries adds at most 125 ms,
+/// which is imperceptible in practice and far less disruptive than the operation
+/// failing outright.
+pub fn retry_io<T, F: FnMut() -> io::Result<T>>(mut f: F) -> io::Result<T> {
+    const MAX_RETRIES: u32 = 5;
+    const RETRY_DELAY: Duration = Duration::from_millis(25);
+    let mut attempt = 0u32;
+    loop {
+        match f() {
+            Ok(v) => return Ok(v),
+            Err(e) if attempt < MAX_RETRIES && is_transient_io_error(&e) => {
+                attempt += 1;
+                std::thread::sleep(RETRY_DELAY);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+/// Returns `true` for transient Windows I/O errors that may clear with a
+/// short retry delay (AV/Defender scan in progress: sharing violation = os
+/// error 32, access denied = os error 5).  Always `false` on non-Windows
+/// platforms where these codes do not have the same transient meaning.
+fn is_transient_io_error(e: &io::Error) -> bool {
+    #[cfg(windows)]
+    {
+        matches!(e.raw_os_error(), Some(5) | Some(32))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = e;
+        false
     }
 }

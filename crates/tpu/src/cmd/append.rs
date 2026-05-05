@@ -64,7 +64,7 @@ pub fn run(
     }
 
     // ── Open the file and detect its properties ───────────────────────────────
-    let f = fs::File::open(file)?;
+    let f = crate::retry_io(|| fs::File::open(file))?;
     let file_len = f.metadata()?.len();
 
     let (encoding, detected_le, had_bom, decoded_text) = if file_len == 0 {
@@ -101,7 +101,7 @@ pub fn run(
     // ── Diff-only (preview) mode ──────────────────────────────────────────────
     // Emit a unified diff to `diff_out` and return without touching the file.
     if let Some(out) = diff_out {
-        let existing_bytes = fs::read(file)?;
+        let existing_bytes = crate::retry_io(|| fs::read(file))?;
         crate::cmd::write::emit_text_diff(file, &existing_bytes, encoding, &combined, out)?;
         return Ok(());
     }
@@ -153,9 +153,9 @@ pub fn run(
     tmp.flush()?;
 
     let bak = PathBuf::from(format!("{}.bak", file.display()));
-    fs::rename(file, &bak)?;
+    crate::retry_io(|| fs::rename(file, &bak))?;
     if let Err(e) = tmp.persist(file) {
-        let _ = fs::rename(&bak, file); // attempt to restore original
+        let _ = crate::retry_io(|| fs::rename(&bak, file)); // attempt to restore original
         return Err(e.error.into());
     }
 

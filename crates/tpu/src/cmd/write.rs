@@ -92,7 +92,7 @@ pub fn run(
     let need_old_bytes = diff_out.is_some()
         || (policy.reject_introduced_mojibake && file.exists());
     let old_bytes: Option<Vec<u8>> = if need_old_bytes && file.exists() {
-        Some(fs::read(file)?)
+        Some(crate::retry_io(|| fs::read(file))?)
     } else {
         None
     };
@@ -190,9 +190,9 @@ pub fn run(
 
     if file_exists {
         let bak = PathBuf::from(format!("{}.bak", file.display()));
-        fs::rename(file, &bak)?;
+        crate::retry_io(|| fs::rename(file, &bak))?;
         if let Err(e) = tmp.persist(file) {
-            let _ = fs::rename(&bak, file); // attempt to restore
+            let _ = crate::retry_io(|| fs::rename(&bak, file)); // attempt to restore
             return Err(e.error.into());
         }
     } else {
@@ -218,7 +218,7 @@ fn detect_target(
         return Ok((encoding_rs::UTF_8, LineEnding::Lf, false));
     }
 
-    let f = fs::File::open(file)?;
+    let f = crate::retry_io(|| fs::File::open(file))?;
     // Check length before opening; mapping a 0-byte file is platform-dependent.
     if f.metadata()?.len() == 0 {
         return Ok((encoding_rs::UTF_8, LineEnding::Lf, false));
