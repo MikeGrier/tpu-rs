@@ -191,12 +191,27 @@ pub fn run(
     if file_exists {
         let bak = PathBuf::from(format!("{}.bak", file.display()));
         crate::retry_io(|| fs::rename(file, &bak))?;
-        if let Err(e) = tmp.persist(file) {
+        let mut tmp = Some(tmp);
+        crate::retry_io(|| {
+            let t = tmp.take().expect("persist retry: temp file already consumed");
+            match t.persist(file) {
+                Ok(_) => Ok(()),
+                Err(e) => { tmp = Some(e.file); Err(e.error) }
+            }
+        })
+        .map_err(|e| {
             let _ = crate::retry_io(|| fs::rename(&bak, file)); // attempt to restore
-            return Err(e.error.into());
-        }
+            e
+        })?;
     } else {
-        tmp.persist(file).map_err(|e| e.error)?;
+        let mut tmp = Some(tmp);
+        crate::retry_io(|| {
+            let t = tmp.take().expect("persist retry: temp file already consumed");
+            match t.persist(file) {
+                Ok(_) => Ok(()),
+                Err(e) => { tmp = Some(e.file); Err(e.error) }
+            }
+        })?;
     }
 
     // Emit the text diff after a successful write.
