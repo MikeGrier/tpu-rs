@@ -486,7 +486,11 @@ pub fn run_with_policy(
         match result {
             Ok(n) => total_matches += n,
             Err(e) => match on_error {
-                crate::cmd::copy::OnError::Fail => return Err(e),
+                crate::cmd::copy::OnError::Fail => {
+                    return Err(
+                        format!("find: cannot search {}: {e}", file.display()).into()
+                    );
+                }
                 crate::cmd::copy::OnError::Warn => {
                     warnings_out.push(format!(
                         "find: cannot search {}: {e}",

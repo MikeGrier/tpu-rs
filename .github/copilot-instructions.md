@@ -3,6 +3,7 @@
 <!-- encoding-check: allow-mojibake (this file contains literal mojibake
      examples for documentation purposes) -->
 
+<!-- tpu-mcp:setup:begin -->
 ## File operations — use the `tpu-mcp` MCP tools, never PowerShell file I/O
 
 This repository ships a **`tpu-mcp` MCP server** that exposes every common
@@ -69,6 +70,7 @@ used the terminal.
   upgrade) to (re)inject the canonical guidance block, delimited by
   `<!-- tpu-mcp:setup:begin -->` / `<!-- tpu-mcp:setup:end -->`, into
   `.github/copilot-instructions.md`.
+<!-- tpu-mcp:setup:end -->
 
 ## Tool preference (use the first available)
 

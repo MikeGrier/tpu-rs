@@ -227,10 +227,6 @@ fn copy_one(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if dst.exists() && !opts.overwrite {
         report.skipped += 1;
-        let _ = shell.warn(format!(
-            "copy: destination exists, skipping (pass --overwrite to replace): {}",
-            dst.display()
-        ));
         return Ok(());
     }
     match fs::copy(src, dst) {
