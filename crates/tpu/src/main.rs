@@ -1969,8 +1969,8 @@ fn run(
                     output.display(),
                     report.substitutions,
                     if report.substitutions == 1 { "" } else { "s" },
-                    report.missing.len() + vars.len(),
-                    if report.missing.len() + vars.len() == 1 { "" } else { "s" },
+                    report.referenced,
+                    if report.referenced == 1 { "" } else { "s" },
                 ),
             )?;
             Ok(())

@@ -4,7 +4,7 @@
 
 use std::{
     fs,
-    path::{Path, PathBuf},
+    path::Path,
     process::{Command, Stdio},
 };
 
@@ -264,6 +264,4 @@ fn find_fail_mode_aborts_on_missing_path() {
     assert!(!out.status.success(), "fail mode must abort on missing path");
 }
 
-// Unused imports placeholder to silence warnings if `PathBuf` becomes unused.
-#[allow(dead_code)]
-fn _force_pathbuf_use() -> PathBuf { PathBuf::new() }
+

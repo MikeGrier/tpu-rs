@@ -49,11 +49,16 @@ pub enum MissingPolicy {
 /// were first encountered).
 #[derive(Debug, Default)]
 pub struct RenderResult {
-    /// Substitution count.
+    /// Substitution count (counts every substitution, including repeated uses
+    /// of the same token).
     pub substitutions: usize,
     /// Token names referenced in the template but absent from `vars` (in the
-    /// order of first appearance).
+    /// order of first appearance, deduplicated).
     pub missing: Vec<String>,
+    /// Count of distinct token names that were actually referenced by the
+    /// template (both found and missing, deduplicated). Useful for composing
+    /// human-readable summaries.
+    pub referenced: usize,
 }
 
 /// Substitute `{{KEY}}` tokens in `template` using `vars` and return the
@@ -68,6 +73,7 @@ pub fn render_str(
 ) -> Result<(String, RenderResult), Box<dyn std::error::Error>> {
     let mut out = String::with_capacity(template.len());
     let mut report = RenderResult::default();
+    let mut seen_tokens = std::collections::BTreeSet::<String>::new();
     let bytes = template.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
@@ -93,10 +99,12 @@ pub fn render_str(
                         Some(v) => {
                             out.push_str(v);
                             report.substitutions += 1;
+                            seen_tokens.insert(key.to_string());
                         }
                         None => {
                             if !report.missing.iter().any(|k| k == key) {
                                 report.missing.push(key.to_string());
+                                seen_tokens.insert(key.to_string());
                             }
                             match missing {
                                 MissingPolicy::Error => {
@@ -123,9 +131,16 @@ pub fn render_str(
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Advance by one Unicode scalar value (not one byte) so non-ASCII
+        // UTF-8 sequences in the literal text are emitted intact.
+        let ch = template[i..]
+            .chars()
+            .next()
+            .ok_or("render: internal error: expected UTF-8 character boundary")?;
+        out.push(ch);
+        i += ch.len_utf8();
     }
+    report.referenced = seen_tokens.len();
     if matches!(missing, MissingPolicy::Error) && !report.missing.is_empty() {
         return Err(format!(
             "render: template references undefined token{}: {}",

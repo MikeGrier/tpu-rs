@@ -105,7 +105,7 @@
                         "Suppress per-file records and surface only a summary at the end of the operation."
                     ],
                     "default": "each-file",
-                    "markdownDescription": "How verbose the streamed progress notifications should be for tree-walking tools. Currently informational; the server emits each-file progress regardless and consuming clients can collapse it."
+                    "markdownDescription": "How much per-file detail tree-walking tools include in their results. `each-file` (default) includes a full per-entry `log` in `tpu_copy_file` results and individual warning lines in `tpu_find` output. `summary` suppresses the per-entry log and collapses walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
                 }
             }
         }
