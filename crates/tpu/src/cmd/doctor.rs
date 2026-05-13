@@ -34,7 +34,7 @@
 //! matches than the input), the file is rewritten via the standard
 //! [`crate::cmd::write::run`] path so the existing `.bak` machinery and
 //! the M2 write-time guard apply uniformly.  The write is issued with
-//! [`WritePolicy::permissive`] because the *intent* is to write a string
+//! [`crate::mojibake::WritePolicy::permissive`] because the *intent* is to write a string
 //! that may still legitimately contain mojibake — we just want
 //! *strictly less* than before.
 //!
@@ -203,7 +203,19 @@ fn is_binary_extension(path: &Path) -> bool {
 ///   subtrees are skipped; entries matching the optional `.gitignore`
 ///   at the walk root are skipped),
 /// - a shell-style glob (any spec containing `*`, `?`, `[`, `{`).
+#[allow(dead_code)]
 fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    expand_paths_with_policy(path_specs, crate::cmd::copy::OnError::Fail, &mut Vec::new())
+}
+
+/// As [`expand_paths`] but with explicit walk-error policy. Inaccessible
+/// directories produce a textual warning appended to `warnings_out` when
+/// `on_error == OnError::Warn`.
+fn expand_paths_with_policy(
+    path_specs: &[&str],
+    on_error: crate::cmd::copy::OnError,
+    warnings_out: &mut Vec<String>,
+) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
 
@@ -216,7 +228,23 @@ fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
                 .map_err(|e| format!("doctor: invalid glob {spec:?}: {e}"))?
                 .compile_matcher();
             for entry in WalkDir::new(".").into_iter().filter_entry(|e| !is_skipped_dir(e)) {
-                let entry = entry.map_err(|e| format!("doctor: glob walk error: {e}"))?;
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => match on_error {
+                        crate::cmd::copy::OnError::Fail => {
+                            return Err(format!("doctor: glob walk error: {e}").into());
+                        }
+                        crate::cmd::copy::OnError::Warn => {
+                            let path_hint = e
+                                .path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            warnings_out
+                                .push(format!("doctor: cannot access {path_hint}: {e}"));
+                            continue;
+                        }
+                    },
+                };
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -242,7 +270,23 @@ fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
         if meta.is_dir() {
             let ignore = load_gitignore(&p);
             for entry in WalkDir::new(&p).into_iter().filter_entry(|e| !is_skipped_dir(e)) {
-                let entry = entry.map_err(|e| format!("doctor: walk error: {e}"))?;
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => match on_error {
+                        crate::cmd::copy::OnError::Fail => {
+                            return Err(format!("doctor: walk error: {e}").into());
+                        }
+                        crate::cmd::copy::OnError::Warn => {
+                            let path_hint = e
+                                .path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            warnings_out
+                                .push(format!("doctor: cannot access {path_hint}: {e}"));
+                            continue;
+                        }
+                    },
+                };
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -469,16 +513,37 @@ fn apply_peel(issue: &mut DoctorIssue, io_mode: IoMode) -> Result<(), Box<dyn Er
 ///
 /// `path_specs` may be empty, in which case the current directory `"."`
 /// is used.  Output (the human or JSON report) is written to `out`.
+#[allow(dead_code)]
 pub fn run(
     path_specs: &[&str],
     options: DoctorOptions,
     out: &mut dyn Write,
     io_mode: IoMode,
 ) -> Result<DoctorReport, Box<dyn Error>> {
+    run_with_policy(
+        path_specs,
+        options,
+        out,
+        io_mode,
+        crate::cmd::copy::OnError::Fail,
+        &mut Vec::new(),
+    )
+}
+
+/// Variant of [`run`] that accepts an explicit walk-error policy and a
+/// sink for per-entry warnings (for inaccessible directories).
+pub fn run_with_policy(
+    path_specs: &[&str],
+    options: DoctorOptions,
+    out: &mut dyn Write,
+    io_mode: IoMode,
+    on_error: crate::cmd::copy::OnError,
+    warnings_out: &mut Vec<String>,
+) -> Result<DoctorReport, Box<dyn Error>> {
     let default = ["."];
     let specs: &[&str] = if path_specs.is_empty() { &default } else { path_specs };
 
-    let files = expand_paths(specs)?;
+    let files = expand_paths_with_policy(specs, on_error, warnings_out)?;
     let mut report = DoctorReport {
         total_files_scanned: files.len(),
         ..DoctorReport::default()

@@ -2,9 +2,9 @@
 
 //! Tool definitions and dispatch for the `tpu-mcp` MCP server.
 //!
-//! Each tool invokes the `tpu` binary via a temporary response file
-//! (see [`crate::invoke`]).  On success the response file is deleted; on
-//! failure it is retained so the failing invocation can be reproduced.
+//! Each tool calls into the `tpu` library directly via the `call_*` dispatch
+//! functions in this module.  On success the tool returns a JSON-encoded
+//! result string; on failure it returns an MCP error response.
 //!
 //! Tool set:
 //! - `read_file`         — read a text file with encoding/line-ending normalisation
@@ -51,6 +51,9 @@ pub const TOOL_NAMES: &[&str] = &[
     "tpu_count_file",
     "tpu_append_file",
     "tpu_find",
+    "tpu_copy_file",
+    "tpu_render_file",
+    "tpu_setup",
     "tpu_stat_file",
 ];
 
@@ -298,9 +301,16 @@ pub fn list() -> Value {
             "name": "tpu_edit_file",
             "description":
                 "Make targeted in-place edits at known positions (1-based line numbers in \
-                 text mode, 0-based byte offsets in binary mode). All operation positions \
-                 reference the original file; multiple ops in one call are applied without \
-                 interference. The original file is backed up to <file>.bak before writing.\n\n\
+                 text mode, 0-based byte offsets in binary mode). Prefer this over hand-\
+                 rolled PowerShell or shell splice pipelines whenever you have a line \
+                 number you trust — the edit is atomic, encoding-preserving, and backed \
+                 by the same .bak / mojibake-guard machinery as tpu_write_file. \
+                 When the target text is unique and you have just read it, prefer \
+                 tpu_replace_in_file with fixed_strings:true instead, because line \
+                 numbers can shift between reads.\n\n\
+                 All operation positions reference the original file; multiple ops in one \
+                 call are applied without interference. The original file is backed up \
+                 to <file>.bak before writing.\n\n\
                  ESCAPING (text mode): each op's 'data' is LITERAL text. The JSON \
                  transport already handles escaping; do not add a second layer. Put a \
                  real newline in the JSON string for a newline in the file. CRLF/CR in \
@@ -485,9 +495,12 @@ pub fn list() -> Value {
             "name": "tpu_validate_file",
             "description":
                 "Assert that a specific location in a file matches an expected value. \
-                 Use this as a pre-flight guard before a write or replace operation to \
-                 confirm the file is in the expected state. Returns 'validation passed' \
-                 on success, or an error describing the mismatch.\n\n\
+                 USE THIS BEFORE ANY DESTRUCTIVE WRITE that depends on the file being in \
+                 a known state — or pass the equivalent check inline via the `validate` \
+                 array supported by tpu_write_file / tpu_replace_in_file / tpu_edit_file \
+                 / tpu_append_file (those run the same checks atomically before the \
+                 write). Returns 'validation passed' on success, or an error describing \
+                 the mismatch.\n\n\
                  Text selectors:\n\
                    line:N            — line N (1-based) must exactly equal the value\n\
                    line-contains:N   — line N must contain the value as a substring\n\n\
@@ -533,7 +546,10 @@ pub fn list() -> Value {
         {
             "name": "tpu_read_head",
             "description":
-                "Emit the first N lines or N bytes of a file to stdout. \n\n\
+                "Emit the first N lines or N bytes of a file. Prefer this over \
+                 PowerShell `Get-Content -First` / `Select-Object -First` or shell \
+                 `head` to avoid encoding corruption on UTF-16, Windows-1252, and \
+                 Shift-JIS files.\n\n\
                  In line mode (default) the file's native encoding and line-ending \n\
                  convention are preserved in the output. If the file has fewer lines \n\
                  than requested, all lines are returned without error. \n\n\
@@ -579,7 +595,10 @@ pub fn list() -> Value {
         {
             "name": "tpu_read_tail",
             "description":
-                "Emit the last N lines or N bytes of a file to stdout. \n\n\
+                "Emit the last N lines or N bytes of a file. Prefer this over \
+                 PowerShell `Get-Content -Tail` / `Select-Object -Last` or shell \
+                 `tail` to avoid encoding corruption on UTF-16, Windows-1252, and \
+                 Shift-JIS files.\n\n\
                  In line mode (default) the file's native encoding and line-ending \n\
                  convention are preserved in the output. If the file has fewer lines \n\
                  than requested, all lines are returned without error. \n\n\
@@ -627,7 +646,10 @@ pub fn list() -> Value {
             "name": "tpu_count_file",
             "description":
                 "Count lines, words, characters, bytes, and/or regex pattern matches in a \
-                 file. The file is decoded with encoding/line-ending normalisation before \
+                 file. Prefer this over PowerShell `Measure-Object` / `(Get-Content).Count` \
+                 or shell `wc` — counts are computed against the encoding-decoded view, \
+                 so multi-byte UTF-8 characters and UTF-16 files give correct results. \
+                 The file is decoded with encoding/line-ending normalisation before \
                  counting (same rules as tpu_read_file). \n\n\
                  When none of lines/words/chars/bytes is set, all four standard metrics are \
                  reported. Pattern matches are always reported when patterns are supplied. \n\n\
@@ -880,6 +902,15 @@ pub fn list() -> Value {
                         "type": "integer",
                         "description":
                             "Number of context lines to emit before each matching line."
+                    },
+                    "on_error": {
+                        "type": "string",
+                        "enum": ["warn", "fail"],
+                        "description":
+                            "How to handle walk errors when expanding globs (e.g. \
+                             permission-denied directories). 'warn' (default) skips \
+                             unreadable entries and continues; 'fail' aborts on the \
+                             first walk error."
                     }
                 },
                 "required": []
@@ -887,14 +918,166 @@ pub fn list() -> Value {
             "annotations": { "readOnlyHint": true, "destructiveHint": false }
         },
         {
+            "name": "tpu_copy_file",
+            "description":
+                "Copy a file or recursively copy a directory tree, preserving bytes \
+                 verbatim (no encoding or line-ending transformation). \
+                 Prefer this over PowerShell Copy-Item / shell `cp` when working in a \
+                 workspace that uses tpu-mcp — copy is resilient by default: per-entry \
+                 errors (unreadable directories, permission denied, write failures) \
+                 produce a streamed warning record and the operation continues with \
+                 the next entry. Set on_error:'fail' to restore the legacy 'abort on \
+                 first error' behaviour.\n\n\
+                 Modes:\n\
+                   single file       — `source` is a file path, `dest` is a file path \
+                                       or an existing directory.\n\
+                   directory tree    — `source` is a directory path; pass recursive:true. \
+                                       `dest` is created if needed and the tree is \
+                                       mirrored beneath it.\n\
+                   glob expansion    — `source` contains `*`, `?`, `[`, `{`. The matches \
+                                       (relative to the current working directory) are \
+                                       copied flat into `dest` (which must be a directory).\n\n\
+                 By default, an existing destination file is skipped (and counted in \
+                 the report). Pass overwrite:true to replace existing targets.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "source": {
+                        "type": "string",
+                        "description": "Source file path, directory path, or glob pattern."
+                    },
+                    "dest": {
+                        "type": "string",
+                        "description": "Destination file or directory."
+                    },
+                    "recursive": {
+                        "type": "boolean",
+                        "description":
+                            "Recurse into directories. Required when `source` is a directory. \
+                             Default: false."
+                    },
+                    "overwrite": {
+                        "type": "boolean",
+                        "description":
+                            "Overwrite existing destination files. Without this, existing \
+                             targets are skipped (and counted in the report). Default: false."
+                    },
+                    "on_error": {
+                        "type": "string",
+                        "enum": ["warn", "fail"],
+                        "description":
+                            "Per-entry error policy. 'warn' (default) continues past \
+                             unreadable directories and write failures, returning a \
+                             warnings count. 'fail' aborts on the first error."
+                    }
+                },
+                "required": ["source", "dest"]
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false }
+        },
+        {
+            "name": "tpu_render_file",
+            "description":
+                "Populate an output file from a Mustache-style `{{TOKEN}}` template. \
+                 Use this from Copilot Chat to scaffold files (READMEs, manifests, \
+                 boilerplate code) without resorting to PowerShell here-strings or \
+                 shell heredocs, which both round-trip non-ASCII content through the \
+                 active code page and silently corrupt it.\n\n\
+                 Template source: provide exactly one of `template` (inline string) or \
+                 `template_file` (path to a template file decoded with the same rules \
+                 as tpu_read_file).\n\n\
+                 Tokens are written `{{NAME}}` (whitespace inside the braces is \
+                 tolerated, e.g. `{{ NAME }}`). To emit literal braces, escape with \
+                 a leading backslash: `\\{{`. Each token name must consist of ASCII \
+                 letters, digits, '_' or '-'.\n\n\
+                 The rendered text is written through the same atomic write path as \
+                 tpu_write_file, so the destination receives the standard mojibake \
+                 guard, .bak handling, and encoding preservation.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "output": {
+                        "type": "string",
+                        "description": "Absolute path of the file to (re)create."
+                    },
+                    "template": {
+                        "type": "string",
+                        "description":
+                            "Inline template string. Mutually exclusive with template_file."
+                    },
+                    "template_file": {
+                        "type": "string",
+                        "description":
+                            "Absolute path to a template file. Mutually exclusive with template."
+                    },
+                    "vars": {
+                        "type": "object",
+                        "description":
+                            "Token name → value map. Keys must match [A-Za-z0-9_-]+. \
+                             Values are inserted literally (no further escaping).",
+                        "additionalProperties": { "type": "string" }
+                    },
+                    "missing": {
+                        "type": "string",
+                        "enum": ["error", "empty", "leave"],
+                        "description":
+                            "What to do when the template references a token absent from \
+                             `vars`: 'error' (default) lists every missing token and \
+                             refuses the write; 'empty' substitutes the empty string; \
+                             'leave' keeps the literal `{{NAME}}` placeholder in place."
+                    },
+                    "allow_mojibake": {
+                        "type": "boolean",
+                        "description":
+                            "If true, disable the write-time mojibake guard for this call. \
+                             Default: false."
+                    }
+                },
+                "required": ["output"]
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false }
+        },
+        {
+            "name": "tpu_setup",
+            "description":
+                "Emit (or inject) a canonical Markdown block that teaches Copilot to \
+                 prefer this MCP server's `tpu_*` tools over PowerShell / shell file \
+                 commands. Use this once per repository to keep `.github/copilot-instructions.md` \
+                 (or any equivalent) up to date — re-running the tool replaces an \
+                 existing managed block in place, so it is safe to invoke after every \
+                 tpu-mcp upgrade.\n\n\
+                 Without `target` the block is returned as the tool result. With \
+                 `target` the named file is updated in place: an existing managed \
+                 block (delimited by `<!-- tpu-mcp:setup:begin -->` / \
+                 `<!-- tpu-mcp:setup:end -->`) is replaced; otherwise the block is \
+                 appended after a single blank line. The destination file's encoding \
+                 and line-ending convention are preserved.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description":
+                            "Absolute path of the file to inject the guidance block into. \
+                             Typical value: '<repo>/.github/copilot-instructions.md'. \
+                             Omit to receive the block as the tool result without \
+                             writing any file."
+                    }
+                },
+                "required": []
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false }
+        },
+        {
             "name": "tpu_stat_file",
             "description":
                 "Return file metadata (size, modification time, creation time, read-only \
-                 flag) as a JSON object.  Use this to verify that a prior write actually \
-                 persisted: compare the returned mtime_epoch_ms against the value \
-                 included in the response from tpu_write_file, tpu_replace_in_file, \
-                 tpu_edit_file, or tpu_append_file.  A stale or mismatched mtime after a \
-                 write likely indicates Windows Defender interference.",
+                 flag) as a JSON object. Call this immediately after a write when you need \
+                 to confirm the change actually persisted: compare the returned \
+                 mtime_epoch_ms against the value included in the response from \
+                 tpu_write_file, tpu_replace_in_file, tpu_edit_file, or tpu_append_file. \
+                 A stale or mismatched mtime after a write likely indicates Windows \
+                 Defender interference and means the operation should be retried.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -933,7 +1116,10 @@ pub fn call(
         "tpu_read_tail" => call_read_tail(args),
         "tpu_count_file" => call_count_file(args),
         "tpu_append_file" => call_append_file(args, config),
-        "tpu_find" => call_find(args),
+        "tpu_copy_file" => call_copy_file(args, config),
+        "tpu_render_file" => call_render_file(args, config),
+        "tpu_setup" => call_setup(args, config),
+        "tpu_find" => call_find(args, config),
         "tpu_stat_file" => call_stat_file(args),
         _ => Err(format!("unknown tool: {name}").into()),
     }
@@ -1465,7 +1651,7 @@ fn call_append_file(
     ))
 }
 
-fn call_find(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std::error::Error>> {
     // Collect patterns: primary "pattern" + optional "patterns" array.
     let mut all_patterns: Vec<String> = Vec::new();
     if let Some(p) = args.get("pattern").and_then(|v| v.as_str()) {
@@ -1530,8 +1716,15 @@ fn call_find(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let pattern_refs: Vec<&str> = all_patterns.iter().map(String::as_str).collect();
     let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
 
+    let on_error = match args.get("on_error").and_then(|v| v.as_str()) {
+        Some("fail") => tpu::cmd::copy::OnError::Fail,
+        Some("warn") => tpu::cmd::copy::OnError::Warn,
+        _ => config.default_on_error,
+    };
+    let mut walk_warnings: Vec<String> = Vec::new();
+
     let mut buf: Vec<u8> = Vec::new();
-    let result = tpu::cmd::find::run(
+    let result = tpu::cmd::find::run_with_policy(
         &path_refs,
         &pattern_refs,
         fixed_strings,
@@ -1545,11 +1738,146 @@ fn call_find(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         numbers,
         &mut buf,
         tpu::IoMode::Buffered,
+        on_error,
+        &mut walk_warnings,
     );
 
     match result {
-        Ok(_) => Ok(String::from_utf8(buf).map_err(|e| format!("find: non-UTF-8 output: {e}"))?),
+        Ok(_) => {
+            let mut text = String::from_utf8(buf)
+                .map_err(|e| format!("find: non-UTF-8 output: {e}"))?;
+            // Surface walk warnings so Copilot sees a structured note about
+            // skipped paths, not silent loss. In summary mode we collapse
+            // the per-entry detail into a single tail line.
+            if !walk_warnings.is_empty() {
+                if !text.is_empty() && !text.ends_with('\n') {
+                    text.push('\n');
+                }
+                match config.progress_detail {
+                    ProgressDetail::EachFile => {
+                        for w in &walk_warnings {
+                            text.push_str("warning: ");
+                            text.push_str(w);
+                            text.push('\n');
+                        }
+                    }
+                    ProgressDetail::Summary => {
+                        text.push_str(&format!(
+                            "warning: {} path(s) skipped (use progressDetail=each-file to list)\n",
+                            walk_warnings.len()
+                        ));
+                    }
+                }
+            }
+            Ok(text)
+        }
         Err(e) => Err(e),
+    }
+}
+
+fn call_copy_file(
+    args: &Value,
+    config: &ServerConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let source = require_str(args, "source")?.to_string();
+    let dest = normalize_file_path(require_str(args, "dest")?);
+    let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+    let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
+    let on_error = match args.get("on_error").and_then(|v| v.as_str()) {
+        Some("fail") => tpu::cmd::copy::OnError::Fail,
+        Some("warn") => tpu::cmd::copy::OnError::Warn,
+        _ => config.default_on_error,
+    };
+    let opts = tpu::cmd::copy::CopyOptions { recursive, overwrite, on_error };
+
+    // Capture diagnostic output from the copy command's `Shell::warn` calls
+    // so we can surface skipped paths in the tool result.
+    let warn_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let warn_buf_writer = warn_buf.clone();
+    struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for SharedWriter {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+    let mut shell = tpu::shell::Shell::from_json_write(Box::new(SharedWriter(warn_buf_writer)));
+
+    let report = tpu::cmd::copy::run(&source, std::path::Path::new(&dest), opts, &mut shell)?;
+    drop(shell);
+
+    let warnings_text = String::from_utf8_lossy(&warn_buf.lock().unwrap()).into_owned();
+    let mut result = serde_json::json!({
+        "copied":   report.copied,
+        "skipped":  report.skipped,
+        "warnings": report.warnings,
+    });
+    if matches!(config.progress_detail, ProgressDetail::EachFile) {
+        result["log"] = serde_json::Value::String(warnings_text);
+    }
+    Ok(serde_json::to_string(&result)?)
+}
+
+fn call_render_file(
+    args: &Value,
+    _config: &ServerConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use std::collections::BTreeMap;
+    let output = normalize_file_path(require_str(args, "output")?);
+    let template_inline = args.get("template").and_then(|v| v.as_str());
+    let template_file = args.get("template_file").and_then(|v| v.as_str()).map(normalize_file_path);
+    let mut vars: BTreeMap<String, String> = BTreeMap::new();
+    if let Some(map) = args.get("vars").and_then(|v| v.as_object()) {
+        for (k, v) in map {
+            let val = v.as_str().ok_or_else(|| {
+                format!("render: vars[{k}]: value must be a string")
+            })?;
+            vars.insert(k.clone(), val.to_string());
+        }
+    }
+    let missing = match args.get("missing").and_then(|v| v.as_str()) {
+        Some("empty") => tpu::cmd::render::MissingPolicy::Empty,
+        Some("leave") => tpu::cmd::render::MissingPolicy::Leave,
+        _ => tpu::cmd::render::MissingPolicy::Error,
+    };
+    let policy = mojibake_policy_from_args(args);
+    let report = tpu::cmd::render::run(
+        std::path::Path::new(&output),
+        template_inline,
+        template_file.as_deref().map(std::path::Path::new),
+        None,
+        &vars,
+        missing,
+        tpu::IoMode::Buffered,
+        policy,
+    )?;
+    Ok(serde_json::to_string(&serde_json::json!({
+        "output": output,
+        "substitutions": report.substitutions,
+        "missing": report.missing,
+    }))?)
+}
+
+fn call_setup(
+    args: &Value,
+    _config: &ServerConfig,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let target = args
+        .get("target")
+        .and_then(|v| v.as_str())
+        .map(normalize_file_path);
+    match target {
+        None => Ok(tpu::cmd::setup::full_block()),
+        Some(path) => {
+            let (updated, replaced) =
+                tpu::cmd::setup::inject(std::path::Path::new(&path), tpu::IoMode::Buffered)?;
+            Ok(serde_json::to_string(&serde_json::json!({
+                "target": path,
+                "updated": updated,
+                "replaced": replaced,
+            }))?)
+        }
     }
 }
 
@@ -1619,6 +1947,34 @@ pub struct ServerConfig {
     /// (level `info`), not stderr, so they appear in the client's MCP output
     /// channel as informational rather than warnings.
     pub trace: bool,
+
+    /// Default policy for tools that walk file trees (`tpu_find`,
+    /// `tpu_copy_file`) when an entry cannot be read or written.
+    ///
+    /// `Warn` (default) emits a streamed warning record and continues with
+    /// the next entry. `Fail` aborts the operation on the first error.
+    /// Per-call `on_error` arguments override this default.
+    pub default_on_error: tpu::cmd::copy::OnError,
+
+    /// How verbose the per-call result of tree-walking tools should be.
+    ///
+    /// `EachFile` (default) returns the full per-entry log along with the
+    /// summary counts. `Summary` suppresses the per-entry log and returns
+    /// only the aggregate counts (and a single tail message naming the
+    /// number of warnings). Useful for clients that want a quieter trail
+    /// in the MCP output channel.
+    pub progress_detail: ProgressDetail,
+}
+
+/// How much per-entry detail tree-walking tools should include in their
+/// JSON tool result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ProgressDetail {
+    /// Include the full `log` of per-entry warnings / progress lines.
+    #[default]
+    EachFile,
+    /// Suppress the per-entry log; emit only summary counts.
+    Summary,
 }
 
 impl Default for ServerConfig {
@@ -1626,6 +1982,8 @@ impl Default for ServerConfig {
         ServerConfig {
             verify_delay_ms: 100,
             trace: true,
+            default_on_error: tpu::cmd::copy::OnError::Warn,
+            progress_detail: ProgressDetail::EachFile,
         }
     }
 }
@@ -2326,6 +2684,8 @@ mod integration_tests {
             &ServerConfig {
                 verify_delay_ms: 0,
                 trace: false,
+                default_on_error: tpu::cmd::copy::OnError::Warn,
+                progress_detail: ProgressDetail::EachFile,
             },
         )
     }

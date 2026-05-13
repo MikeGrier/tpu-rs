@@ -3,6 +3,73 @@
 <!-- encoding-check: allow-mojibake (this file contains literal mojibake
      examples for documentation purposes) -->
 
+## File operations — use the `tpu-mcp` MCP tools, never PowerShell file I/O
+
+This repository ships a **`tpu-mcp` MCP server** that exposes every common
+file operation as a first-class MCP tool. The tools preserve byte-exact
+content, native encodings, and line endings, and they refuse to introduce
+new mojibake — guarantees that PowerShell `Set-Content` / `Out-File` /
+`Get-Content` / `>` actively violate.
+
+**Rule:** When working in this repository, ALWAYS use the `tpu_*` MCP
+tools listed below instead of running file-manipulation commands in a
+PowerShell or bash terminal. This applies even inside a larger workflow —
+do not switch to the terminal for file I/O just because a previous step
+used the terminal.
+
+| MCP tool | Replaces |
+|---|---|
+| `tpu_read_file` | `Get-Content`, `cat`, `type` |
+| `tpu_read_head` / `tpu_read_tail` | `Select-Object -First/-Last`, `head`, `tail` |
+| `tpu_read_file_binary` | `Format-Hex`, `xxd`, `od` |
+| `tpu_read_file_escaped` | inspecting whitespace / control bytes by hand |
+| `tpu_write_file` | `Set-Content`, `Out-File`, `>`, `New-Item -Value` |
+| `tpu_append_file` | `Add-Content`, `>>` |
+| `tpu_replace_in_file` | `(Get-Content … ) -replace … \| Set-Content`, `sed -i` |
+| `tpu_edit_file` | line-based splice / patch sequences |
+| `tpu_copy_file` | `Copy-Item`, `cp`, `robocopy` |
+| `tpu_render_file` | here-strings / heredoc-driven file generation |
+| `tpu_find` | `Select-String`, `grep`, `rg` |
+| `tpu_count_file` | `(Get-Content).Count`, `wc -l` |
+| `tpu_stat_file` | `Get-Item`, `stat` |
+| `tpu_validate_file` | `Get-FileHash` + manual encoding inspection |
+| `tpu_setup` | (re)inject this guidance block into `.github/copilot-instructions.md` |
+
+### When to use each tool
+
+- **Reads** (`tpu_read_file`, `tpu_read_head`, `tpu_read_tail`,
+  `tpu_read_file_binary`, `tpu_read_file_escaped`) — always prefer over
+  `Get-Content`/`cat`. Reads decode the file's native encoding to UTF-8
+  with LF line endings, regardless of source (UTF-16, Windows-1252,
+  Shift-JIS, …) and surface a one-line note when they decode a file
+  that is already mojibake'd.
+- **Writes** (`tpu_write_file`, `tpu_append_file`) — always use these for
+  any non-trivial file content. They preserve the destination file's
+  existing encoding and line-ending convention, and they refuse to write
+  content that would *introduce* new mojibake (use `allow_mojibake: true`
+  only when intentionally writing curated mojibake fixtures).
+- **Targeted edits** (`tpu_replace_in_file`, `tpu_edit_file`) — prefer
+  over hand-rolled regex pipelines. `tpu_replace_in_file` interprets
+  `\n` in the replacement as a real newline by default; pass
+  `literal_replacement: true` for the literal two characters.
+- **`tpu_copy_file`** — use for any file or directory copy. By default
+  per-entry errors (unreadable directories, permission denied) emit a
+  warning and the operation continues; pass `on_error: "fail"` for the
+  legacy abort-on-first-error behaviour. Supports recursive directory
+  copies and glob expansion.
+- **`tpu_render_file`** — use to create files from `{{TOKEN}}` Mustache
+  templates. Avoids the encoding pitfalls of PowerShell here-strings
+  and shell heredocs. Provide either an inline `template` or a
+  `template_file`; control unknown-token behaviour via `missing`
+  (`error` | `empty` | `leave`).
+- **`tpu_find`** — use for code/text search. Streams matches with
+  optional `before`/`after` context. Pass `on_error: "fail"` to abort
+  on walk errors instead of warning and continuing.
+- **`tpu_setup`** — use once per workspace (and after each tpu-mcp
+  upgrade) to (re)inject the canonical guidance block, delimited by
+  `<!-- tpu-mcp:setup:begin -->` / `<!-- tpu-mcp:setup:end -->`, into
+  `.github/copilot-instructions.md`.
+
 ## Tool preference (use the first available)
 
 1. **Editor edit tools** (the IDE's built-in edit / replace operations) —

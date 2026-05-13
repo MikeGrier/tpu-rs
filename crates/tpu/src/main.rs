@@ -60,6 +60,27 @@ struct Cli {
     #[arg(long, global = true)]
     no_mojibake_warning: bool,
 
+    /// How to handle per-entry errors during a multi-file or recursive
+    /// operation (`tpu find`, `tpu doctor`, `tpu copy --recursive`).
+    ///
+    ///   warn — emit a streamed warning record (NDJSON
+    ///          `{"reason":"warning"}` in JSON mode, a yellow `warning:`
+    ///          line on stderr in human mode) and continue with the next
+    ///          entry. This is the default — a single inaccessible
+    ///          directory no longer aborts a large scan.
+    ///
+    ///   fail — restore the legacy "abort on first walk error" behaviour.
+    ///
+    /// Has no effect on operations that touch a single explicit file.
+    #[arg(
+        long,
+        global = true,
+        value_name = "MODE",
+        default_value = "warn",
+        value_parser = ["warn", "fail"]
+    )]
+    on_error: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -793,6 +814,92 @@ enum Commands {
         #[arg(long, short = 'q')]
         quiet: bool,
     },
+
+    /// Copy a file or recursively copy a directory tree.
+    ///
+    /// Bytes are copied verbatim — no encoding or line-ending transformation
+    /// is applied. When SRC contains a glob meta-character (`*`, `?`, `[`,
+    /// `{`) the matches are copied flat into DEST (which must be a
+    /// directory). For a directory copy, pass `--recursive`.
+    ///
+    /// Per-entry errors honour the global `--on-error` flag: by default
+    /// they produce a streamed warning record and the copy continues with
+    /// the remaining entries.
+    Copy {
+        /// Source file, directory, or glob pattern.
+        source: String,
+
+        /// Destination file or directory.
+        dest: PathBuf,
+
+        /// Recurse into directories. Required when SRC is a directory.
+        #[arg(long, short = 'r')]
+        recursive: bool,
+
+        /// Overwrite existing destination files. Without this flag an
+        /// existing target is skipped (and counted in the report).
+        #[arg(long)]
+        overwrite: bool,
+    },
+
+    /// Render a file from a `{{TOKEN}}`-style template.
+    ///
+    /// Tokens are written `{{NAME}}` (whitespace inside the braces is
+    /// tolerated) and substituted with values supplied by repeatable
+    /// `--var KEY=VALUE` pairs. Use `\{{` to emit literal braces.
+    ///
+    /// The template source is one of `--template <STRING>`,
+    /// `--template-file <PATH>`, or stdin (when neither flag is given).
+    /// The rendered text is written through `tpu`'s normal write path so
+    /// the destination receives the standard mojibake guard, atomic .bak
+    /// handling, and encoding preservation.
+    Render {
+        /// Output file to populate with the rendered template.
+        output: PathBuf,
+
+        /// Inline template string. Mutually exclusive with `--template-file`
+        /// and stdin.
+        #[arg(long, value_name = "STRING", conflicts_with = "template_file")]
+        template: Option<String>,
+
+        /// Path to a template file (decoded with the same rules as
+        /// `tpu read`). Mutually exclusive with `--template` and stdin.
+        #[arg(long = "template-file", value_name = "PATH")]
+        template_file: Option<PathBuf>,
+
+        /// Repeatable `KEY=VALUE` pair. Keys must match `[A-Za-z0-9_-]+`.
+        #[arg(long = "var", value_name = "KEY=VALUE", action = clap::ArgAction::Append)]
+        var: Vec<String>,
+
+        /// What to do when the template references a token absent from
+        /// the supplied vars: `error` (default), `empty`, or `leave`.
+        #[arg(
+            long,
+            value_name = "POLICY",
+            default_value = "error",
+            value_parser = ["error", "empty", "leave"]
+        )]
+        missing: String,
+
+        /// Disable the write-time mojibake guard for the output file.
+        #[arg(long)]
+        allow_mojibake: bool,
+    },
+
+    /// Emit (or inject) the canonical Copilot-instructions guidance block
+    /// for the `tpu-mcp` server's tools.
+    ///
+    /// Without `--inject` the block is printed to stdout. With `--inject`
+    /// the block is idempotently merged into the named file: an existing
+    /// managed block (delimited by `<!-- tpu-mcp:setup:begin -->` /
+    /// `<!-- tpu-mcp:setup:end -->`) is replaced; otherwise the block is
+    /// appended after a single blank line.
+    Setup {
+        /// File to update in place. When omitted, the block is printed to
+        /// stdout. Typical value: `.github/copilot-instructions.md`.
+        #[arg(long, value_name = "PATH")]
+        inject: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -856,6 +963,10 @@ fn run(
     let mojibake_advisory_enabled = !cli.no_mojibake_warning
         && std::env::var_os("TPU_NO_MOJIBAKE_WARNING").is_none()
         && !json_mode;
+    let on_error_mode = match cli.on_error.as_str() {
+        "fail" => cmd::copy::OnError::Fail,
+        _ => cmd::copy::OnError::Warn,
+    };
     match cli.command {
         Commands::Read {
             file,
@@ -1676,7 +1787,8 @@ fn run(
             let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
 
             let mut buf: Vec<u8> = Vec::new();
-            let result = cmd::find::run(
+            let mut walk_warnings: Vec<String> = Vec::new();
+            let result = cmd::find::run_with_policy(
                 &path_refs,
                 &pattern_refs,
                 fixed_strings,
@@ -1690,7 +1802,12 @@ fn run(
                 numbers,
                 &mut buf,
                 IoMode::Mmap,
+                on_error_mode,
+                &mut walk_warnings,
             );
+            for w in &walk_warnings {
+                let _ = shell.warn(w);
+            }
             match result {
                 Ok(r) => {
                     let content = String::from_utf8(buf)
@@ -1732,7 +1849,18 @@ fn run(
             // Buffer the doctor output and route it through the standard
             // `Output` channel so JSON / human modes both work uniformly.
             let mut buf: Vec<u8> = Vec::new();
-            let report = cmd::doctor::run(&path_refs, opts, &mut buf, IoMode::Mmap)?;
+            let mut walk_warnings: Vec<String> = Vec::new();
+            let report = cmd::doctor::run_with_policy(
+                &path_refs,
+                opts,
+                &mut buf,
+                IoMode::Mmap,
+                on_error_mode,
+                &mut walk_warnings,
+            )?;
+            for w in &walk_warnings {
+                let _ = shell.warn(w);
+            }
             let content = String::from_utf8(buf)
                 .map_err(|e| format!("doctor: non-UTF-8 output: {e}"))?;
             out.emit("doctor", None, None, format_args!("{content}"));
@@ -1741,6 +1869,131 @@ fn run(
             }
             Ok(())
         }
+
+        Commands::Copy {
+            source,
+            dest,
+            recursive,
+            overwrite,
+        } => {
+            let opts = cmd::copy::CopyOptions {
+                recursive,
+                overwrite,
+                on_error: on_error_mode,
+            };
+            let report = cmd::copy::run(&source, &dest, opts, shell)?;
+            if json_mode {
+                out.emit_json(
+                    "copy",
+                    None,
+                    None,
+                    &serde_json::json!({
+                        "reason": "data",
+                        "subcommand": "copy",
+                        "copied": report.copied,
+                        "skipped": report.skipped,
+                        "warnings": report.warnings,
+                        "rendered": format!(
+                            "copied {} file{}, skipped {}, {} warning{}",
+                            report.copied,
+                            if report.copied == 1 { "" } else { "s" },
+                            report.skipped,
+                            report.warnings,
+                            if report.warnings == 1 { "" } else { "s" },
+                        ),
+                    }),
+                );
+            } else {
+                shell.status(
+                    "copy",
+                    format!(
+                        "{} copied, {} skipped, {} warning{}",
+                        report.copied,
+                        report.skipped,
+                        report.warnings,
+                        if report.warnings == 1 { "" } else { "s" },
+                    ),
+                )?;
+            }
+            Ok(())
+        }
+
+        Commands::Render {
+            output,
+            template,
+            template_file,
+            var,
+            missing,
+            allow_mojibake,
+        } => {
+            use std::collections::BTreeMap;
+            let mut vars: BTreeMap<String, String> = BTreeMap::new();
+            for v in &var {
+                let (k, val) = cmd::render::parse_var(v).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                vars.insert(k, val);
+            }
+            let policy = match missing.as_str() {
+                "empty" => cmd::render::MissingPolicy::Empty,
+                "leave" => cmd::render::MissingPolicy::Leave,
+                _ => cmd::render::MissingPolicy::Error,
+            };
+            // If neither --template nor --template-file: read stdin.
+            let stdin_template: Option<String> = if template.is_none() && template_file.is_none() {
+                use std::io::Read;
+                let mut s = String::new();
+                io::stdin()
+                    .read_to_string(&mut s)
+                    .map_err(|e| format!("render: reading template from stdin: {e}"))?;
+                Some(s)
+            } else {
+                None
+            };
+            let report = cmd::render::run(
+                &output,
+                template.as_deref(),
+                template_file.as_deref(),
+                stdin_template.as_deref(),
+                &vars,
+                policy,
+                IoMode::Mmap,
+                if allow_mojibake {
+                    mojibake::WritePolicy::permissive()
+                } else {
+                    mojibake::WritePolicy::default()
+                },
+            )?;
+            shell.status(
+                "render",
+                format!(
+                    "{}: {} substitution{} ({} unique token{} referenced)",
+                    output.display(),
+                    report.substitutions,
+                    if report.substitutions == 1 { "" } else { "s" },
+                    report.missing.len() + vars.len(),
+                    if report.missing.len() + vars.len() == 1 { "" } else { "s" },
+                ),
+            )?;
+            Ok(())
+        }
+
+        Commands::Setup { inject } => match inject {
+            None => {
+                out.emit("setup", None, None, format_args!("{}", cmd::setup::full_block()));
+                Ok(())
+            }
+            Some(path) => {
+                let (updated, replaced) = cmd::setup::inject(&path, IoMode::Mmap)?;
+                let verb = if !updated {
+                    "already up to date"
+                } else if replaced {
+                    "block replaced"
+                } else {
+                    "block appended"
+                };
+                shell.status("setup", format!("{}: {verb}", path.display()))?;
+                Ok(())
+            }
+        },
     }
 }
 

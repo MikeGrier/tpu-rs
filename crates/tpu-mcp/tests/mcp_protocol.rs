@@ -197,9 +197,17 @@ fn mcp_it_1_initialize_and_tools_list() {
         "tpu_write_file",
         "tpu_replace_in_file",
         "tpu_edit_file",
+        "tpu_read_file_binary",
+        "tpu_read_file_escaped",
+        "tpu_validate_file",
+        "tpu_read_head",
+        "tpu_read_tail",
+        "tpu_count_file",
         "tpu_append_file",
         "tpu_find",
-        "tpu_count_file",
+        "tpu_copy_file",
+        "tpu_render_file",
+        "tpu_setup",
         "tpu_stat_file",
     ] {
         assert!(

@@ -74,6 +74,27 @@ function buildArgs(): string[] {
     return args;
 }
 
+/**
+ * Build the environment overrides for the spawned `tpu-mcp` process.
+ *
+ * Currently forwards `tpu-mcp.errorMode` so the server's tools default to the
+ * user's preferred walk-error policy without the agent needing to thread
+ * `on_error` through every call.
+ */
+function buildEnv(): Record<string, string> {
+    const config = vscode.workspace.getConfiguration("tpu-mcp");
+    const mode = (config.get<string>("errorMode", "continue") ?? "continue").trim();
+    const detail = (config.get<string>("progressDetail", "each-file") ?? "each-file").trim();
+    const env: Record<string, string> = {};
+    if (mode === "continue" || mode === "strict") {
+        env["TPU_DEFAULT_ERROR_MODE"] = mode;
+    }
+    if (detail === "each-file" || detail === "summary") {
+        env["TPU_PROGRESS_DETAIL"] = detail;
+    }
+    return env;
+}
+
 class TpuMcpServerProvider
     implements vscode.McpServerDefinitionProvider<vscode.McpStdioServerDefinition>
 {
@@ -129,7 +150,7 @@ class TpuMcpServerProvider
                 SERVER_LABEL,
                 binary,
                 buildArgs(),
-                /* env */ {},
+                buildEnv(),
                 version,
             ),
         ];
@@ -237,6 +258,30 @@ export function activate(context: vscode.ExtensionContext): void {
             await vscode.window.showInformationMessage(
                 `tpu-mcp server version ${version} \u2014 ${binary}`,
             );
+        }),
+    );
+
+    context.subscriptions.push(
+        vscode.commands.registerCommand("tpu-mcp.openSetupChat", async () => {
+            // Open Copilot Chat with a prompt that asks the agent to invoke
+            // the `tpu_setup` MCP tool. This is the friendliest path for
+            // first-time users: it does not silently mutate any file, but it
+            // also does not require them to remember the tool name.
+            const prompt =
+                "Use the tpu_setup MCP tool (with target = the absolute path of " +
+                ".github/copilot-instructions.md in the current workspace) to (re)inject the " +
+                "canonical tpu-mcp guidance block. If the file does not exist, create it. " +
+                "After the tool succeeds, summarise what changed.";
+            try {
+                await vscode.commands.executeCommand(
+                    "workbench.action.chat.open",
+                    { query: prompt },
+                );
+            } catch (err) {
+                await vscode.window.showErrorMessage(
+                    `tpu-mcp: failed to open Copilot Chat: ${err}`,
+                );
+            }
         }),
     );
 }

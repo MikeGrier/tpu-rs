@@ -57,6 +57,11 @@
                 "command": "tpu-mcp.showServerVersion",
                 "title": "tpu-mcp: Show bundled server version",
                 "category": "tpu-mcp"
+            },
+            {
+                "command": "tpu-mcp.openSetupChat",
+                "title": "tpu-mcp: Inject Copilot guidance into .github/copilot-instructions.md",
+                "category": "tpu-mcp"
             }
         ],
         "configuration": {
@@ -81,6 +86,26 @@
                     },
                     "default": [],
                     "markdownDescription": "Additional command-line arguments appended to the `tpu-mcp` invocation. Intended for advanced/debug scenarios."
+                },
+                "tpu-mcp.errorMode": {
+                    "type": "string",
+                    "enum": ["continue", "strict"],
+                    "enumDescriptions": [
+                        "Tools that walk file trees (`tpu_find`, `tpu_copy_file`) emit a warning and skip past unreadable entries instead of aborting the whole operation.",
+                        "Tools abort on the first walk error (the legacy 'fail-fast' behaviour). Use this when you want any inaccessible path to surface as a hard error."
+                    ],
+                    "default": "continue",
+                    "markdownDescription": "Default error policy for `tpu_find` and `tpu_copy_file` when an entry cannot be read or written. Per-call `on_error` arguments still override this default. Forwarded to the server via the `TPU_DEFAULT_ERROR_MODE` environment variable."
+                },
+                "tpu-mcp.progressDetail": {
+                    "type": "string",
+                    "enum": ["each-file", "summary"],
+                    "enumDescriptions": [
+                        "Surface a streamed record for every file the server touches.",
+                        "Suppress per-file records and surface only a summary at the end of the operation."
+                    ],
+                    "default": "each-file",
+                    "markdownDescription": "How verbose the streamed progress notifications should be for tree-walking tools. Currently informational; the server emits each-file progress regardless and consuming clients can collapse it."
                 }
             }
         }

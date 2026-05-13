@@ -14,7 +14,7 @@
 //! - [`JsonOutput`] — wraps every payload in a newline-delimited JSON
 //!   (`{"reason":"data",...}`) envelope.
 //!
-//! Use [`tpu_emit!`] for the common case of a plain-text emit without file
+//! Use `tpu_emit!` for the common case of a plain-text emit without file
 //! or range provenance.
 //!
 //! ## Write-failure policy
@@ -53,7 +53,7 @@ use crate::{data_format, escape};
 pub trait Output {
     /// Emit a plain-text payload.
     ///
-    /// `args` is produced by `format_args!()`.  Use [`tpu_emit!`] for the
+    /// `args` is produced by `format_args!()`.  Use `tpu_emit!` for the
     /// common case that omits file and range provenance.
     fn emit(
         &mut self,

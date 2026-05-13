@@ -6,8 +6,14 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.4" # x-release-please-version
-edition = "2024"
+version       = "0.1.4" # x-release-please-version
+edition       = "2024"
+rust-version  = "1.93"
+authors       = ["Michael Grier"]
+license       = "MIT"
+repository    = "https://github.com/MikeGrier/tpu-rs"
+homepage      = "https://github.com/MikeGrier/tpu-rs"
+documentation = "https://github.com/MikeGrier/tpu-rs"
 
 [workspace.dependencies]
 anstream    = "0.6"
