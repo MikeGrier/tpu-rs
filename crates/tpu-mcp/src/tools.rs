@@ -1790,8 +1790,8 @@ fn call_copy_file(
     };
     let opts = tpu::cmd::copy::CopyOptions { recursive, overwrite, on_error };
 
-    // Capture diagnostic output from the copy command's `Shell::warn` calls
-    // so we can surface skipped paths in the tool result.
+    // Capture Shell::warn output as plain human-mode text so we can parse it
+    // into a structured string array — avoids embedding NDJSON in a JSON string.
     let warn_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let warn_buf_writer = warn_buf.clone();
     struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
@@ -1802,19 +1802,28 @@ fn call_copy_file(
         }
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
-    let mut shell = tpu::shell::Shell::from_json_write(Box::new(SharedWriter(warn_buf_writer)));
+    let mut shell = tpu::shell::Shell::from_write(Box::new(SharedWriter(warn_buf_writer)));
 
     let report = tpu::cmd::copy::run(&source, std::path::Path::new(&dest), opts, &mut shell)?;
     drop(shell);
 
-    let warnings_text = String::from_utf8_lossy(&warn_buf.lock().unwrap()).into_owned();
+    // Human-mode warn() emits "warning: {message}\n"; strip the prefix to get
+    // a clean string array that MCP clients can read directly.
+    let raw = String::from_utf8_lossy(&warn_buf.lock().unwrap()).into_owned();
+    let warn_lines: Vec<&str> = raw
+        .lines()
+        .map(|l| l.strip_prefix("warning: ").unwrap_or(l))
+        .filter(|l| !l.is_empty())
+        .collect();
     let mut result = serde_json::json!({
         "copied":   report.copied,
         "skipped":  report.skipped,
         "warnings": report.warnings,
     });
     if matches!(config.progress_detail, ProgressDetail::EachFile) {
-        result["log"] = serde_json::Value::String(warnings_text);
+        result["log"] = serde_json::Value::Array(
+            warn_lines.iter().map(|s| serde_json::Value::String((*s).to_string())).collect(),
+        );
     }
     Ok(serde_json::to_string(&result)?)
 }
