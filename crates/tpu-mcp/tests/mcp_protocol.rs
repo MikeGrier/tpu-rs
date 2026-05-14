@@ -12,7 +12,7 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Locate the tpu-mcp binary for the current build profile.
 ///
@@ -110,9 +110,10 @@ impl McpSession {
         }));
         let resp = self.recv_raw();
         if let Some(err) = resp.get("error")
-            && !err.is_null() {
-                panic!("RPC error for '{method}': {err}");
-            }
+            && !err.is_null()
+        {
+            panic!("RPC error for '{method}': {err}");
+        }
         resp["result"].clone()
     }
 
@@ -197,9 +198,17 @@ fn mcp_it_1_initialize_and_tools_list() {
         "tpu_write_file",
         "tpu_replace_in_file",
         "tpu_edit_file",
+        "tpu_read_file_binary",
+        "tpu_read_file_escaped",
+        "tpu_validate_file",
+        "tpu_read_head",
+        "tpu_read_tail",
+        "tpu_count_file",
         "tpu_append_file",
         "tpu_find",
-        "tpu_count_file",
+        "tpu_copy_file",
+        "tpu_render_file",
+        "tpu_setup",
         "tpu_stat_file",
     ] {
         assert!(
@@ -408,5 +417,209 @@ fn mcp_it_7_find_matches_and_no_match() {
     assert!(
         no_match.trim().is_empty(),
         "no-match result must be empty; got: {no_match:?}"
+    );
+}
+
+/// MCP-IT-8: `tpu_copy_file` copies a file; result JSON includes counts.
+/// Overwriting an existing destination with `overwrite=true` replaces it.
+#[test]
+fn mcp_it_8_copy_file_basic_and_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.txt");
+    let dst = dir.path().join("dst.txt");
+    std::fs::write(&src, "copy me\n").unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // First copy — dst does not exist yet.
+    let out = s.call_tool(
+        "tpu_copy_file",
+        json!({
+            "source":    src.to_str().unwrap(),
+            "dest":      dst.to_str().unwrap(),
+            "overwrite": false,
+        }),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("tpu_copy_file result must be JSON; got {out:?}: {e}"));
+    assert_eq!(v["copied"], 1, "copied count must be 1; result: {v}");
+    assert_eq!(v["skipped"], 0, "skipped count must be 0; result: {v}");
+    assert_eq!(
+        std::fs::read_to_string(&dst).unwrap(),
+        "copy me\n",
+        "destination content must match source"
+    );
+
+    // Overwrite — dst already exists; overwrite=true must replace it atomically.
+    std::fs::write(&src, "updated content\n").unwrap();
+    let out2 = s.call_tool(
+        "tpu_copy_file",
+        json!({
+            "source":    src.to_str().unwrap(),
+            "dest":      dst.to_str().unwrap(),
+            "overwrite": true,
+        }),
+    );
+    let v2: serde_json::Value = serde_json::from_str(&out2).unwrap_or_else(|e| {
+        panic!("tpu_copy_file overwrite result must be JSON; got {out2:?}: {e}")
+    });
+    assert_eq!(
+        v2["copied"], 1,
+        "overwrite copied count must be 1; result: {v2}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&dst).unwrap(),
+        "updated content\n",
+        "destination must contain updated source after overwrite"
+    );
+
+    // Skip — dst exists and overwrite=false: skipped=1, copied=0.
+    let out3 = s.call_tool(
+        "tpu_copy_file",
+        json!({
+            "source":    src.to_str().unwrap(),
+            "dest":      dst.to_str().unwrap(),
+            "overwrite": false,
+        }),
+    );
+    let v3: serde_json::Value = serde_json::from_str(&out3)
+        .unwrap_or_else(|e| panic!("tpu_copy_file skip result must be JSON; got {out3:?}: {e}"));
+    assert_eq!(v3["skipped"], 1, "skip count must be 1; result: {v3}");
+    assert_eq!(
+        v3["copied"], 0,
+        "copied count must be 0 when skipped; result: {v3}"
+    );
+}
+
+/// MCP-IT-9: `tpu_render_file` substitutes tokens and writes the output file.
+/// Also verifies that an empty token key is rejected.
+#[test]
+fn mcp_it_9_render_file_substitution_and_empty_key_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.txt");
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // Basic substitution — inline template.
+    let result = s.call_tool(
+        "tpu_render_file",
+        json!({
+            "template": "Hello {{NAME}}, you are {{AGE}} years old.",
+            "output":   out.to_str().unwrap(),
+            "vars": { "NAME": "Alice", "AGE": "30" },
+        }),
+    );
+    let v: serde_json::Value = serde_json::from_str(&result)
+        .unwrap_or_else(|e| panic!("tpu_render_file result must be JSON; got {result:?}: {e}"));
+    assert_eq!(
+        v["substitutions"], 2,
+        "substitution count must be 2; result: {v}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "Hello Alice, you are 30 years old.",
+        "rendered output must match expected"
+    );
+
+    // Empty key must be rejected with an error (isError: true in the MCP response).
+    // Use a valid template with a named placeholder so the failure comes from the
+    // vars-key validation, not from template parsing of `{{}}` itself.
+    let id = s.next_id();
+    s.send_raw(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "tpu_render_file",
+            "arguments": {
+                "template": "{{VALID}}",
+                "output":   out.to_str().unwrap(),
+                "vars": { "": "value" },
+            }
+        },
+    }));
+    let resp = s.recv_raw();
+    // MCP errors can be either a JSON-RPC error or a tool result with isError=true.
+    let is_error =
+        resp.get("error").is_some() || resp["result"]["isError"].as_bool().unwrap_or(false);
+    assert!(is_error, "empty var key must produce an error; got: {resp}");
+}
+
+/// MCP-IT-10: `tpu_setup` without a `target` returns the canonical Markdown
+/// block as plain text (not JSON).
+#[test]
+fn mcp_it_10_setup_returns_markdown_block() {
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let out = s.call_tool("tpu_setup", json!({}));
+    // The block must contain the tpu-mcp:setup markers and at least one table row.
+    assert_has("setup begin marker", &out, "tpu-mcp:setup:begin");
+    assert_has("setup end marker", &out, "tpu-mcp:setup:end");
+    assert_has("tpu_read_file row", &out, "tpu_read_file");
+    // Plain text — must NOT look like a top-level JSON object.
+    assert!(
+        !out.trim_start().starts_with('{'),
+        "tpu_setup without target must return plain Markdown, not JSON; got: {out:?}"
+    );
+}
+
+/// MCP-IT-11: `tpu_setup` with a `target` injects the guidance block into
+/// the target file, then a second call with the same target replaces it
+/// (`replaced: true`). Exercises the MCP write path (inject, stamp_and_verify,
+/// .bak cleanup) which is not covered by MCP-IT-10.
+#[test]
+fn mcp_it_11_setup_inject_and_replace() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("copilot-instructions.md");
+    // Seed the target with some existing content so inject has something to work with.
+    std::fs::write(&target, "# Existing instructions\n").unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // First call — inject: block is not yet present, so replaced must be false.
+    let out1 = s.call_tool("tpu_setup", json!({ "target": target.to_str().unwrap() }));
+    let v1: serde_json::Value = serde_json::from_str(&out1)
+        .unwrap_or_else(|e| panic!("tpu_setup inject result must be JSON; got {out1:?}: {e}"));
+    assert_eq!(
+        v1["updated"], true,
+        "first inject must report updated=true; result: {v1}"
+    );
+    assert_eq!(
+        v1["replaced"], false,
+        "first inject must report replaced=false; result: {v1}"
+    );
+    assert!(
+        v1["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+        "first inject must include a non-zero mtime; result: {v1}"
+    );
+
+    // Verify the block was actually written to disk.
+    let content1 = std::fs::read_to_string(&target).unwrap();
+    assert!(
+        content1.contains("tpu-mcp:setup:begin"),
+        "target file must contain setup begin marker after inject; content:\n{content1}"
+    );
+
+    // Second call — replace: block already exists, so replaced must be true.
+    let out2 = s.call_tool("tpu_setup", json!({ "target": target.to_str().unwrap() }));
+    let v2: serde_json::Value = serde_json::from_str(&out2)
+        .unwrap_or_else(|e| panic!("tpu_setup replace result must be JSON; got {out2:?}: {e}"));
+    // updated may be false if the block content was already identical; the key
+    // observable is that `replaced` is true (the block was found and processed).
+    assert_eq!(
+        v2["replaced"], true,
+        "second inject must report replaced=true; result: {v2}"
+    );
+
+    // .bak file must have been cleaned up.
+    let bak = target.with_extension("md.bak");
+    assert!(
+        !bak.exists(),
+        ".bak file must not remain after successful inject; found: {}",
+        bak.display()
     );
 }

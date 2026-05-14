@@ -34,7 +34,7 @@
 //! matches than the input), the file is rewritten via the standard
 //! [`crate::cmd::write::run`] path so the existing `.bak` machinery and
 //! the M2 write-time guard apply uniformly.  The write is issued with
-//! [`WritePolicy::permissive`] because the *intent* is to write a string
+//! [`crate::mojibake::WritePolicy::permissive`] because the *intent* is to write a string
 //! that may still legitimately contain mojibake — we just want
 //! *strictly less* than before.
 //!
@@ -84,9 +84,9 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use crate::{
+    IoMode,
     encoding::{BomPolicy, OutputEncoding},
     mojibake::{self, Pattern},
-    IoMode,
 };
 
 // ── Public option / record types ────────────────────────────────────────────
@@ -176,14 +176,11 @@ impl DoctorReport {
 /// Lowercase file extensions that are unconditionally treated as binary
 /// and skipped by the doctor walk.
 const BINARY_EXTS: &[&str] = &[
-    "exe", "dll", "so", "dylib", "a", "lib", "o", "obj", "pdb", "class",
-    "jar", "war", "zip", "7z", "gz", "tgz", "bz2", "xz", "rar", "tar",
-    "iso", "dmg", "img", "bin", "dat", "db", "sqlite",
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp",
-    "psd", "svgz",
-    "mp3", "mp4", "wav", "flac", "ogg", "avi", "mov", "mkv", "webm",
-    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-    "ttf", "otf", "woff", "woff2", "eot",
+    "exe", "dll", "so", "dylib", "a", "lib", "o", "obj", "pdb", "class", "jar", "war", "zip", "7z",
+    "gz", "tgz", "bz2", "xz", "rar", "tar", "iso", "dmg", "img", "bin", "dat", "db", "sqlite",
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp", "psd", "svgz", "mp3", "mp4",
+    "wav", "flac", "ogg", "avi", "mov", "mkv", "webm", "pdf", "doc", "docx", "xls", "xlsx", "ppt",
+    "pptx", "ttf", "otf", "woff", "woff2", "eot",
 ];
 
 fn is_binary_extension(path: &Path) -> bool {
@@ -203,9 +200,24 @@ fn is_binary_extension(path: &Path) -> bool {
 ///   subtrees are skipped; entries matching the optional `.gitignore`
 ///   at the walk root are skipped),
 /// - a shell-style glob (any spec containing `*`, `?`, `[`, `{`).
+#[allow(dead_code)]
 fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
+    expand_paths_with_policy(path_specs, crate::cmd::copy::OnError::Fail, &mut Vec::new())
+}
+
+/// As [`expand_paths`] but with explicit walk-error policy. Inaccessible
+/// directories produce a textual warning appended to `warnings_out` when
+/// `on_error == OnError::Warn`.
+fn expand_paths_with_policy(
+    path_specs: &[&str],
+    on_error: crate::cmd::copy::OnError,
+    warnings_out: &mut Vec<String>,
+) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    // Track warnings emitted during this call so we can detect the case
+    // where every supplied path was inaccessible (all warned-and-skipped).
+    let initial_warnings_len = warnings_out.len();
 
     for &spec in path_specs {
         let is_glob =
@@ -215,8 +227,26 @@ fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
             let matcher = Glob::new(spec)
                 .map_err(|e| format!("doctor: invalid glob {spec:?}: {e}"))?
                 .compile_matcher();
-            for entry in WalkDir::new(".").into_iter().filter_entry(|e| !is_skipped_dir(e)) {
-                let entry = entry.map_err(|e| format!("doctor: glob walk error: {e}"))?;
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_entry(|e| !is_skipped_dir(e))
+            {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => match on_error {
+                        crate::cmd::copy::OnError::Fail => {
+                            return Err(format!("doctor: glob walk error: {e}").into());
+                        }
+                        crate::cmd::copy::OnError::Warn => {
+                            let path_hint = e
+                                .path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            warnings_out.push(format!("doctor: cannot access {path_hint}: {e}"));
+                            continue;
+                        }
+                    },
+                };
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -229,8 +259,23 @@ fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
         }
 
         let p = PathBuf::from(spec);
-        let meta = fs::metadata(&p)
-            .map_err(|e| format!("doctor: cannot stat {}: {e}", p.display()))?;
+        let meta = match fs::metadata(&p) {
+            Ok(m) => m,
+            Err(e) => match on_error {
+                crate::cmd::copy::OnError::Fail => {
+                    return Err(format!("doctor: cannot stat {}: {e}", p.display()).into());
+                }
+                // A single explicit path has no other entries to fall back on;
+                // downgrade to a warning only when there are multiple specs.
+                crate::cmd::copy::OnError::Warn if path_specs.len() == 1 => {
+                    return Err(format!("doctor: cannot stat {}: {e}", p.display()).into());
+                }
+                crate::cmd::copy::OnError::Warn => {
+                    warnings_out.push(format!("doctor: cannot stat {}: {e}", p.display()));
+                    continue;
+                }
+            },
+        };
 
         if meta.is_file() {
             if !is_binary_extension(&p) {
@@ -241,8 +286,26 @@ fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
 
         if meta.is_dir() {
             let ignore = load_gitignore(&p);
-            for entry in WalkDir::new(&p).into_iter().filter_entry(|e| !is_skipped_dir(e)) {
-                let entry = entry.map_err(|e| format!("doctor: walk error: {e}"))?;
+            for entry in WalkDir::new(&p)
+                .into_iter()
+                .filter_entry(|e| !is_skipped_dir(e))
+            {
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => match on_error {
+                        crate::cmd::copy::OnError::Fail => {
+                            return Err(format!("doctor: walk error: {e}").into());
+                        }
+                        crate::cmd::copy::OnError::Warn => {
+                            let path_hint = e
+                                .path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            warnings_out.push(format!("doctor: cannot access {path_hint}: {e}"));
+                            continue;
+                        }
+                    },
+                };
                 if !entry.file_type().is_file() {
                     continue;
                 }
@@ -262,6 +325,15 @@ fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn Error>> {
         }
     }
 
+    // If every supplied path was inaccessible (all warned-and-skipped) there
+    // is nothing to scan and the caller would silently report "scanned 0".
+    // Return an error so the user knows their path specs were all bad.
+    if paths.is_empty() && warnings_out.len() > initial_warnings_len {
+        return Err(
+            "doctor: no files to scan; all specified paths were missing or inaccessible".into(),
+        );
+    }
+
     Ok(paths)
 }
 
@@ -276,7 +348,7 @@ fn push_unique(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, p: PathBuf
 /// These are virtually always either binary, generated, or already
 /// classified by their own checkers — and they would otherwise dominate
 /// the report.
-fn is_skipped_dir(entry: &walkdir::DirEntry) -> bool {
+pub(crate) fn is_skipped_dir(entry: &walkdir::DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return false;
     }
@@ -432,12 +504,14 @@ fn annotate_matches(text: &str, raw: &[mojibake::Match]) -> Vec<DoctorMatch> {
     }
 
     out.into_iter()
-        .map(|o| o.unwrap_or(DoctorMatch {
-            byte_offset: 0,
-            line: 0,
-            col: 0,
-            pattern: Pattern::Latin1,
-        }))
+        .map(|o| {
+            o.unwrap_or(DoctorMatch {
+                byte_offset: 0,
+                line: 0,
+                col: 0,
+                pattern: Pattern::Latin1,
+            })
+        })
         .collect()
 }
 
@@ -469,47 +543,88 @@ fn apply_peel(issue: &mut DoctorIssue, io_mode: IoMode) -> Result<(), Box<dyn Er
 ///
 /// `path_specs` may be empty, in which case the current directory `"."`
 /// is used.  Output (the human or JSON report) is written to `out`.
+#[allow(dead_code)]
 pub fn run(
     path_specs: &[&str],
     options: DoctorOptions,
     out: &mut dyn Write,
     io_mode: IoMode,
 ) -> Result<DoctorReport, Box<dyn Error>> {
-    let default = ["."];
-    let specs: &[&str] = if path_specs.is_empty() { &default } else { path_specs };
+    run_with_policy(
+        path_specs,
+        options,
+        out,
+        io_mode,
+        crate::cmd::copy::OnError::Fail,
+        &mut Vec::new(),
+    )
+}
 
-    let files = expand_paths(specs)?;
-    let mut report = DoctorReport {
-        total_files_scanned: files.len(),
-        ..DoctorReport::default()
+/// Variant of [`run`] that accepts an explicit walk-error policy and a
+/// sink for per-entry warnings (for inaccessible directories).
+pub fn run_with_policy(
+    path_specs: &[&str],
+    options: DoctorOptions,
+    out: &mut dyn Write,
+    io_mode: IoMode,
+    on_error: crate::cmd::copy::OnError,
+    warnings_out: &mut Vec<String>,
+) -> Result<DoctorReport, Box<dyn Error>> {
+    let default = ["."];
+    let specs: &[&str] = if path_specs.is_empty() {
+        &default
+    } else {
+        path_specs
     };
+
+    let files = expand_paths_with_policy(specs, on_error, warnings_out)?;
+    let mut report = DoctorReport::default();
 
     for path in &files {
         match diagnose_file(path, io_mode) {
-            Ok(Some(issue)) => report.issues.push(issue),
-            Ok(None) => {}
+            Ok(Some(issue)) => {
+                report.total_files_scanned += 1;
+                report.issues.push(issue);
+            }
+            Ok(None) => {
+                report.total_files_scanned += 1;
+            }
             Err(e) => {
-                // Emit a per-file warning but keep going so one unreadable
-                // file doesn't abort a large scan.
-                if !options.quiet && options.format == DoctorFormat::Human {
-                    writeln!(out, "doctor: {}: {}", path.display(), e)?;
+                let msg = format!("doctor: {}: {e}", path.display());
+                // A single explicit file has no other entries to fall back on;
+                // downgrade to a warning only when there are multiple files.
+                if matches!(on_error, crate::cmd::copy::OnError::Fail) || files.len() == 1 {
+                    return Err(msg.into());
                 }
+                warnings_out.push(msg);
             }
         }
     }
 
+    // If every selected file failed in warn mode, returning Ok with
+    // total_files_scanned == 0 would silently look like an empty-directory
+    // scan.  Return an error instead so callers know nothing was diagnosed.
+    if report.total_files_scanned == 0 && !files.is_empty() {
+        return Err(
+            "doctor: no files could be scanned; all selected files were missing or unreadable"
+                .into(),
+        );
+    }
+
     if options.fix == DoctorFix::Peel {
         for issue in &mut report.issues {
-            if !issue.mojibake_matches.is_empty() && issue.peel_suggested.is_some()
+            if !issue.mojibake_matches.is_empty()
+                && issue.peel_suggested.is_some()
                 && let Err(e) = apply_peel(issue, io_mode)
-                    && options.format == DoctorFormat::Human {
-                        writeln!(
-                            out,
-                            "doctor: peel-fix failed for {}: {}",
-                            issue.path.display(),
-                            e
-                        )?;
-                    }
+                && options.format == DoctorFormat::Human
+            {
+                writeln!(
+                    out,
+                    "doctor: peel-fix failed for {}: {}",
+                    issue.path.display(),
+                    e
+                )?;
+            }
         }
         report.total_repaired = report.issues.iter().filter(|i| i.repaired).count();
     }
@@ -630,6 +745,75 @@ mod tests {
     }
 
     #[test]
+    fn expand_paths_warn_mode_all_missing_returns_error() {
+        // When every supplied path is missing and on_error is Warn,
+        // expand_paths_with_policy must error rather than silently returning
+        // an empty list (which would cause `tpu doctor` to report "scanned 0"
+        // and exit successfully without checking anything).
+        let mut warnings: Vec<String> = Vec::new();
+        let result = expand_paths_with_policy(
+            &["definitely_does_not_exist_a", "definitely_does_not_exist_b"],
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        );
+        assert!(
+            result.is_err(),
+            "expected an error when all paths are missing"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no files to scan"),
+            "error should mention 'no files to scan', got: {msg}"
+        );
+        // The individual stat failures should still have been recorded as warnings.
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn expand_paths_warn_mode_partial_missing_succeeds() {
+        // When only SOME paths are missing, the function should succeed and
+        // return the files that were found.
+        let tmp = TempDir::new().unwrap();
+        let p = write(&tmp, "real.txt", b"hello");
+        let real = p.to_str().unwrap().to_owned();
+        let mut warnings: Vec<String> = Vec::new();
+        let result = expand_paths_with_policy(
+            &[real.as_str(), "definitely_does_not_exist"],
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(warnings.len(), 1, "one warning for the missing path");
+    }
+
+    #[test]
+    fn run_with_policy_counts_only_successfully_diagnosed_files() {
+        // total_files_scanned must reflect the number of files that were
+        // actually diagnosed, not the total length of the candidate list.
+        // (The pre-fix bug initialised the count with files.len() before the
+        // loop so every failed diagnose_file still incremented the tally.)
+        let tmp = TempDir::new().unwrap();
+        let a = write(&tmp, "a.txt", b"clean utf-8\n");
+        let b = write(&tmp, "b.txt", b"also clean\n");
+        let a_s = a.to_str().unwrap().to_owned();
+        let b_s = b.to_str().unwrap().to_owned();
+        let mut out: Vec<u8> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let report = run_with_policy(
+            &[a_s.as_str(), b_s.as_str()],
+            DoctorOptions::default(),
+            &mut out,
+            IoMode::Buffered,
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(report.total_files_scanned, 2);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn binary_extensions_skipped() {
         assert!(is_binary_extension(Path::new("foo.png")));
         assert!(is_binary_extension(Path::new("foo.PNG")));
@@ -646,10 +830,15 @@ mod tests {
         fs::create_dir(tmp.path().join("src")).unwrap();
         let mut found_src = false;
         let mut found_skipped = false;
-        for e in WalkDir::new(tmp.path()).into_iter().filter_entry(|e| !is_skipped_dir(e)) {
+        for e in WalkDir::new(tmp.path())
+            .into_iter()
+            .filter_entry(|e| !is_skipped_dir(e))
+        {
             let e = e.unwrap();
             let n = e.file_name().to_string_lossy().to_string();
-            if n == "src" { found_src = true; }
+            if n == "src" {
+                found_src = true;
+            }
             if n == ".git" || n == "target" {
                 // only top-level entry survives the filter (it's checked
                 // *before* being yielded, so we still see the dir itself).
@@ -676,7 +865,9 @@ mod tests {
         // Two lines; mojibake is on line 2 at column 5 (0-indexed bytes
         // include "first\n" = 6 bytes before the 'c' of 'caf').
         let p = write(&tmp, "bad.txt", "first\ncafÃ©\n".as_bytes());
-        let issue = diagnose_file(&p, IoMode::Buffered).unwrap().expect("flagged");
+        let issue = diagnose_file(&p, IoMode::Buffered)
+            .unwrap()
+            .expect("flagged");
         assert!(issue.valid_in_detected_encoding);
         assert_eq!(issue.mojibake_matches.len(), 1);
         let m = &issue.mojibake_matches[0];
@@ -699,18 +890,16 @@ mod tests {
         // bytes are valid and the test is moot — assert with that in mind.
         let res = diagnose_file(&p, IoMode::Buffered).unwrap();
         if let Some(issue) = res
-            && !issue.valid_in_detected_encoding {
-                assert!(issue.mojibake_matches.is_empty());
-            }
+            && !issue.valid_in_detected_encoding
+        {
+            assert!(issue.mojibake_matches.is_empty());
+        }
     }
 
     #[test]
     fn allow_marker_suppresses_diagnosis() {
         let tmp = TempDir::new().unwrap();
-        let body = format!(
-            "// {}\nthis line has cafÃ© in it\n",
-            mojibake::ALLOW_MARKER
-        );
+        let body = format!("// {}\nthis line has cafÃ© in it\n", mojibake::ALLOW_MARKER);
         let p = write(&tmp, "ok.txt", body.as_bytes());
         let res = diagnose_file(&p, IoMode::Buffered).unwrap();
         assert!(res.is_none());
@@ -772,7 +961,10 @@ mod tests {
         )
         .unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(!s.contains("bad.txt"), "quiet should suppress per-file lines: {s}");
+        assert!(
+            !s.contains("bad.txt"),
+            "quiet should suppress per-file lines: {s}"
+        );
         assert!(s.contains("doctor: scanned"), "summary still emitted: {s}");
     }
 
@@ -844,8 +1036,7 @@ mod tests {
         let now_text = String::from_utf8_lossy(&now);
         assert!(
             mojibake::scan(&now_text).matches.is_empty()
-                || mojibake::scan(&now_text).matches.len()
-                    < mojibake::scan(single).matches.len()
+                || mojibake::scan(&now_text).matches.len() < mojibake::scan(single).matches.len()
         );
     }
 
@@ -870,7 +1061,10 @@ mod tests {
 
         assert_eq!(report.total_repaired, 0);
         let bak = format!("{}.bak", p.display());
-        assert!(!Path::new(&bak).exists(), "no .bak should be created for clean files");
+        assert!(
+            !Path::new(&bak).exists(),
+            "no .bak should be created for clean files"
+        );
     }
 
     #[test]
@@ -946,8 +1140,18 @@ mod tests {
         )
         .unwrap();
         // .gitignore + kept.txt are scanned; ignored/ + *.log skipped.
-        assert!(report.issues.iter().all(|i| !i.path.to_string_lossy().contains("ignored")));
-        assert!(report.issues.iter().all(|i| !i.path.to_string_lossy().ends_with(".log")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| !i.path.to_string_lossy().contains("ignored"))
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| !i.path.to_string_lossy().ends_with(".log"))
+        );
         assert!(report.issues.iter().any(|i| i.path.ends_with("kept.txt")));
     }
 
@@ -975,7 +1179,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.total_files_scanned, 1);
-        assert!(report.issues.iter().any(|i| i.path.to_string_lossy().ends_with("a.txt")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.path.to_string_lossy().ends_with("a.txt"))
+        );
     }
 
     /// Restore the previous working directory on drop.  Used to keep

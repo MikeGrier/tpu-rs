@@ -21,9 +21,9 @@
 use std::{fs, path::PathBuf};
 
 use tempfile::TempDir;
+use tpu::IoMode;
 use tpu::cmd::doctor::{self, DoctorFix, DoctorFormat, DoctorOptions};
 use tpu::test_fixtures::{cafe, cafe_line};
-use tpu::IoMode;
 
 /// Build a temp tree with seven fixtures.  The returned tuple is the
 /// `TempDir` (kept alive) and a map of canonical labels → on-disk paths.
@@ -58,11 +58,7 @@ fn build_tree() -> (TempDir, Fixtures) {
         // UTF-8 BOM forces harrier's detection to UTF-8.  After the
         // BOM we put a bare 0xFF byte which is not a legal UTF-8 start
         // byte, so the doctor sees `valid_in_detected_encoding=false`.
-        invalid_utf8: write_file(
-            &dir,
-            "invalid.txt",
-            b"\xEF\xBB\xBFcafe \xFF garbage\n",
-        ),
+        invalid_utf8: write_file(&dir, "invalid.txt", b"\xEF\xBB\xBFcafe \xFF garbage\n"),
         with_marker: write_file(
             &dir,
             "with_marker.txt",
@@ -103,14 +99,10 @@ fn utf16le_with_bom(s: &str) -> Vec<u8> {
     out
 }
 
-fn run_doctor(
-    tree: &TempDir,
-    options: DoctorOptions,
-) -> (doctor::DoctorReport, String) {
+fn run_doctor(tree: &TempDir, options: DoctorOptions) -> (doctor::DoctorReport, String) {
     let path = tree.path().to_string_lossy().to_string();
     let mut buf: Vec<u8> = Vec::new();
-    let report = doctor::run(&[&path], options, &mut buf, IoMode::Buffered)
-        .expect("doctor::run");
+    let report = doctor::run(&[&path], options, &mut buf, IoMode::Buffered).expect("doctor::run");
     let s = String::from_utf8(buf).expect("utf-8 output");
     (report, s)
 }
@@ -216,7 +208,10 @@ fn json_format_produces_documented_schema() {
             entry["peel_suggested"].is_boolean(),
             "missing 'peel_suggested': {entry}"
         );
-        assert!(entry["repaired"].is_boolean(), "missing 'repaired': {entry}");
+        assert!(
+            entry["repaired"].is_boolean(),
+            "missing 'repaired': {entry}"
+        );
 
         for m in entry["mojibake_matches"].as_array().unwrap() {
             assert!(m["byte_offset"].is_u64());

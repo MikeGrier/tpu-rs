@@ -4,6 +4,13 @@
 name = "tpu-mcp"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "MCP server exposing the encoding-aware file I/O primitives of the `tpu` crate to LLM agents (Copilot Chat and other MCP clients)."
 
 [[bin]]
 name = "tpu-mcp"

@@ -57,6 +57,11 @@
                 "command": "tpu-mcp.showServerVersion",
                 "title": "tpu-mcp: Show bundled server version",
                 "category": "tpu-mcp"
+            },
+            {
+                "command": "tpu-mcp.openSetupChat",
+                "title": "tpu-mcp: Open chat to inject Copilot guidance (tpu setup --inject)",
+                "category": "tpu-mcp"
             }
         ],
         "configuration": {
@@ -81,6 +86,26 @@
                     },
                     "default": [],
                     "markdownDescription": "Additional command-line arguments appended to the `tpu-mcp` invocation. Intended for advanced/debug scenarios."
+                },
+                "tpu-mcp.errorMode": {
+                    "type": "string",
+                    "enum": ["continue", "strict"],
+                    "enumDescriptions": [
+                        "Tools that walk file trees (`tpu_find`, `tpu_copy_file`) emit a warning and skip past unreadable entries instead of aborting the whole operation.",
+                        "Tools abort on the first walk error (the legacy 'fail-fast' behaviour). Use this when you want any inaccessible path to surface as a hard error."
+                    ],
+                    "default": "continue",
+                    "markdownDescription": "Default error policy for `tpu_find` and `tpu_copy_file` when an entry cannot be read or written. Per-call `on_error` arguments still override this default. Forwarded to the server via the `TPU_DEFAULT_ERROR_MODE` environment variable."
+                },
+                "tpu-mcp.progressDetail": {
+                    "type": "string",
+                    "enum": ["each-file", "summary"],
+                    "enumDescriptions": [
+                        "Include a per-operation warning log: each inaccessible path or walk error appears as a separate entry (successfully skipped destinations are counted in the summary only, not individually logged).",
+                        "Suppress per-entry warning details and surface only a summary count at the end of the operation."
+                    ],
+                    "default": "each-file",
+                    "markdownDescription": "How much walk-error detail tree-walking tools include in their results. `each-file` (default) includes a `log` array of warning strings in `tpu_copy_file` results and individual warning lines in `tpu_find` output — each entry represents an inaccessible path or walk error. `summary` suppresses those per-entry details and collapses all walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
                 }
             }
         }

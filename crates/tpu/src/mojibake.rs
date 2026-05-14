@@ -148,10 +148,7 @@ fn patterns() -> &'static [(Pattern, Regex)] {
                 Pattern::BoxDrawing,
                 Regex::new(r"\u{00E2}\u{201D}[\u{0080}-\u{20FF}]").unwrap(),
             ),
-            (
-                Pattern::Nbsp,
-                Regex::new(r"\u{00C2}\u{00A0}").unwrap(),
-            ),
+            (Pattern::Nbsp, Regex::new(r"\u{00C2}\u{00A0}").unwrap()),
         ]
     })
 }
@@ -781,9 +778,7 @@ mod tests {
 
     #[test]
     fn check_clean_to_clean_is_ok() {
-        assert!(
-            check_write_does_not_introduce_mojibake("hello", "hello world").is_ok()
-        );
+        assert!(check_write_does_not_introduce_mojibake("hello", "hello world").is_ok());
     }
 
     #[test]

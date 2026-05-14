@@ -29,6 +29,12 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      pre_release:
+        description: "Publish as a Marketplace pre-release (use for odd-minor versions only)"
+        type: boolean
+        required: false
+        default: false
 
 permissions:
   contents: write   # needed to create the GitHub Release
@@ -119,9 +125,43 @@ jobs:
         working-directory: crates/tpu-mcp/extension
         run: npm run compile
 
+      - name: Compute pre-release flag
+        id: prerelease
+        env:
+          PRE_RELEASE_INPUT: ${{ github.event.inputs.pre_release || 'false' }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # vsce requires --pre-release at BOTH package and publish time;
+          # passing it only to publish errors with "Cannot use '--pre-release'
+          # flag with a package that was not packaged as pre-release". So we
+          # decide once here and propagate the result through job outputs.
+          pre="false"
+          if [ "${PRE_RELEASE_INPUT:-false}" = "true" ]; then
+              pre="true"
+          elif [ "${REF_TYPE:-}" = "tag" ] && [[ "${REF_NAME}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              minor="${BASH_REMATCH[2]}"
+              if (( minor % 2 == 1 )); then
+                  pre="true"
+              fi
+          fi
+          echo "pre_release=${pre}" >> "$GITHUB_OUTPUT"
+          echo "pre_release=${pre}"
+
       - name: vsce package --target ${{ matrix.vscode_target }}
         working-directory: crates/tpu-mcp/extension
-        run: npx vsce package --target ${{ matrix.vscode_target }} --no-dependencies
+        env:
+          PRE_RELEASE: ${{ steps.prerelease.outputs.pre_release }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pre_flag=""
+          if [ "${PRE_RELEASE:-false}" = "true" ]; then
+              pre_flag="--pre-release"
+          fi
+          npx vsce package $pre_flag --target ${{ matrix.vscode_target }} --no-dependencies
 
       - name: Upload VSIX artifact
         uses: actions/upload-artifact@v5
@@ -174,12 +214,37 @@ jobs:
         working-directory: crates/tpu-mcp/extension
         env:
           VSCE_PAT: ${{ secrets.VSCE_PAT }}
+          PRE_RELEASE_INPUT: ${{ github.event.inputs.pre_release || 'false' }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
         shell: bash
         run: |
           set -euo pipefail
           if [ -z "${VSCE_PAT:-}" ]; then
               echo "::error::VSCE_PAT secret is not set on the 'marketplace' environment"
               exit 1
+          fi
+          # Decide whether this is a pre-release publish.
+          #
+          # workflow_dispatch: `pre_release=true` forces pre-release.
+          #                    `false` (the default) falls through to
+          #                    auto-detection by the tag convention below.
+          # tag push (v*):     auto-detect via VS Code's minor-version
+          #                    convention -- odd minor = pre-release,
+          #                    even minor = stable. So v0.3.1 -> pre-release,
+          #                    v0.4.0 -> stable.
+          pre_flag=""
+          if [ "${PRE_RELEASE_INPUT:-false}" = "true" ]; then
+              pre_flag="--pre-release"
+              echo "Publishing as Marketplace pre-release (workflow_dispatch input)"
+          elif [ "${REF_TYPE:-}" = "tag" ] && [[ "${REF_NAME}" =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+              minor="${BASH_REMATCH[2]}"
+              if (( minor % 2 == 1 )); then
+                  pre_flag="--pre-release"
+                  echo "Publishing as Marketplace pre-release (odd minor ${minor} in tag ${REF_NAME})"
+              else
+                  echo "Publishing as Marketplace stable (even minor ${minor} in tag ${REF_NAME})"
+              fi
           fi
           # Publish each per-target VSIX. `vsce publish --packagePath`
           # uploads an already-built VSIX rather than repackaging, which
@@ -189,7 +254,7 @@ jobs:
           published=0
           for vsix in ../../../vsix/*/*.vsix; do
               echo "Publishing $vsix"
-              npx vsce publish --packagePath "$vsix" --pat "$VSCE_PAT"
+              npx vsce publish $pre_flag --packagePath "$vsix" --pat "$VSCE_PAT"
               published=$((published + 1))
           done
           if [ "$published" -eq 0 ]; then

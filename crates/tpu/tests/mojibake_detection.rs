@@ -19,12 +19,9 @@
 //! source file remains pure ASCII and needs no `allow-mojibake` opt-out.
 
 use tpu::mojibake::{
-    self, ALLOW_MARKER, Pattern, allowed_by_marker, first_match,
-    looks_like_one_layer_peel, scan,
+    self, ALLOW_MARKER, Pattern, allowed_by_marker, first_match, looks_like_one_layer_peel, scan,
 };
-use tpu::test_fixtures::{
-    all_four_mixed, box_drawing, cafe, double_cafe, em_dash, naive, nbsp,
-};
+use tpu::test_fixtures::{all_four_mixed, box_drawing, cafe, double_cafe, em_dash, naive, nbsp};
 
 /// Each fixture: a label, the input text, the expected mojibake match
 /// count from `scan`, and the expected allow-marker honouring.
@@ -224,7 +221,9 @@ fn module_is_pure_and_does_not_panic_on_pathological_inputs() {
     let _ = looks_like_one_layer_peel(&long);
 
     // Single-character / boundary inputs.
-    for s in ["", "a", "\u{00C3}", "\u{00E2}", "\u{00C2}", "\u{00A0}", "\u{20AC}"] {
+    for s in [
+        "", "a", "\u{00C3}", "\u{00E2}", "\u{00C2}", "\u{00A0}", "\u{20AC}",
+    ] {
         let _ = scan(s);
         let _ = first_match(s);
         let _ = looks_like_one_layer_peel(s);

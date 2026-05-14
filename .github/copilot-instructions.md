@@ -3,6 +3,62 @@
 <!-- encoding-check: allow-mojibake (this file contains literal mojibake
      examples for documentation purposes) -->
 
+<!-- tpu-mcp:setup:begin -->
+## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
+
+This workspace runs the **tpu-mcp** MCP server which exposes encoding-aware
+file primitives as first-class tools. Plain `Get-Content` / `Set-Content` /
+`Out-File` / `>` / `cat` / `sed` round-trip files through the active code
+page and silently corrupt UTF-8, UTF-16, smart quotes, em-dashes, and
+box-drawing characters. Use the MCP tools instead — they detect, preserve,
+and round-trip the file's native encoding and line endings safely.
+
+**Rule:** when working in any project that has the tpu-mcp server registered,
+ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
+
+| MCP tool | Use it for |
+|---|---|
+| `tpu_read_file` | reading text files (UTF-8, UTF-16, Windows-1252, Shift-JIS, …) |
+| `tpu_read_head` / `tpu_read_tail` | first/last N lines or bytes |
+| `tpu_read_file_binary` | inspecting raw bytes of binary files |
+| `tpu_read_file_escaped` | reading text as a single 7-bit-clean escaped line |
+| `tpu_write_file` | replacing a text file's full contents |
+| `tpu_append_file` | appending text to an existing file |
+| `tpu_replace_in_file` | regex / fixed-string substitution (use `fixed_strings: true` for literal targets) |
+| `tpu_edit_file` | targeted insert/delete/splice at known line numbers |
+| `tpu_validate_file` | pre-flight assertion that a file is in the expected state |
+| `tpu_count_file` | line / word / char / byte / pattern counts |
+| `tpu_find` | encoding-aware grep across files and globs |
+| `tpu_copy_file` | copy a file or recursively copy a tree (resilient: per-entry warnings, never aborts mid-walk by default) |
+| `tpu_render_file` | populate a file from a `{{TOKEN}}` template |
+| `tpu_stat_file` | verify a write actually persisted (mtime / size) |
+| `tpu_setup` | (re)write this guidance block into the active `copilot-instructions.md` |
+
+### When to use each
+
+- **Reads** — always use `tpu_read_file`. Never use PowerShell `Get-Content`
+  for code review or content inspection.
+- **Edits** — prefer `tpu_replace_in_file` with `fixed_strings: true` over
+  `tpu_edit_file` when the target text is unique, because line numbers can
+  shift between reads. Use `tpu_edit_file` when you have just read the file
+  and know exact line offsets.
+- **Writes that should be guarded** — pass `validate: [{ "selector":
+  "line-contains:N", "value": "..." }]` to refuse the write if the file is
+  not in the expected state.
+- **Globs / recursion** — `tpu_find` and `tpu_copy_file` accept glob
+  patterns and tolerate inaccessible directories by emitting warning
+  records (configurable via the `on_error` argument).
+- **Dependency-free templating** — `tpu_render_file` substitutes
+  `{{NAME}}`-style tokens. Use `\{{` to emit literal braces.
+
+### File encoding
+
+When you must fall back to PowerShell, never round-trip non-ASCII files
+through `Get-Content` / `Set-Content` — read and write via
+`[System.IO.File]::ReadAllBytes` / `WriteAllBytes` and validate with
+`tools/check-encoding.ps1` afterwards.
+<!-- tpu-mcp:setup:end -->
+
 ## Tool preference (use the first available)
 
 1. **Editor edit tools** (the IDE's built-in edit / replace operations) —

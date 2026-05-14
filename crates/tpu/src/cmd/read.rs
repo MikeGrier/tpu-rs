@@ -9,8 +9,8 @@ use harrier::{encoding::SourceConfig, source::Source};
 use md5::{Digest, Md5};
 
 use crate::{
-    encoding::{BomPolicy, OutputEncoding},
     IoMode,
+    encoding::{BomPolicy, OutputEncoding},
 };
 
 /// UTF-8 BOM byte sequence (U+FEFF encoded as UTF-8).
@@ -349,7 +349,7 @@ pub fn parse_hash_arg(s: &str) -> Result<HashSpec, Box<dyn std::error::Error>> {
         other => {
             return Err(
                 format!("--hash: unknown algorithm {other:?}; expected 'crc32' or 'md5'").into(),
-            )
+            );
         }
     };
 
