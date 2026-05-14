@@ -401,7 +401,7 @@ impl DaclDenyGuard {
             //               + 8 bytes (ACE_HEADER + Mask)
             //               + full SID body (replaces the inline SidStart DWORD).
             let acl_len: u32 = 8 + 8 + sid_len;
-            let mut acl_buf = vec![0u8; acl_len as usize];
+            let mut acl_buf = vec![0u64; (acl_len as usize + 7) / 8];
             let acl_ptr = acl_buf.as_mut_ptr() as *mut ACL;
             assert_ne!(
                 InitializeAcl(acl_ptr, acl_len, ACL_REVISION as u32),
