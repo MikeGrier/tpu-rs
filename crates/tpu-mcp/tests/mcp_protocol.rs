@@ -513,6 +513,8 @@ fn mcp_it_9_render_file_substitution_and_empty_key_rejected() {
     );
 
     // Empty key must be rejected with an error (isError: true in the MCP response).
+    // Use a valid template with a named placeholder so the failure comes from the
+    // vars-key validation, not from template parsing of `{{}}` itself.
     let id = s.next_id();
     s.send_raw(json!({
         "jsonrpc": "2.0",
@@ -521,7 +523,7 @@ fn mcp_it_9_render_file_substitution_and_empty_key_rejected() {
         "params": {
             "name": "tpu_render_file",
             "arguments": {
-                "template": "{{}}",
+                "template": "{{VALID}}",
                 "output":   out.to_str().unwrap(),
                 "vars": { "": "value" },
             }

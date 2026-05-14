@@ -60,7 +60,7 @@
             },
             {
                 "command": "tpu-mcp.openSetupChat",
-                "title": "tpu-mcp: Inject Copilot guidance into .github/copilot-instructions.md",
+                "title": "tpu-mcp: Open chat to inject Copilot guidance (tpu setup --inject)",
                 "category": "tpu-mcp"
             }
         ],

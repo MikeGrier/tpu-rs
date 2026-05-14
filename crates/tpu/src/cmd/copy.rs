@@ -32,12 +32,39 @@ use walkdir::WalkDir;
 
 use crate::shell::Shell;
 
+/// Lexically resolve `.` and `..` in `path` without touching the filesystem.
+///
+/// Must be called before walking up to the deepest existing ancestor: without
+/// it `Path::file_name()` returns `None` for `..` components and they silently
+/// vanish from the reconstructed path, causing the self-copy guard to miss
+/// destinations such as `other/../src/dst` that are actually inside `src/`.
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Canonicalize a path, or — when it doesn't exist yet — canonicalize the
 /// deepest existing ancestor and re-append the non-existing tail.
 ///
-/// This normalises `..` components in the non-existing suffix so that a dest
-/// like `other/../src/dst` is correctly identified as being inside `src/`.
+/// Lexically normalises `.`/`..` first so that a dest like
+/// `other/../src/dst` is correctly identified as being inside `src/` even
+/// when the path does not exist yet.
 fn canon_nearest(path: &Path) -> PathBuf {
+    // Lexically resolve `.` and `..` before any filesystem access so that
+    // `..` components in a non-existent suffix don't silently vanish when
+    // `file_name()` returns `None` for them during the ancestor walk.
+    let lexical = normalize_lexical(path);
+    let path = lexical.as_path();
     if let Ok(c) = path.canonicalize() {
         return c;
     }
