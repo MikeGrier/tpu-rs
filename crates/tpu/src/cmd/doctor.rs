@@ -578,15 +578,17 @@ pub fn run_with_policy(
     };
 
     let files = expand_paths_with_policy(specs, on_error, warnings_out)?;
-    let mut report = DoctorReport {
-        total_files_scanned: files.len(),
-        ..DoctorReport::default()
-    };
+    let mut report = DoctorReport::default();
 
     for path in &files {
         match diagnose_file(path, io_mode) {
-            Ok(Some(issue)) => report.issues.push(issue),
-            Ok(None) => {}
+            Ok(Some(issue)) => {
+                report.total_files_scanned += 1;
+                report.issues.push(issue);
+            }
+            Ok(None) => {
+                report.total_files_scanned += 1;
+            }
             Err(e) => {
                 let msg = format!("doctor: {}: {e}", path.display());
                 // A single explicit file has no other entries to fall back on;
@@ -597,6 +599,16 @@ pub fn run_with_policy(
                 warnings_out.push(msg);
             }
         }
+    }
+
+    // If every selected file failed in warn mode, returning Ok with
+    // total_files_scanned == 0 would silently look like an empty-directory
+    // scan.  Return an error instead so callers know nothing was diagnosed.
+    if report.total_files_scanned == 0 && !files.is_empty() {
+        return Err(
+            "doctor: no files could be scanned; all selected files were missing or unreadable"
+                .into(),
+        );
     }
 
     if options.fix == DoctorFix::Peel {
@@ -773,6 +785,32 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap().len(), 1);
         assert_eq!(warnings.len(), 1, "one warning for the missing path");
+    }
+
+    #[test]
+    fn run_with_policy_counts_only_successfully_diagnosed_files() {
+        // total_files_scanned must reflect the number of files that were
+        // actually diagnosed, not the total length of the candidate list.
+        // (The pre-fix bug initialised the count with files.len() before the
+        // loop so every failed diagnose_file still incremented the tally.)
+        let tmp = TempDir::new().unwrap();
+        let a = write(&tmp, "a.txt", b"clean utf-8\n");
+        let b = write(&tmp, "b.txt", b"also clean\n");
+        let a_s = a.to_str().unwrap().to_owned();
+        let b_s = b.to_str().unwrap().to_owned();
+        let mut out: Vec<u8> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let report = run_with_policy(
+            &[a_s.as_str(), b_s.as_str()],
+            DoctorOptions::default(),
+            &mut out,
+            IoMode::Buffered,
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(report.total_files_scanned, 2);
+        assert!(warnings.is_empty());
     }
 
     #[test]
