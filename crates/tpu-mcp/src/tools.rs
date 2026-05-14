@@ -2404,8 +2404,13 @@ fn is_windows_drive_path(s: &str) -> bool {
 /// Decode all `%XX` percent-encoded sequences in `s`.
 ///
 /// Invalid or incomplete sequences are passed through unchanged.
+///
+/// Bytes are collected first and then interpreted as UTF-8 so that
+/// multi-byte sequences such as `%C3%A9` round-trip correctly to `é`
+/// rather than being mojibaked into `Ã©` by treating each decoded byte
+/// as a Latin-1 scalar.
 fn percent_decode_path(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
@@ -2413,14 +2418,14 @@ fn percent_decode_path(s: &str) -> String {
             && i + 2 < b.len()
             && let (Some(hi), Some(lo)) = (hex_nibble(b[i + 1]), hex_nibble(b[i + 2]))
         {
-            out.push(char::from(hi << 4 | lo));
+            bytes.push(hi << 4 | lo);
             i += 3;
             continue;
         }
-        out.push(char::from(b[i]));
+        bytes.push(b[i]);
         i += 1;
     }
-    out
+    String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
 
 fn hex_nibble(b: u8) -> Option<u8> {
@@ -2553,6 +2558,19 @@ mod tests {
     #[test]
     fn percent_decode_space() {
         assert_eq!(percent_decode_path("my%20file.txt"), "my file.txt");
+    }
+
+    #[test]
+    fn percent_decode_utf8_multibyte() {
+        // é is U+00E9, UTF-8 bytes 0xC3 0xA9.  Each %XX must not be
+        // treated as a Latin-1 scalar (which would produce "Ã©").
+        assert_eq!(percent_decode_path("%C3%A9"), "é");
+        assert_eq!(percent_decode_path("/path/caf%C3%A9"), "/path/café");
+        // Japanese: ファイル — 3 × 3-byte UTF-8 sequences
+        assert_eq!(
+            percent_decode_path("%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB"),
+            "ファイル"
+        );
     }
 
     #[test]

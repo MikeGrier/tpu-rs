@@ -215,6 +215,9 @@ fn expand_paths_with_policy(
 ) -> Result<Vec<PathBuf>, Box<dyn Error>> {
     let mut paths: Vec<PathBuf> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
+    // Track warnings emitted during this call so we can detect the case
+    // where every supplied path was inaccessible (all warned-and-skipped).
+    let initial_warnings_len = warnings_out.len();
 
     for &spec in path_specs {
         let is_glob =
@@ -320,6 +323,15 @@ fn expand_paths_with_policy(
             }
             continue;
         }
+    }
+
+    // If every supplied path was inaccessible (all warned-and-skipped) there
+    // is nothing to scan and the caller would silently report "scanned 0".
+    // Return an error so the user knows their path specs were all bad.
+    if paths.is_empty() && warnings_out.len() > initial_warnings_len {
+        return Err(
+            "doctor: no files to scan; all specified paths were missing or inaccessible".into(),
+        );
     }
 
     Ok(paths)
@@ -718,6 +730,49 @@ mod tests {
         let mut f = fs::File::create(&p).unwrap();
         f.write_all(bytes).unwrap();
         p
+    }
+
+    #[test]
+    fn expand_paths_warn_mode_all_missing_returns_error() {
+        // When every supplied path is missing and on_error is Warn,
+        // expand_paths_with_policy must error rather than silently returning
+        // an empty list (which would cause `tpu doctor` to report "scanned 0"
+        // and exit successfully without checking anything).
+        let mut warnings: Vec<String> = Vec::new();
+        let result = expand_paths_with_policy(
+            &["definitely_does_not_exist_a", "definitely_does_not_exist_b"],
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        );
+        assert!(
+            result.is_err(),
+            "expected an error when all paths are missing"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no files to scan"),
+            "error should mention 'no files to scan', got: {msg}"
+        );
+        // The individual stat failures should still have been recorded as warnings.
+        assert_eq!(warnings.len(), 2);
+    }
+
+    #[test]
+    fn expand_paths_warn_mode_partial_missing_succeeds() {
+        // When only SOME paths are missing, the function should succeed and
+        // return the files that were found.
+        let tmp = TempDir::new().unwrap();
+        let p = write(&tmp, "real.txt", b"hello");
+        let real = p.to_str().unwrap().to_owned();
+        let mut warnings: Vec<String> = Vec::new();
+        let result = expand_paths_with_policy(
+            &[real.as_str(), "definitely_does_not_exist"],
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        );
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().len(), 1);
+        assert_eq!(warnings.len(), 1, "one warning for the missing path");
     }
 
     #[test]
