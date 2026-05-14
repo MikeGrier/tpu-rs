@@ -346,7 +346,7 @@ fn copy_one(
         };
         match fs::copy(src, &tmp) {
             Ok(_) => {
-                if let Err(e) = fs::rename(&tmp, dst) {
+                if let Err(e) = rename_replacing(&tmp, dst) {
                     let _ = fs::remove_file(&tmp);
                     let msg = format!("copy: {} -> {}: {e}", src.display(), dst.display());
                     report.warnings += 1;
@@ -384,6 +384,44 @@ fn copy_one(
             let _ = shell.warn(msg);
             Ok(())
         }
+    }
+}
+
+/// Rename `from` to `to`, replacing `to` if it already exists.
+///
+/// `std::fs::rename` on Windows does not replace an existing destination
+/// (it returns `ERROR_ALREADY_EXISTS`). On Windows this therefore calls
+/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` directly via `windows-sys`
+/// so no filesystem-helper library decides the semantics for us.
+///
+/// On POSIX platforms `rename(2)` is guaranteed atomic and replaces the
+/// destination, so `fs::rename` is used as-is.
+fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+        let from_w: Vec<u16> = from
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let to_w: Vec<u16> = to
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: both wide strings are null-terminated and remain alive for
+        // the duration of the call.
+        let ok = unsafe { MoveFileExW(from_w.as_ptr(), to_w.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+        if ok == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    {
+        fs::rename(from, to)
     }
 }
 

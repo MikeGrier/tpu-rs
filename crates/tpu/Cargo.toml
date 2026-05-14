@@ -38,6 +38,10 @@ crc32fast = "1"
 globset = "0.4"
 walkdir = "2"
 
+[target."cfg(windows)".dependencies]
+# MoveFileExW for atomic replace-existing rename in copy_one.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 encoding_rs = "0.8"
 md-5 = "0.10"
