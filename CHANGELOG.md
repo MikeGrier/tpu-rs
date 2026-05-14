@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.1.5](https://github.com/MikeGrier/tpu-rs/compare/v0.1.4...v0.1.5) (2026-05-14)
+
+
+### Bug Fixes
+
+* trigger release for copy/render/setup changes ([#25](https://github.com/MikeGrier/tpu-rs/issues/25)) ([f69ccb4](https://github.com/MikeGrier/tpu-rs/commit/f69ccb4aa28197f16de7bcc500d2b9a646b4bc4f))
+
 ## [0.1.4](https://github.com/MikeGrier/tpu-rs/compare/v0.1.3...v0.1.4) (2026-05-05)
 
 

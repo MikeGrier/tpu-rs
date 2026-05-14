@@ -620,7 +620,7 @@ dependencies = [
 
 [[package]]
 name = "tpu"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anstream 0.6.21",
  "anstyle",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "tpu-mcp"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "serde",
  "serde_json",
