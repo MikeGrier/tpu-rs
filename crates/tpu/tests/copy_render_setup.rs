@@ -557,6 +557,20 @@ fn copy_recursive_warn_mode_continues_past_denied_subdir() {
     // restoring the DACL before TempDir attempts to clean up the tree.
     let _guard = DaclDenyGuard::deny_listing(&a.join("b"));
 
+    // Sanity-check: confirm the DACL deny actually took effect on this runner.
+    // Some CI environments (e.g. ones with SeBackupPrivilege) may bypass DACLs;
+    // return early with a clear diagnostic rather than failing confusingly.
+    match std::fs::read_dir(a.join("b")) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        probe => {
+            eprintln!(
+                "DACL deny did not produce PermissionDenied on this runner; \
+                 skipping test (probe: {probe:?})"
+            );
+            return;
+        }
+    }
+
     let out = tpu()
         .arg("--on-error")
         .arg("warn")
@@ -585,8 +599,10 @@ fn copy_recursive_warn_mode_continues_past_denied_subdir() {
     );
     // A warning about the inaccessible path must appear on stderr.
     let stderr = String::from_utf8_lossy(&out.stderr);
+    let denied_dir = a.join("b");
+    let denied_str = denied_dir.to_string_lossy();
     assert!(
-        stderr.to_ascii_lowercase().contains("warn") || stderr.contains('b'),
+        stderr.to_ascii_lowercase().contains("warn") || stderr.contains(denied_str.as_ref()),
         "expected a warning mentioning the denied path; stderr: {stderr}"
     );
 }
@@ -601,6 +617,18 @@ fn copy_recursive_fail_mode_aborts_on_denied_subdir() {
     let dst = dir.path().join("dst");
 
     let _guard = DaclDenyGuard::deny_listing(&a.join("b"));
+
+    // Sanity-check: confirm the DACL deny actually took effect on this runner.
+    match std::fs::read_dir(a.join("b")) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        probe => {
+            eprintln!(
+                "DACL deny did not produce PermissionDenied on this runner; \
+                 skipping test (probe: {probe:?})"
+            );
+            return;
+        }
+    }
 
     let out = tpu()
         .arg("--on-error")

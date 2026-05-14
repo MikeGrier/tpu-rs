@@ -348,7 +348,7 @@ fn push_unique(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, p: PathBuf
 /// These are virtually always either binary, generated, or already
 /// classified by their own checkers — and they would otherwise dominate
 /// the report.
-fn is_skipped_dir(entry: &walkdir::DirEntry) -> bool {
+pub(crate) fn is_skipped_dir(entry: &walkdir::DirEntry) -> bool {
     if !entry.file_type().is_dir() {
         return false;
     }

@@ -196,7 +196,10 @@ pub fn run(
         // increment `report.warnings` but not copied/skipped) don't falsely
         // trip the no-match guard below.
         let mut matched: usize = 0;
-        for entry in WalkDir::new(&walk_root) {
+        for entry in WalkDir::new(&walk_root)
+            .into_iter()
+            .filter_entry(|e| !crate::cmd::doctor::is_skipped_dir(e))
+        {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
