@@ -101,11 +101,11 @@
                     "type": "string",
                     "enum": ["each-file", "summary"],
                     "enumDescriptions": [
-                        "Surface a streamed record for every file the server touches.",
-                        "Suppress per-file records and surface only a summary at the end of the operation."
+                        "Include a per-operation warning log: each inaccessible or skipped path appears as a separate entry (warnings only; successful copies are not individually logged).",
+                        "Suppress per-entry warning details and surface only a summary count at the end of the operation."
                     ],
                     "default": "each-file",
-                    "markdownDescription": "How much per-file detail tree-walking tools include in their results. `each-file` (default) includes a full per-entry `log` in `tpu_copy_file` results and individual warning lines in `tpu_find` output. `summary` suppresses the per-entry log and collapses walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
+                    "markdownDescription": "How much walk-error detail tree-walking tools include in their results. `each-file` (default) includes a `log` array of warning strings in `tpu_copy_file` results and individual warning lines in `tpu_find` output — each entry represents an inaccessible path or walk error. `summary` suppresses those per-entry details and collapses all walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
                 }
             }
         }

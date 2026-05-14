@@ -32,6 +32,37 @@ use walkdir::WalkDir;
 
 use crate::shell::Shell;
 
+/// Canonicalize a path, or — when it doesn't exist yet — canonicalize the
+/// deepest existing ancestor and re-append the non-existing tail.
+///
+/// This normalises `..` components in the non-existing suffix so that a dest
+/// like `other/../src/dst` is correctly identified as being inside `src/`.
+fn canon_nearest(path: &Path) -> PathBuf {
+    if let Ok(c) = path.canonicalize() {
+        return c;
+    }
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    let mut cur = path.to_path_buf();
+    loop {
+        let parent = match cur.parent() {
+            Some(p) if p != cur => p.to_path_buf(),
+            _ => break,
+        };
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_owned());
+        }
+        cur = parent;
+        if let Ok(c) = cur.canonicalize() {
+            let mut result = c;
+            for part in tail.into_iter().rev() {
+                result.push(part);
+            }
+            return result;
+        }
+    }
+    path.to_path_buf()
+}
+
 /// Result of one [`run`] invocation.
 #[derive(Debug, Default)]
 pub struct CopyReport {
@@ -179,7 +210,7 @@ pub fn run(
                     .map_err(|e| format!("copy: cwd: {e}"))?
                     .join(dest)
             };
-            let dest_canon = dest.canonicalize().unwrap_or(dest_abs);
+            let dest_canon = canon_nearest(&dest_abs);
             if dest_canon == src_canon || dest_canon.starts_with(&src_canon) {
                 return Err(format!(
                     "copy: destination {} is inside source {}; \

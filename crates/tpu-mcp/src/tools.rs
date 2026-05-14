@@ -1876,6 +1876,7 @@ fn call_render_file(
         policy,
     )?;
     let stamp = stamp_and_verify(std::path::Path::new(&output), config.verify_delay_ms)?;
+    delete_bak_if_exists(&output);
     Ok(serde_json::to_string(&serde_json::json!({
         "output": output,
         "substitutions": report.substitutions,
@@ -1906,6 +1907,7 @@ fn call_setup(
             if updated {
                 let stamp =
                     stamp_and_verify(std::path::Path::new(&path), config.verify_delay_ms)?;
+                delete_bak_if_exists(&path);
                 result["mtime_epoch_ms"] =
                     serde_json::Value::Number(stamp.mtime_epoch_ms.into());
                 result["size"] = serde_json::Value::Number(stamp.size.into());

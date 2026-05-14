@@ -555,12 +555,11 @@ pub fn run_with_policy(
             Ok(None) => {}
             Err(e) => {
                 match on_error {
-                    crate::cmd::copy::OnError::Fail => return Err(e),
+                    crate::cmd::copy::OnError::Fail => {
+                        return Err(format!("doctor: {}: {e}", path.display()).into())
+                    }
                     crate::cmd::copy::OnError::Warn => {
                         warnings_out.push(format!("doctor: {}: {e}", path.display()));
-                        if !options.quiet && options.format == DoctorFormat::Human {
-                            writeln!(out, "doctor: {}: {}", path.display(), e)?;
-                        }
                     }
                 }
             }
