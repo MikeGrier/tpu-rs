@@ -263,6 +263,11 @@ fn expand_paths_with_policy(
                 crate::cmd::copy::OnError::Fail => {
                     return Err(format!("doctor: cannot stat {}: {e}", p.display()).into());
                 }
+                // A single explicit path has no other entries to fall back on;
+                // downgrade to a warning only when there are multiple specs.
+                crate::cmd::copy::OnError::Warn if path_specs.len() == 1 => {
+                    return Err(format!("doctor: cannot stat {}: {e}", p.display()).into());
+                }
                 crate::cmd::copy::OnError::Warn => {
                     warnings_out.push(format!("doctor: cannot stat {}: {e}", p.display()));
                     continue;
@@ -564,14 +569,13 @@ pub fn run_with_policy(
             Ok(Some(issue)) => report.issues.push(issue),
             Ok(None) => {}
             Err(e) => {
-                match on_error {
-                    crate::cmd::copy::OnError::Fail => {
-                        return Err(format!("doctor: {}: {e}", path.display()).into())
-                    }
-                    crate::cmd::copy::OnError::Warn => {
-                        warnings_out.push(format!("doctor: {}: {e}", path.display()));
-                    }
+                let msg = format!("doctor: {}: {e}", path.display());
+                // A single explicit file has no other entries to fall back on;
+                // downgrade to a warning only when there are multiple files.
+                if matches!(on_error, crate::cmd::copy::OnError::Fail) || files.len() == 1 {
+                    return Err(msg.into());
                 }
+                warnings_out.push(msg);
             }
         }
     }

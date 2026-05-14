@@ -207,6 +207,12 @@ pub fn run(
             let target = dest.join(leaf);
             copy_one(entry.path(), &target, &opts, shell, &mut report)?;
         }
+        // A glob that matched nothing is always an error — a typo in the
+        // pattern would otherwise silently create an empty destination
+        // directory and exit successfully.
+        if report.copied == 0 && report.skipped == 0 {
+            return Err(format!("copy: glob {source:?} matched no files").into());
+        }
         return Ok(report);
     }
 
@@ -371,7 +377,7 @@ fn copy_one(
                 .unwrap_or_else(|| "file".to_string());
             parent.join(format!(".tpu_tmp_{name}_{}", std::process::id()))
         };
-        match fs::copy(src, &tmp) {
+        match crate::retry_io(|| fs::copy(src, &tmp)) {
             Ok(_) => {
                 if let Err(e) = rename_replacing(&tmp, dst) {
                     let _ = fs::remove_file(&tmp);
@@ -397,7 +403,7 @@ fn copy_one(
         }
         return Ok(());
     }
-    match fs::copy(src, dst) {
+    match crate::retry_io(|| fs::copy(src, dst)) {
         Ok(_) => {
             report.copied += 1;
             Ok(())

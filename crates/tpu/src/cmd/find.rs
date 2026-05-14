@@ -485,19 +485,16 @@ pub fn run_with_policy(
         );
         match result {
             Ok(n) => total_matches += n,
-            Err(e) => match on_error {
-                crate::cmd::copy::OnError::Fail => {
-                    return Err(
-                        format!("find: cannot search {}: {e}", file.display()).into()
-                    );
+            Err(e) => {
+                let msg = format!("find: cannot search {}: {e}", file.display());
+                // A single explicit file has no other entries to fall back on;
+                // downgrade to a warning only when there are multiple files so
+                // the rest of the scan can continue.
+                if matches!(on_error, crate::cmd::copy::OnError::Fail) || files.len() == 1 {
+                    return Err(msg.into());
                 }
-                crate::cmd::copy::OnError::Warn => {
-                    warnings_out.push(format!(
-                        "find: cannot search {}: {e}",
-                        file.display()
-                    ));
-                }
-            },
+                warnings_out.push(msg);
+            }
         }
     }
 

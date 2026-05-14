@@ -226,7 +226,9 @@ jobs:
           fi
           # Decide whether this is a pre-release publish.
           #
-          # workflow_dispatch: caller-supplied `pre_release` boolean wins.
+          # workflow_dispatch: `pre_release=true` forces pre-release.
+          #                    `false` (the default) falls through to
+          #                    auto-detection by the tag convention below.
           # tag push (v*):     auto-detect via VS Code's minor-version
           #                    convention -- odd minor = pre-release,
           #                    even minor = stable. So v0.3.1 -> pre-release,

@@ -63,7 +63,7 @@ struct Cli {
     /// How to handle per-entry errors during a multi-file or recursive
     /// operation (`tpu find`, `tpu doctor`, `tpu copy --recursive`).
     ///
-    ///   warn — emit a streamed warning record (NDJSON
+    ///   warn — emit a warning record (NDJSON
     ///          `{"reason":"warning"}` in JSON mode, a yellow `warning:`
     ///          line on stderr in human mode) and continue with the next
     ///          entry. This is the default — a single inaccessible
@@ -823,7 +823,7 @@ enum Commands {
     /// directory). For a directory copy, pass `--recursive`.
     ///
     /// Per-entry errors honour the global `--on-error` flag: by default
-    /// they produce a streamed warning record and the copy continues with
+    /// they produce a warning record and the copy continues with
     /// the remaining entries.
     Copy {
         /// Source file, directory, or glob pattern.

@@ -2011,7 +2011,9 @@ pub struct ServerConfig {
     /// `EachFile` (default) returns the per-entry warning log (inaccessible
     /// paths and other walk errors) along with the summary counts. `Summary`
     /// suppresses the per-entry warning log and returns only the aggregate
-    /// counts (and a single tail message naming the number of warnings).
+    /// counts. (Note: `tpu_find` additionally appends a single tail line
+    /// with the warning count in summary mode; other tree-walking tools
+    /// return only the numeric count in the JSON result.)
     /// Useful for clients that want a quieter trail in the MCP output channel.
     pub progress_detail: ProgressDetail,
 }

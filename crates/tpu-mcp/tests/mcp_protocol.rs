@@ -554,3 +554,58 @@ fn mcp_it_10_setup_returns_markdown_block() {
         "tpu_setup without target must return plain Markdown, not JSON; got: {out:?}"
     );
 }
+
+/// MCP-IT-11: `tpu_setup` with a `target` injects the guidance block into
+/// the target file, then a second call with the same target replaces it
+/// (`replaced: true`). Exercises the MCP write path (inject, stamp_and_verify,
+/// .bak cleanup) which is not covered by MCP-IT-10.
+#[test]
+fn mcp_it_11_setup_inject_and_replace() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("copilot-instructions.md");
+    // Seed the target with some existing content so inject has something to work with.
+    std::fs::write(&target, "# Existing instructions\n").unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // First call — inject: block is not yet present, so replaced must be false.
+    let out1 = s.call_tool(
+        "tpu_setup",
+        json!({ "target": target.to_str().unwrap() }),
+    );
+    let v1: serde_json::Value = serde_json::from_str(&out1)
+        .unwrap_or_else(|e| panic!("tpu_setup inject result must be JSON; got {out1:?}: {e}"));
+    assert_eq!(v1["updated"], true, "first inject must report updated=true; result: {v1}");
+    assert_eq!(v1["replaced"], false, "first inject must report replaced=false; result: {v1}");
+    assert!(
+        v1["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+        "first inject must include a non-zero mtime; result: {v1}"
+    );
+
+    // Verify the block was actually written to disk.
+    let content1 = std::fs::read_to_string(&target).unwrap();
+    assert!(
+        content1.contains("tpu-mcp:setup:begin"),
+        "target file must contain setup begin marker after inject; content:\n{content1}"
+    );
+
+    // Second call — replace: block already exists, so replaced must be true.
+    let out2 = s.call_tool(
+        "tpu_setup",
+        json!({ "target": target.to_str().unwrap() }),
+    );
+    let v2: serde_json::Value = serde_json::from_str(&out2)
+        .unwrap_or_else(|e| panic!("tpu_setup replace result must be JSON; got {out2:?}: {e}"));
+    // updated may be false if the block content was already identical; the key
+    // observable is that `replaced` is true (the block was found and processed).
+    assert_eq!(v2["replaced"], true, "second inject must report replaced=true; result: {v2}");
+
+    // .bak file must have been cleaned up.
+    let bak = target.with_extension("md.bak");
+    assert!(
+        !bak.exists(),
+        ".bak file must not remain after successful inject; found: {}",
+        bak.display()
+    );
+}
