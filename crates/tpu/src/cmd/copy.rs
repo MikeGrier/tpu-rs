@@ -104,7 +104,22 @@ pub fn run(
             format!("copy: cannot create destination {}: {e}", dest.display())
         })?;
 
-        for entry in WalkDir::new(".") {
+        // Walk from the appropriate root: for absolute patterns the anchor
+        // directory (longest non-glob prefix) is used so that entry paths are
+        // absolute and the matcher can compare them against the full pattern.
+        let first_meta = source.bytes().position(|b| b"*?[{".contains(&b));
+        let anchor_str = first_meta.map(|i| &source[..i]).unwrap_or(source);
+        let anchor_path = Path::new(anchor_str);
+        let (walk_root, absolute_walk) = if anchor_path.is_absolute() {
+            let root = anchor_path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(anchor_path);
+            (root.to_path_buf(), true)
+        } else {
+            (PathBuf::from("."), false)
+        };
+        for entry in WalkDir::new(&walk_root) {
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
@@ -119,8 +134,12 @@ pub fn run(
             if !entry.file_type().is_file() {
                 continue;
             }
-            let rel = entry.path().strip_prefix(".").unwrap_or(entry.path());
-            if !matcher.is_match(rel) {
+            let match_path = if absolute_walk {
+                entry.path()
+            } else {
+                entry.path().strip_prefix(".").unwrap_or(entry.path())
+            };
+            if !matcher.is_match(match_path) {
                 continue;
             }
             let leaf = match entry.path().file_name() {
@@ -147,6 +166,29 @@ pub fn run(
                 src_path.display()
             )
             .into());
+        }
+        // Guard against copying a tree into itself: dest inside src would
+        // recurse indefinitely and exhaust disk space or path depth.
+        {
+            let src_canon = fs::canonicalize(src_path)
+                .map_err(|e| format!("copy: source {}: {e}", src_path.display()))?;
+            let dest_abs = if dest.is_absolute() {
+                dest.to_path_buf()
+            } else {
+                std::env::current_dir()
+                    .map_err(|e| format!("copy: cwd: {e}"))?
+                    .join(dest)
+            };
+            let dest_canon = dest.canonicalize().unwrap_or(dest_abs);
+            if dest_canon == src_canon || dest_canon.starts_with(&src_canon) {
+                return Err(format!(
+                    "copy: destination {} is inside source {}; \
+                     recursive copy would loop indefinitely",
+                    dest.display(),
+                    src_path.display()
+                )
+                .into());
+            }
         }
         // Directory copy: walk SRC, mirror structure under DEST.
         fs::create_dir_all(dest).map_err(|e| {
@@ -225,6 +267,14 @@ fn copy_one(
     shell: &mut Shell,
     report: &mut CopyReport,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Same-file guard: silently skip if src and dst resolve to the same path,
+    // rather than truncating the file by overwriting it with itself.
+    if let (Ok(a), Ok(b)) = (src.canonicalize(), dst.canonicalize()) {
+        if a == b {
+            report.skipped += 1;
+            return Ok(());
+        }
+    }
     if dst.exists() && !opts.overwrite {
         report.skipped += 1;
         return Ok(());

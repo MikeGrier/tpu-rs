@@ -42,3 +42,6 @@ walkdir = "2"
 encoding_rs = "0.8"
 md-5 = "0.10"
 crc32fast = "1"
+
+[target."cfg(windows)".dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }

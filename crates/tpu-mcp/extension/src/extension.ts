@@ -77,9 +77,10 @@ function buildArgs(): string[] {
 /**
  * Build the environment overrides for the spawned `tpu-mcp` process.
  *
- * Currently forwards `tpu-mcp.errorMode` so the server's tools default to the
- * user's preferred walk-error policy without the agent needing to thread
- * `on_error` through every call.
+ * Forwards `tpu-mcp.errorMode` and `tpu-mcp.progressDetail` so the server's
+ * tools default to the user's preferred walk-error policy and progress
+ * verbosity without the agent needing to thread those arguments through every
+ * call.
  */
 function buildEnv(): Record<string, string> {
     const config = vscode.workspace.getConfiguration("tpu-mcp");

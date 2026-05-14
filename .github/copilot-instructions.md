@@ -4,71 +4,60 @@
      examples for documentation purposes) -->
 
 <!-- tpu-mcp:setup:begin -->
-## File operations — use the `tpu-mcp` MCP tools, never PowerShell file I/O
+## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
 
-This repository ships a **`tpu-mcp` MCP server** that exposes every common
-file operation as a first-class MCP tool. The tools preserve byte-exact
-content, native encodings, and line endings, and they refuse to introduce
-new mojibake — guarantees that PowerShell `Set-Content` / `Out-File` /
-`Get-Content` / `>` actively violate.
+This workspace runs the **tpu-mcp** MCP server which exposes encoding-aware
+file primitives as first-class tools. Plain `Get-Content` / `Set-Content` /
+`Out-File` / `>` / `cat` / `sed` round-trip files through the active code
+page and silently corrupt UTF-8, UTF-16, smart quotes, em-dashes, and
+box-drawing characters. Use the MCP tools instead — they detect, preserve,
+and round-trip the file's native encoding and line endings safely.
 
-**Rule:** When working in this repository, ALWAYS use the `tpu_*` MCP
-tools listed below instead of running file-manipulation commands in a
-PowerShell or bash terminal. This applies even inside a larger workflow —
-do not switch to the terminal for file I/O just because a previous step
-used the terminal.
+**Rule:** when working in any project that has the tpu-mcp server registered,
+ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 
-| MCP tool | Replaces |
+| MCP tool | Use it for |
 |---|---|
-| `tpu_read_file` | `Get-Content`, `cat`, `type` |
-| `tpu_read_head` / `tpu_read_tail` | `Select-Object -First/-Last`, `head`, `tail` |
-| `tpu_read_file_binary` | `Format-Hex`, `xxd`, `od` |
-| `tpu_read_file_escaped` | inspecting whitespace / control bytes by hand |
-| `tpu_write_file` | `Set-Content`, `Out-File`, `>`, `New-Item -Value` |
-| `tpu_append_file` | `Add-Content`, `>>` |
-| `tpu_replace_in_file` | `(Get-Content … ) -replace … \| Set-Content`, `sed -i` |
-| `tpu_edit_file` | line-based splice / patch sequences |
-| `tpu_copy_file` | `Copy-Item`, `cp`, `robocopy` |
-| `tpu_render_file` | here-strings / heredoc-driven file generation |
-| `tpu_find` | `Select-String`, `grep`, `rg` |
-| `tpu_count_file` | `(Get-Content).Count`, `wc -l` |
-| `tpu_stat_file` | `Get-Item`, `stat` |
-| `tpu_validate_file` | `Get-FileHash` + manual encoding inspection |
-| `tpu_setup` | (re)inject this guidance block into `.github/copilot-instructions.md` |
+| `tpu_read_file` | reading text files (UTF-8, UTF-16, Windows-1252, Shift-JIS, …) |
+| `tpu_read_head` / `tpu_read_tail` | first/last N lines or bytes |
+| `tpu_read_file_binary` | inspecting raw bytes of binary files |
+| `tpu_read_file_escaped` | reading text as a single 7-bit-clean escaped line |
+| `tpu_write_file` | replacing a text file's full contents |
+| `tpu_append_file` | appending text to an existing file |
+| `tpu_replace_in_file` | regex / fixed-string substitution (use `fixed_strings: true` for literal targets) |
+| `tpu_edit_file` | targeted insert/delete/splice at known line numbers |
+| `tpu_validate_file` | pre-flight assertion that a file is in the expected state |
+| `tpu_count_file` | line / word / char / byte / pattern counts |
+| `tpu_find` | encoding-aware grep across files and globs |
+| `tpu_copy_file` | copy a file or recursively copy a tree (resilient: per-entry warnings, never aborts mid-walk by default) |
+| `tpu_render_file` | populate a file from a `{{TOKEN}}` template |
+| `tpu_stat_file` | verify a write actually persisted (mtime / size) |
+| `tpu_setup` | (re)write this guidance block into the active `copilot-instructions.md` |
 
-### When to use each tool
+### When to use each
 
-- **Reads** (`tpu_read_file`, `tpu_read_head`, `tpu_read_tail`,
-  `tpu_read_file_binary`, `tpu_read_file_escaped`) — always prefer over
-  `Get-Content`/`cat`. Reads decode the file's native encoding to UTF-8
-  with LF line endings, regardless of source (UTF-16, Windows-1252,
-  Shift-JIS, …) and surface a one-line note when they decode a file
-  that is already mojibake'd.
-- **Writes** (`tpu_write_file`, `tpu_append_file`) — always use these for
-  any non-trivial file content. They preserve the destination file's
-  existing encoding and line-ending convention, and they refuse to write
-  content that would *introduce* new mojibake (use `allow_mojibake: true`
-  only when intentionally writing curated mojibake fixtures).
-- **Targeted edits** (`tpu_replace_in_file`, `tpu_edit_file`) — prefer
-  over hand-rolled regex pipelines. `tpu_replace_in_file` interprets
-  `\n` in the replacement as a real newline by default; pass
-  `literal_replacement: true` for the literal two characters.
-- **`tpu_copy_file`** — use for any file or directory copy. By default
-  per-entry errors (unreadable directories, permission denied) emit a
-  warning and the operation continues; pass `on_error: "fail"` for the
-  legacy abort-on-first-error behaviour. Supports recursive directory
-  copies and glob expansion.
-- **`tpu_render_file`** — use to create files from `{{TOKEN}}` Mustache
-  templates. Avoids the encoding pitfalls of PowerShell here-strings
-  and shell heredocs. Provide either an inline `template` or a
-  `template_file`; control unknown-token behaviour via `missing`
-  (`error` | `empty` | `leave`).
-- **`tpu_find`** — use for code/text search. Streams matches with
-  optional `before`/`after` context. Pass `on_error: "fail"` to abort
-  on walk errors instead of warning and continuing.
-- **`tpu_setup`** — use once per workspace (and after each tpu-mcp
-  upgrade) to (re)inject the canonical guidance block, delimited by
-  `<!-- tpu-mcp:setup:begin -->` / `<!-- tpu-mcp:setup:end -->`, into
+- **Reads** — always use `tpu_read_file`. Never use PowerShell `Get-Content`
+  for code review or content inspection.
+- **Edits** — prefer `tpu_replace_in_file` with `fixed_strings: true` over
+  `tpu_edit_file` when the target text is unique, because line numbers can
+  shift between reads. Use `tpu_edit_file` when you have just read the file
+  and know exact line offsets.
+- **Writes that should be guarded** — pass `validate: [{ "selector":
+  "line-contains:N", "value": "..." }]` to refuse the write if the file is
+  not in the expected state.
+- **Globs / recursion** — `tpu_find` and `tpu_copy_file` accept glob
+  patterns and tolerate inaccessible directories by emitting warning
+  records (configurable via the `on_error` argument).
+- **Dependency-free templating** — `tpu_render_file` substitutes
+  `{{NAME}}`-style tokens. Use `\{{` to emit literal braces.
+
+### File encoding
+
+When you must fall back to PowerShell, never round-trip non-ASCII files
+through `Get-Content` / `Set-Content` — read and write via
+`[System.IO.File]::ReadAllBytes` / `WriteAllBytes` and validate with
+`tools/check-encoding.ps1` afterwards.
+<!-- tpu-mcp:setup:end -->`, into
   `.github/copilot-instructions.md`.
 <!-- tpu-mcp:setup:end -->
 

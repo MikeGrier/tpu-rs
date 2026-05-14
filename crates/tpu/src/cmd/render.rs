@@ -114,9 +114,10 @@ pub fn render_str(
                                 }
                                 MissingPolicy::Empty => {}
                                 MissingPolicy::Leave => {
-                                    out.push_str("{{");
-                                    out.push_str(key);
-                                    out.push_str("}}");
+                                    // Preserve the original slice (including any
+                                    // whitespace inside the braces) rather than
+                                    // reconstructing from the trimmed key name.
+                                    out.push_str(&template[i..end + 2]);
                                 }
                             }
                         }

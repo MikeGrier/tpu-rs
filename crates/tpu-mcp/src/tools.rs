@@ -1779,7 +1779,7 @@ fn call_copy_file(
     args: &Value,
     config: &ServerConfig,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let source = require_str(args, "source")?.to_string();
+    let source = normalize_file_path(require_str(args, "source")?);
     let dest = normalize_file_path(require_str(args, "dest")?);
     let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
     let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1830,19 +1830,33 @@ fn call_copy_file(
 
 fn call_render_file(
     args: &Value,
-    _config: &ServerConfig,
+    config: &ServerConfig,
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::collections::BTreeMap;
     let output = normalize_file_path(require_str(args, "output")?);
-    let template_inline = args.get("template").and_then(|v| v.as_str());
+    // Normalize CRLF → LF at the MCP boundary, consistent with other write tools.
+    let template_inline_owned = args
+        .get("template")
+        .and_then(|v| v.as_str())
+        .map(|s| s.replace("\r\n", "\n").replace('\r', "\n"));
+    let template_inline = template_inline_owned.as_deref();
     let template_file = args.get("template_file").and_then(|v| v.as_str()).map(normalize_file_path);
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
     if let Some(map) = args.get("vars").and_then(|v| v.as_object()) {
         for (k, v) in map {
+            // Enforce the same key constraints as the CLI parser.
+            if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+                return Err(format!(
+                    "render: vars key {k:?} may only contain ASCII letters, digits, '_' or '-'"
+                )
+                .into());
+            }
             let val = v.as_str().ok_or_else(|| {
                 format!("render: vars[{k}]: value must be a string")
             })?;
-            vars.insert(k.clone(), val.to_string());
+            // Normalize CRLF → LF so variable values don't produce doubled
+            // carriage returns when written to CRLF-convention destination files.
+            vars.insert(k.clone(), val.replace("\r\n", "\n").replace('\r', "\n"));
         }
     }
     let missing = match args.get("missing").and_then(|v| v.as_str()) {
@@ -1861,16 +1875,19 @@ fn call_render_file(
         tpu::IoMode::Buffered,
         policy,
     )?;
+    let stamp = stamp_and_verify(std::path::Path::new(&output), config.verify_delay_ms)?;
     Ok(serde_json::to_string(&serde_json::json!({
         "output": output,
         "substitutions": report.substitutions,
         "missing": report.missing,
+        "mtime_epoch_ms": stamp.mtime_epoch_ms,
+        "size": stamp.size,
     }))?)
 }
 
 fn call_setup(
     args: &Value,
-    _config: &ServerConfig,
+    config: &ServerConfig,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let target = args
         .get("target")
@@ -1881,11 +1898,19 @@ fn call_setup(
         Some(path) => {
             let (updated, replaced) =
                 tpu::cmd::setup::inject(std::path::Path::new(&path), tpu::IoMode::Buffered)?;
-            Ok(serde_json::to_string(&serde_json::json!({
+            let mut result = serde_json::json!({
                 "target": path,
                 "updated": updated,
                 "replaced": replaced,
-            }))?)
+            });
+            if updated {
+                let stamp =
+                    stamp_and_verify(std::path::Path::new(&path), config.verify_delay_ms)?;
+                result["mtime_epoch_ms"] =
+                    serde_json::Value::Number(stamp.mtime_epoch_ms.into());
+                result["size"] = serde_json::Value::Number(stamp.size.into());
+            }
+            Ok(serde_json::to_string(&result)?)
         }
     }
 }

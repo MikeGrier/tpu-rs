@@ -265,3 +265,287 @@ fn find_fail_mode_aborts_on_missing_path() {
 }
 
 
+
+// ─── Windows-only: recursive copy through a DACL-denied subdirectory ────────
+
+/// RAII guard that opens a directory with `WRITE_DAC | READ_CONTROL` (all
+/// `FILE_SHARE_*` bits set so the handle survives the denial period), then:
+///
+/// 1. snapshots the existing DACL via `GetSecurityInfo`;
+/// 2. builds a new DACL with a single `FILE_LIST_DIRECTORY` deny ACE for the
+///    current process's user SID;
+/// 3. applies that DACL with `SetSecurityInfo`; and
+/// 4. on drop, restores the original DACL through the still-open handle and
+///    frees the snapshot with `LocalFree`.
+///
+/// Declare this guard *after* `TempDir` in each test so that Rust's
+/// reverse-drop order restores the DACL before `TempDir` tries to remove the
+/// directory tree.
+#[cfg(windows)]
+struct DaclDenyGuard {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    orig_dacl: *mut windows_sys::Win32::Security::ACL,
+    /// Security-descriptor storage returned by `GetSecurityInfo`; `orig_dacl`
+    /// points into this allocation, so it must outlive every use of `orig_dacl`.
+    sd: *mut core::ffi::c_void,
+}
+
+// The raw pointers are exclusively owned by this guard and are never shared
+// across threads.
+#[cfg(windows)]
+unsafe impl Send for DaclDenyGuard {}
+
+#[cfg(windows)]
+impl DaclDenyGuard {
+    /// Open `dir` with `WRITE_DAC`, snapshot its DACL, then apply a
+    /// `FILE_LIST_DIRECTORY` deny ACE for the current user.
+    fn deny_listing(dir: &std::path::Path) -> Self {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+            Security::{
+                AddAccessDeniedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
+                TokenUser, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, TOKEN_QUERY,
+                TOKEN_USER,
+            },
+            Security::Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT},
+            Storage::FileSystem::{
+                CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE, OPEN_EXISTING,
+            },
+            System::Threading::{GetCurrentProcess, OpenProcessToken},
+        };
+
+        unsafe {
+            // Null-terminate the directory path as UTF-16.
+            let wide: Vec<u16> = dir
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0u16))
+                .collect();
+
+            // WRITE_DAC = 0x00040000, READ_CONTROL = 0x00020000.  These are
+            // standard object access rights that windows-sys 0.61 does not
+            // expose as named constants separate from their typed variants.
+            const WRITE_DAC: u32 = 0x0004_0000;
+            const READ_CONTROL: u32 = 0x0002_0000;
+
+            // Open with WRITE_DAC so restoration works even after we deny our
+            // own read access.  FILE_FLAG_BACKUP_SEMANTICS is required to open
+            // a directory handle.  All three FILE_SHARE_* bits prevent the
+            // open from failing if something else holds the directory.
+            let handle = CreateFileW(
+                wide.as_ptr(),
+                WRITE_DAC | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null_mut(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(), // hTemplateFile
+            );
+            assert_ne!(handle, INVALID_HANDLE_VALUE, "CreateFileW({dir:?}) failed");
+
+            // Snapshot the existing DACL.  `orig_dacl` points inside `sd`;
+            // both must remain alive until SetSecurityInfo is called in Drop.
+            let mut orig_dacl: *mut ACL = std::ptr::null_mut();
+            let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
+            assert_eq!(
+                GetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    &mut orig_dacl,
+                    std::ptr::null_mut(),
+                    &mut sd,
+                ),
+                0,
+                "GetSecurityInfo failed"
+            );
+
+            // Obtain the current user's SID from the process token.
+            let mut token: windows_sys::Win32::Foundation::HANDLE = std::ptr::null_mut();
+            assert_ne!(
+                OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token),
+                0,
+                "OpenProcessToken failed"
+            );
+            let mut needed: u32 = 0;
+            GetTokenInformation(
+                token,
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut needed,
+            );
+            let mut token_buf = vec![0u8; needed as usize];
+            assert_ne!(
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    token_buf.as_mut_ptr().cast(),
+                    needed,
+                    &mut needed,
+                ),
+                0,
+                "GetTokenInformation failed"
+            );
+            let _ = CloseHandle(token);
+
+            let user_sid = (*(token_buf.as_ptr() as *const TOKEN_USER)).User.Sid;
+            let sid_len = GetLengthSid(user_sid);
+
+            // Build a one-ACE deny DACL.
+            // Memory layout: 8-byte ACL header
+            //               + 8 bytes (ACE_HEADER + Mask)
+            //               + full SID body (replaces the inline SidStart DWORD).
+            let acl_len: u32 = 8 + 8 + sid_len;
+            let mut acl_buf = vec![0u8; acl_len as usize];
+            let acl_ptr = acl_buf.as_mut_ptr() as *mut ACL;
+            assert_ne!(
+                InitializeAcl(acl_ptr, acl_len, ACL_REVISION as u32),
+                0,
+                "InitializeAcl failed"
+            );
+            // FILE_LIST_DIRECTORY (0x0001) prevents NtQueryDirectoryFile /
+            // FindNextFileW from succeeding when the caller tries to enumerate
+            // the directory contents.
+            const FILE_LIST_DIRECTORY: u32 = 0x0001;
+            assert_ne!(
+                AddAccessDeniedAce(acl_ptr, ACL_REVISION as u32, FILE_LIST_DIRECTORY, user_sid),
+                0,
+                "AddAccessDeniedAce failed"
+            );
+
+            // Apply the deny DACL.  Subsequent opens of `dir` for
+            // FILE_LIST_DIRECTORY will receive ERROR_ACCESS_DENIED.
+            assert_eq!(
+                SetSecurityInfo(
+                    handle,
+                    SE_FILE_OBJECT,
+                    DACL_SECURITY_INFORMATION,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    acl_ptr,
+                    std::ptr::null_mut(),
+                ),
+                0,
+                "SetSecurityInfo (apply deny) failed"
+            );
+
+            DaclDenyGuard { handle, orig_dacl, sd }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DaclDenyGuard {
+    fn drop(&mut self) {
+        use windows_sys::Win32::{
+            Foundation::{CloseHandle, LocalFree},
+            Security::DACL_SECURITY_INFORMATION,
+            Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT},
+        };
+        unsafe {
+            // Restore the original DACL through the still-open WRITE_DAC handle.
+            let _ = SetSecurityInfo(
+                self.handle,
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                self.orig_dacl, // null restores a NULL DACL (grant-all) when appropriate
+                std::ptr::null_mut(),
+            );
+            // Release the security-descriptor buffer returned by GetSecurityInfo.
+            let _ = LocalFree(self.sd);
+            let _ = CloseHandle(self.handle);
+        }
+    }
+}
+
+/// Tree used by both DACL-based copy tests:
+///
+/// ```text
+/// <tmp>/
+///   a/              ← source root passed to `tpu copy --recursive`
+///     b/            ← FILE_LIST_DIRECTORY denied for the current principal
+///       c/
+///         secret.txt
+///     d/            ← peer of b; successfully copied in warn mode
+///       found.txt
+///   dst/            ← copy destination
+/// ```
+#[test]
+#[cfg(windows)]
+fn copy_recursive_warn_mode_continues_past_denied_subdir() {
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a");
+    write_file(&a.join("b").join("c").join("secret.txt"), b"secret");
+    write_file(&a.join("d").join("found.txt"), b"found");
+    let dst = dir.path().join("dst");
+
+    // `_guard` is declared after `dir`, so it drops first (reverse-drop order),
+    // restoring the DACL before TempDir attempts to clean up the tree.
+    let _guard = DaclDenyGuard::deny_listing(&a.join("b"));
+
+    let out = tpu()
+        .arg("--on-error").arg("warn")
+        .arg("copy").arg("--recursive")
+        .arg(&a)
+        .arg(&dst)
+        .output()
+        .unwrap();
+
+    assert!(
+        out.status.success(),
+        "warn mode should exit 0; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The peer directory d must have been copied despite the failure on b.
+    assert!(
+        dst.join("d").join("found.txt").exists(),
+        "d/found.txt must be present in dst; stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The denied subtree must not appear in dst.
+    assert!(
+        !dst.join("b").join("c").join("secret.txt").exists(),
+        "secret.txt must not be copied from the denied subtree"
+    );
+    // A warning about the inaccessible path must appear on stderr.
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.to_ascii_lowercase().contains("warn") || stderr.contains('b'),
+        "expected a warning mentioning the denied path; stderr: {stderr}"
+    );
+}
+
+#[test]
+#[cfg(windows)]
+fn copy_recursive_fail_mode_aborts_on_denied_subdir() {
+    let dir = TempDir::new().unwrap();
+    let a = dir.path().join("a");
+    write_file(&a.join("b").join("c").join("secret.txt"), b"secret");
+    write_file(&a.join("d").join("found.txt"), b"found");
+    let dst = dir.path().join("dst");
+
+    let _guard = DaclDenyGuard::deny_listing(&a.join("b"));
+
+    let out = tpu()
+        .arg("--on-error").arg("fail")
+        .arg("copy").arg("--recursive")
+        .arg(&a)
+        .arg(&dst)
+        .output()
+        .unwrap();
+
+    assert!(
+        !out.status.success(),
+        "fail mode must exit non-zero when a subdirectory is inaccessible;\
+         \nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

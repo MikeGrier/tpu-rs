@@ -176,7 +176,32 @@ pub fn inject(
             out.push_str(&existing[end..]);
             (out, true)
         }
-        _ => {
+        (Some(b), Some(e)) => {
+            // End marker appears before begin marker — unbalanced.
+            return Err(format!(
+                "setup: {END_MARKER} (offset {e}) appears before {BEGIN_MARKER} \
+                 (offset {b}) in {}; cannot safely inject",
+                target_file.display()
+            )
+            .into());
+        }
+        (Some(_), None) => {
+            return Err(format!(
+                "setup: {BEGIN_MARKER} found without a matching {END_MARKER} in {}; \
+                 cannot safely inject",
+                target_file.display()
+            )
+            .into());
+        }
+        (None, Some(_)) => {
+            return Err(format!(
+                "setup: {END_MARKER} found without a matching {BEGIN_MARKER} in {}; \
+                 cannot safely inject",
+                target_file.display()
+            )
+            .into());
+        }
+        (None, None) => {
             // Append, ensuring exactly one blank line of separation.
             let mut out = existing.clone();
             if !out.is_empty() && !out.ends_with("\n\n") {
