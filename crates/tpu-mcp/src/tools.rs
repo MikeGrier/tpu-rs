@@ -1736,16 +1736,23 @@ fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std:
     let pattern_refs: Vec<&str> = all_patterns.iter().map(String::as_str).collect();
     let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
 
-    let on_error = match args.get("on_error").and_then(|v| v.as_str()) {
-        Some("fail") => tpu::cmd::copy::OnError::Fail,
-        Some("warn") => tpu::cmd::copy::OnError::Warn,
-        Some(other) => {
-            return Err(format!(
-                "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
-            )
-            .into());
-        }
+    let on_error = match args.get("on_error") {
         None => config.default_on_error,
+        Some(v) => match v.as_str() {
+            Some("fail") => tpu::cmd::copy::OnError::Fail,
+            Some("warn") => tpu::cmd::copy::OnError::Warn,
+            Some(other) => {
+                return Err(format!(
+                    "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
+                )
+                .into());
+            }
+            None => {
+                return Err(
+                    format!("invalid value for `on_error`: expected a string, got {v}").into(),
+                );
+            }
+        },
     };
     let mut walk_warnings: Vec<String> = Vec::new();
 
@@ -1828,16 +1835,23 @@ fn call_copy_file(
         .get("overwrite")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let on_error = match args.get("on_error").and_then(|v| v.as_str()) {
-        Some("fail") => tpu::cmd::copy::OnError::Fail,
-        Some("warn") => tpu::cmd::copy::OnError::Warn,
-        Some(other) => {
-            return Err(format!(
-                "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
-            )
-            .into());
-        }
+    let on_error = match args.get("on_error") {
         None => config.default_on_error,
+        Some(v) => match v.as_str() {
+            Some("fail") => tpu::cmd::copy::OnError::Fail,
+            Some("warn") => tpu::cmd::copy::OnError::Warn,
+            Some(other) => {
+                return Err(format!(
+                    "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
+                )
+                .into());
+            }
+            None => {
+                return Err(
+                    format!("invalid value for `on_error`: expected a string, got {v}").into(),
+                );
+            }
+        },
     };
     let opts = tpu::cmd::copy::CopyOptions {
         recursive,
@@ -1900,17 +1914,30 @@ fn call_render_file(
     use std::collections::BTreeMap;
     let output = normalize_file_path(require_str(args, "output")?);
     // Normalize CRLF → LF at the MCP boundary, consistent with other write tools.
-    let template_inline_owned = args
-        .get("template")
-        .and_then(|v| v.as_str())
-        .map(|s| s.replace("\r\n", "\n").replace('\r', "\n"));
+    let template_inline_owned = match args.get("template") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("render: `template` must be a string, got {v}"))?;
+            Some(s.replace("\r\n", "\n").replace('\r', "\n"))
+        }
+    };
     let template_inline = template_inline_owned.as_deref();
-    let template_file = args
-        .get("template_file")
-        .and_then(|v| v.as_str())
-        .map(normalize_file_path);
+    let template_file = match args.get("template_file") {
+        None => None,
+        Some(v) => {
+            let s = v
+                .as_str()
+                .ok_or_else(|| format!("render: `template_file` must be a string, got {v}"))?;
+            Some(normalize_file_path(s))
+        }
+    };
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
-    if let Some(map) = args.get("vars").and_then(|v| v.as_object()) {
+    if let Some(vars_val) = args.get("vars") {
+        let map = vars_val
+            .as_object()
+            .ok_or_else(|| format!("render: `vars` must be an object, got {vars_val}"))?;
         for (k, v) in map {
             // Enforce the same key constraints as the CLI parser.
             if k.is_empty()
@@ -1931,16 +1958,25 @@ fn call_render_file(
             vars.insert(k.clone(), val.replace("\r\n", "\n").replace('\r', "\n"));
         }
     }
-    let missing = match args.get("missing").and_then(|v| v.as_str()) {
-        Some("error") | None => tpu::cmd::render::MissingPolicy::Error,
-        Some("empty") => tpu::cmd::render::MissingPolicy::Empty,
-        Some("leave") => tpu::cmd::render::MissingPolicy::Leave,
-        Some(other) => {
-            return Err(format!(
-                "render: invalid missing policy {other:?}; expected one of \"error\", \"empty\", or \"leave\""
-            )
-            .into());
-        }
+    let missing = match args.get("missing") {
+        None => tpu::cmd::render::MissingPolicy::Error,
+        Some(v) => match v.as_str() {
+            Some("error") => tpu::cmd::render::MissingPolicy::Error,
+            Some("empty") => tpu::cmd::render::MissingPolicy::Empty,
+            Some("leave") => tpu::cmd::render::MissingPolicy::Leave,
+            Some(other) => {
+                return Err(format!(
+                    "render: invalid missing policy {other:?}; expected one of \"error\", \"empty\", or \"leave\""
+                )
+                .into());
+            }
+            None => {
+                return Err(format!(
+                    "render: invalid value for `missing`: expected a string, got {v}"
+                )
+                .into());
+            }
+        },
     };
     let policy = mojibake_policy_from_args(args);
     let report = tpu::cmd::render::run(
@@ -2084,8 +2120,8 @@ pub struct ServerConfig {
 }
 
 /// How much per-entry detail tree-walking tools should include in their
-/// output.  `tpu_copy_file` and `tpu_setup` include per-entry diagnostics
-/// in a JSON result; `tpu_find` appends them as plain text.
+/// output.  `tpu_copy_file` includes per-entry diagnostics in a JSON result;
+/// `tpu_find` appends them as plain text.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProgressDetail {
     /// Include the `log` of per-entry warnings (inaccessible paths and walk errors).

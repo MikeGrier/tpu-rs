@@ -443,6 +443,16 @@ fn copy_one(
             };
             match crate::retry_io(|| fs::copy(src, &tmp)) {
                 Ok(_) => {
+                    // Re-check existence before commit to narrow the TOCTOU
+                    // window between the guard at the top of copy_one and the
+                    // rename.  A truly atomic "rename-if-not-exists" is not
+                    // portable, but this avoids the obvious concurrent-creator
+                    // case without adding platform-specific syscalls.
+                    if !opts.overwrite && dst.exists() {
+                        let _ = fs::remove_file(&tmp);
+                        report.skipped += 1;
+                        return Ok(());
+                    }
                     if let Err(e) = crate::retry_io(|| rename_replacing(&tmp, dst)) {
                         let _ = fs::remove_file(&tmp);
                         let msg = format!("copy: {} -> {}: {e}", src.display(), dst.display());
