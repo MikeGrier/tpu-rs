@@ -418,3 +418,137 @@ fn mcp_it_7_find_matches_and_no_match() {
         "no-match result must be empty; got: {no_match:?}"
     );
 }
+
+/// MCP-IT-8: `tpu_copy_file` copies a file; result JSON includes counts.
+/// Overwriting an existing destination with `overwrite=true` replaces it.
+#[test]
+fn mcp_it_8_copy_file_basic_and_overwrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("src.txt");
+    let dst = dir.path().join("dst.txt");
+    std::fs::write(&src, "copy me\n").unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // First copy — dst does not exist yet.
+    let out = s.call_tool(
+        "tpu_copy_file",
+        json!({
+            "source":    src.to_str().unwrap(),
+            "dest":      dst.to_str().unwrap(),
+            "overwrite": false,
+        }),
+    );
+    let v: serde_json::Value = serde_json::from_str(&out)
+        .unwrap_or_else(|e| panic!("tpu_copy_file result must be JSON; got {out:?}: {e}"));
+    assert_eq!(v["copied"], 1, "copied count must be 1; result: {v}");
+    assert_eq!(v["skipped"], 0, "skipped count must be 0; result: {v}");
+    assert_eq!(
+        std::fs::read_to_string(&dst).unwrap(),
+        "copy me\n",
+        "destination content must match source"
+    );
+
+    // Overwrite — dst already exists; overwrite=true must replace it atomically.
+    std::fs::write(&src, "updated content\n").unwrap();
+    let out2 = s.call_tool(
+        "tpu_copy_file",
+        json!({
+            "source":    src.to_str().unwrap(),
+            "dest":      dst.to_str().unwrap(),
+            "overwrite": true,
+        }),
+    );
+    let v2: serde_json::Value = serde_json::from_str(&out2)
+        .unwrap_or_else(|e| panic!("tpu_copy_file overwrite result must be JSON; got {out2:?}: {e}"));
+    assert_eq!(v2["copied"], 1, "overwrite copied count must be 1; result: {v2}");
+    assert_eq!(
+        std::fs::read_to_string(&dst).unwrap(),
+        "updated content\n",
+        "destination must contain updated source after overwrite"
+    );
+
+    // Skip — dst exists and overwrite=false: skipped=1, copied=0.
+    let out3 = s.call_tool(
+        "tpu_copy_file",
+        json!({
+            "source":    src.to_str().unwrap(),
+            "dest":      dst.to_str().unwrap(),
+            "overwrite": false,
+        }),
+    );
+    let v3: serde_json::Value = serde_json::from_str(&out3)
+        .unwrap_or_else(|e| panic!("tpu_copy_file skip result must be JSON; got {out3:?}: {e}"));
+    assert_eq!(v3["skipped"], 1, "skip count must be 1; result: {v3}");
+    assert_eq!(v3["copied"], 0, "copied count must be 0 when skipped; result: {v3}");
+}
+
+/// MCP-IT-9: `tpu_render_file` substitutes tokens and writes the output file.
+/// Also verifies that an empty token key is rejected.
+#[test]
+fn mcp_it_9_render_file_substitution_and_empty_key_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("out.txt");
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // Basic substitution — inline template.
+    let result = s.call_tool(
+        "tpu_render_file",
+        json!({
+            "template": "Hello {{NAME}}, you are {{AGE}} years old.",
+            "output":   out.to_str().unwrap(),
+            "vars": { "NAME": "Alice", "AGE": "30" },
+        }),
+    );
+    let v: serde_json::Value = serde_json::from_str(&result)
+        .unwrap_or_else(|e| panic!("tpu_render_file result must be JSON; got {result:?}: {e}"));
+    assert_eq!(v["substitutions"], 2, "substitution count must be 2; result: {v}");
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap(),
+        "Hello Alice, you are 30 years old.",
+        "rendered output must match expected"
+    );
+
+    // Empty key must be rejected with an error (isError: true in the MCP response).
+    let id = s.next_id();
+    s.send_raw(json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "tpu_render_file",
+            "arguments": {
+                "template": "{{}}",
+                "output":   out.to_str().unwrap(),
+                "vars": { "": "value" },
+            }
+        },
+    }));
+    let resp = s.recv_raw();
+    // MCP errors can be either a JSON-RPC error or a tool result with isError=true.
+    let is_error = resp.get("error").is_some()
+        || resp["result"]["isError"].as_bool().unwrap_or(false);
+    assert!(is_error, "empty var key must produce an error; got: {resp}");
+}
+
+/// MCP-IT-10: `tpu_setup` without a `target` returns the canonical Markdown
+/// block as plain text (not JSON).
+#[test]
+fn mcp_it_10_setup_returns_markdown_block() {
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let out = s.call_tool("tpu_setup", json!({}));
+    // The block must contain the tpu-mcp:setup markers and at least one table row.
+    assert_has("setup begin marker", &out, "tpu-mcp:setup:begin");
+    assert_has("setup end marker",   &out, "tpu-mcp:setup:end");
+    assert_has("tpu_read_file row",  &out, "tpu_read_file");
+    // Plain text — must NOT look like a top-level JSON object.
+    assert!(
+        !out.trim_start().starts_with('{'),
+        "tpu_setup without target must return plain Markdown, not JSON; got: {out:?}"
+    );
+}

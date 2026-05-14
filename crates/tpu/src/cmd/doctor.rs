@@ -257,8 +257,18 @@ fn expand_paths_with_policy(
         }
 
         let p = PathBuf::from(spec);
-        let meta = fs::metadata(&p)
-            .map_err(|e| format!("doctor: cannot stat {}: {e}", p.display()))?;
+        let meta = match fs::metadata(&p) {
+            Ok(m) => m,
+            Err(e) => match on_error {
+                crate::cmd::copy::OnError::Fail => {
+                    return Err(format!("doctor: cannot stat {}: {e}", p.display()).into());
+                }
+                crate::cmd::copy::OnError::Warn => {
+                    warnings_out.push(format!("doctor: cannot stat {}: {e}", p.display()));
+                    continue;
+                }
+            },
+        };
 
         if meta.is_file() {
             if !is_binary_extension(&p) {

@@ -3,8 +3,9 @@
 //! Tool definitions and dispatch for the `tpu-mcp` MCP server.
 //!
 //! Each tool calls into the `tpu` library directly via the `call_*` dispatch
-//! functions in this module.  On success the tool returns a JSON-encoded
-//! result string; on failure it returns an MCP error response.
+//! functions in this module.  File-reading tools return the raw file content
+//! as plain text.  Mutating and introspection tools return a JSON-encoded
+//! result object.  On failure all tools return an MCP error response.
 //!
 //! Tool set:
 //! - `read_file`         — read a text file with encoding/line-ending normalisation
@@ -1766,9 +1767,13 @@ fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std:
                         }
                     }
                     ProgressDetail::Summary => {
+                        let n = walk_warnings.len();
+                        // Free the strings immediately — in summary mode only
+                        // the count is needed, not the individual messages.
+                        walk_warnings.clear();
+                        walk_warnings.shrink_to_fit();
                         text.push_str(&format!(
-                            "warning: {} path(s) skipped (use progressDetail=each-file to list)\n",
-                            walk_warnings.len()
+                            "warning: {n} path(s) skipped (use progressDetail=each-file to list)\n",
                         ));
                     }
                 }
@@ -1794,10 +1799,11 @@ fn call_copy_file(
     };
     let opts = tpu::cmd::copy::CopyOptions { recursive, overwrite, on_error };
 
-    // Capture Shell::warn output as plain human-mode text so we can parse it
-    // into a structured string array — avoids embedding NDJSON in a JSON string.
+    // In EachFile mode, capture Shell::warn output for the `log` array.  In
+    // Summary mode the warning count is already in report.warnings, so we
+    // write to a sink to avoid retaining every warning string in memory for
+    // large tree walks.
     let warn_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let warn_buf_writer = warn_buf.clone();
     struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
     impl std::io::Write for SharedWriter {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -1806,7 +1812,11 @@ fn call_copy_file(
         }
         fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
     }
-    let mut shell = tpu::shell::Shell::from_write(Box::new(SharedWriter(warn_buf_writer)));
+    let mut shell = if matches!(config.progress_detail, ProgressDetail::EachFile) {
+        tpu::shell::Shell::from_write(Box::new(SharedWriter(warn_buf.clone())))
+    } else {
+        tpu::shell::Shell::from_write(Box::new(std::io::sink()))
+    };
 
     let report = tpu::cmd::copy::run(&source, std::path::Path::new(&dest), opts, &mut shell)?;
     drop(shell);
@@ -1849,7 +1859,7 @@ fn call_render_file(
     if let Some(map) = args.get("vars").and_then(|v| v.as_object()) {
         for (k, v) in map {
             // Enforce the same key constraints as the CLI parser.
-            if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
                 return Err(format!(
                     "render: vars key {k:?} may only contain ASCII letters, digits, '_' or '-'"
                 )
