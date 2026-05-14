@@ -151,7 +151,9 @@ pub fn run(
             .compile_matcher();
 
         // Destination must be a directory (or be created as one) so that
-        // every glob match has a unique target.
+        // each glob match can be placed within it using the source file's
+        // leaf name.  Note: two matched files with the same leaf name will
+        // collide; the outcome depends on `--overwrite` (skip vs. replace).
         if dest.exists() && !dest.is_dir() {
             return Err(format!(
                 "copy: glob source requires DEST to be a directory: {}",
@@ -410,7 +412,7 @@ fn copy_one(
             // to release the file handle (avoiding Windows sharing violations when
             // `fs::copy` opens the same path for writing) while still guaranteeing
             // the name is unique on disk.
-            let (_, tmp) = tempfile::Builder::new()
+            let tmp = match tempfile::Builder::new()
                 .prefix(".tpu_tmp_")
                 .tempfile_in(parent)
                 .map_err(|e| {
@@ -419,15 +421,26 @@ fn copy_one(
                         src.display(),
                         dst.display()
                     )
-                })?
-                .keep()
-                .map_err(|e| {
-                    format!(
-                        "copy: {} -> {}: cannot persist temp file: {e}",
-                        src.display(),
-                        dst.display()
-                    )
-                })?;
+                })
+                .and_then(|f| {
+                    f.keep().map(|(_, p)| p).map_err(|e| {
+                        format!(
+                            "copy: {} -> {}: cannot persist temp file: {e}",
+                            src.display(),
+                            dst.display()
+                        )
+                    })
+                }) {
+                Ok(p) => p,
+                Err(msg) => {
+                    report.warnings += 1;
+                    if matches!(opts.on_error, OnError::Fail) {
+                        return Err(msg.into());
+                    }
+                    let _ = shell.warn(msg);
+                    return Ok(());
+                }
+            };
             match crate::retry_io(|| fs::copy(src, &tmp)) {
                 Ok(_) => {
                     if let Err(e) = crate::retry_io(|| rename_replacing(&tmp, dst)) {

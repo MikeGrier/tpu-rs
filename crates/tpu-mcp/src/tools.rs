@@ -6,10 +6,11 @@
 //! functions in this module.  File-reading tools (`read_file`, `read_head`,
 //! `read_tail`, `read_file_binary`, `read_file_escaped`) return the raw file
 //! content as plain text.  File-mutating tools (`write_file`, `replace_in_file`,
-//! `edit_file`, `append_file`, `copy_file`) return plain status text or diffs.
-//! Structured JSON result objects are returned only by tools that explicitly
-//! advertise them (`count_file`, `find`, `setup`, `stat_file`, `render_file`,
-//! `copy_file`).  On failure all tools return an MCP error response.
+//! `edit_file`, `append_file`) return plain status text or diffs; `find` also
+//! returns plain matching text. Structured JSON result objects are returned
+//! only by tools that explicitly advertise them (`count_file`, `stat_file`,
+//! `render_file`, `copy_file`) and by `setup` when `target` is provided.  On
+//! failure all tools return an MCP error response.
 //!
 //! Tool set:
 //! - `read_file`         — read a text file with encoding/line-ending normalisation
@@ -1086,9 +1087,10 @@ pub fn list() -> Value {
                  flag) as a JSON object. Call this immediately after a write when you need \
                  to confirm the change actually persisted: compare the returned \
                  mtime_epoch_ms against the value included in the response from \
-                 tpu_write_file, tpu_replace_in_file, tpu_edit_file, or tpu_append_file. \
-                 A stale or mismatched mtime after a write likely indicates Windows \
-                 Defender interference and means the operation should be retried.",
+                 tpu_write_file, tpu_replace_in_file, tpu_edit_file, tpu_append_file, \
+                 tpu_render_file, or a targeted tpu_setup response (when called with \
+                 `target`). A stale or mismatched mtime after a write likely indicates \
+                 Windows Defender interference and means the operation should be retried.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1799,7 +1801,16 @@ fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std:
             }
             Ok(text)
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            // Surface per-path diagnostics collected before the failure so
+            // MCP clients can see which paths triggered the error.
+            if walk_warnings.is_empty() {
+                Err(e)
+            } else {
+                let context = walk_warnings.join("\n");
+                Err(format!("{context}\n{e}").into())
+            }
+        }
     }
 }
 
@@ -2073,7 +2084,8 @@ pub struct ServerConfig {
 }
 
 /// How much per-entry detail tree-walking tools should include in their
-/// JSON tool result.
+/// output.  `tpu_copy_file` and `tpu_setup` include per-entry diagnostics
+/// in a JSON result; `tpu_find` appends them as plain text.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProgressDetail {
     /// Include the `log` of per-entry warnings (inaccessible paths and walk errors).

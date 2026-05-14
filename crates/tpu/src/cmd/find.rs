@@ -434,9 +434,9 @@ pub fn run(
 }
 
 /// Variant of [`run`] that accepts an explicit walk-error policy and a
-/// sink for per-entry warnings. Use this from the CLI / MCP dispatch so
-/// inaccessible directories produce streamed warning records instead of
-/// aborting the entire find.
+/// sink for collected per-entry warnings. Use this from the CLI / MCP
+/// dispatch so inaccessible directories append warning records to
+/// `warnings_out` instead of aborting the entire find.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_policy(
     path_specs: &[&str],

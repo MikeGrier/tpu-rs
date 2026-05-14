@@ -1847,17 +1847,20 @@ fn run(
             // `Output` channel so JSON / human modes both work uniformly.
             let mut buf: Vec<u8> = Vec::new();
             let mut walk_warnings: Vec<String> = Vec::new();
-            let report = cmd::doctor::run_with_policy(
+            let result = cmd::doctor::run_with_policy(
                 &path_refs,
                 opts,
                 &mut buf,
                 IoMode::Mmap,
                 on_error_mode,
                 &mut walk_warnings,
-            )?;
-            for w in &walk_warnings {
-                let _ = shell.warn(w);
+            );
+            if !opts.quiet {
+                for w in &walk_warnings {
+                    let _ = shell.warn(w);
+                }
             }
+            let report = result?;
             let content =
                 String::from_utf8(buf).map_err(|e| format!("doctor: non-UTF-8 output: {e}"))?;
             out.emit("doctor", None, None, format_args!("{content}"));
