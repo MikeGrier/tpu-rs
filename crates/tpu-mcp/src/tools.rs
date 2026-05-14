@@ -2406,9 +2406,10 @@ fn is_windows_drive_path(s: &str) -> bool {
 /// Invalid or incomplete sequences are passed through unchanged.
 ///
 /// Bytes are collected first and then interpreted as UTF-8 so that
-/// multi-byte sequences such as `%C3%A9` round-trip correctly to `é`
-/// rather than being mojibaked into `Ã©` by treating each decoded byte
-/// as a Latin-1 scalar.
+/// multi-byte sequences round-trip correctly. For example, `%C3%A9`
+/// decodes to the two-byte UTF-8 sequence for U+00E9 (e-acute) rather
+/// than two separate Latin-1 scalars (the bytes 0xC3 and 0xA9 treated
+/// independently).
 fn percent_decode_path(s: &str) -> String {
     let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
     let b = s.as_bytes();
@@ -2562,14 +2563,15 @@ mod tests {
 
     #[test]
     fn percent_decode_utf8_multibyte() {
-        // é is U+00E9, UTF-8 bytes 0xC3 0xA9.  Each %XX must not be
-        // treated as a Latin-1 scalar (which would produce "Ã©").
-        assert_eq!(percent_decode_path("%C3%A9"), "é");
-        assert_eq!(percent_decode_path("/path/caf%C3%A9"), "/path/café");
-        // Japanese: ファイル — 3 × 3-byte UTF-8 sequences
+        // U+00E9 (e-acute) is two UTF-8 bytes: 0xC3 0xA9.  Each %XX byte
+        // must not be treated as a Latin-1 scalar (which would produce two
+        // separate code points instead of the single e-acute character).
+        assert_eq!(percent_decode_path("%C3%A9"), "\u{e9}");
+        assert_eq!(percent_decode_path("/path/caf%C3%A9"), "/path/caf\u{e9}");
+        // Japanese: ファイル — 3 x 3-byte UTF-8 sequences
         assert_eq!(
             percent_decode_path("%E3%83%95%E3%82%A1%E3%82%A4%E3%83%AB"),
-            "ファイル"
+            "\u{30D5}\u{30A1}\u{30A4}\u{30EB}"
         );
     }
 
