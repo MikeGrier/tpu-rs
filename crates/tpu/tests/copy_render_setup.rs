@@ -135,6 +135,10 @@ fn copy_glob_no_match_errors() {
         stderr.contains("matched no files"),
         "expected 'matched no files' in stderr; got: {stderr}"
     );
+    assert!(
+        !dest_dir.exists(),
+        "destination directory should not be created when glob has no matches"
+    );
 }
 
 // ─── render ──────────────────────────────────────────────────────────────────

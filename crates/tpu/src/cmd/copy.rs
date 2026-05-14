@@ -158,9 +158,7 @@ pub fn run(
             )
             .into());
         }
-        fs::create_dir_all(dest).map_err(|e| {
-            format!("copy: cannot create destination {}: {e}", dest.display())
-        })?;
+        let mut dest_ready = dest.exists();
 
         // Walk from the appropriate root: for absolute patterns the anchor
         // directory (longest non-glob prefix) is used so that entry paths are
@@ -211,6 +209,12 @@ pub fn run(
                 None => continue,
             };
             matched += 1;
+            if !dest_ready {
+                fs::create_dir_all(dest).map_err(|e| {
+                    format!("copy: cannot create destination {}: {e}", dest.display())
+                })?;
+                dest_ready = true;
+            }
             let target = dest.join(leaf);
             copy_one(entry.path(), &target, &opts, shell, &mut report)?;
         }
