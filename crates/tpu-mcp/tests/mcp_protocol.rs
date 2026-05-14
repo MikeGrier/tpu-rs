@@ -12,7 +12,7 @@ use std::{
     process::{Child, Command, Stdio},
 };
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Locate the tpu-mcp binary for the current build profile.
 ///
@@ -110,9 +110,10 @@ impl McpSession {
         }));
         let resp = self.recv_raw();
         if let Some(err) = resp.get("error")
-            && !err.is_null() {
-                panic!("RPC error for '{method}': {err}");
-            }
+            && !err.is_null()
+        {
+            panic!("RPC error for '{method}': {err}");
+        }
         resp["result"].clone()
     }
 
@@ -460,9 +461,13 @@ fn mcp_it_8_copy_file_basic_and_overwrite() {
             "overwrite": true,
         }),
     );
-    let v2: serde_json::Value = serde_json::from_str(&out2)
-        .unwrap_or_else(|e| panic!("tpu_copy_file overwrite result must be JSON; got {out2:?}: {e}"));
-    assert_eq!(v2["copied"], 1, "overwrite copied count must be 1; result: {v2}");
+    let v2: serde_json::Value = serde_json::from_str(&out2).unwrap_or_else(|e| {
+        panic!("tpu_copy_file overwrite result must be JSON; got {out2:?}: {e}")
+    });
+    assert_eq!(
+        v2["copied"], 1,
+        "overwrite copied count must be 1; result: {v2}"
+    );
     assert_eq!(
         std::fs::read_to_string(&dst).unwrap(),
         "updated content\n",
@@ -481,7 +486,10 @@ fn mcp_it_8_copy_file_basic_and_overwrite() {
     let v3: serde_json::Value = serde_json::from_str(&out3)
         .unwrap_or_else(|e| panic!("tpu_copy_file skip result must be JSON; got {out3:?}: {e}"));
     assert_eq!(v3["skipped"], 1, "skip count must be 1; result: {v3}");
-    assert_eq!(v3["copied"], 0, "copied count must be 0 when skipped; result: {v3}");
+    assert_eq!(
+        v3["copied"], 0,
+        "copied count must be 0 when skipped; result: {v3}"
+    );
 }
 
 /// MCP-IT-9: `tpu_render_file` substitutes tokens and writes the output file.
@@ -505,7 +513,10 @@ fn mcp_it_9_render_file_substitution_and_empty_key_rejected() {
     );
     let v: serde_json::Value = serde_json::from_str(&result)
         .unwrap_or_else(|e| panic!("tpu_render_file result must be JSON; got {result:?}: {e}"));
-    assert_eq!(v["substitutions"], 2, "substitution count must be 2; result: {v}");
+    assert_eq!(
+        v["substitutions"], 2,
+        "substitution count must be 2; result: {v}"
+    );
     assert_eq!(
         std::fs::read_to_string(&out).unwrap(),
         "Hello Alice, you are 30 years old.",
@@ -531,8 +542,8 @@ fn mcp_it_9_render_file_substitution_and_empty_key_rejected() {
     }));
     let resp = s.recv_raw();
     // MCP errors can be either a JSON-RPC error or a tool result with isError=true.
-    let is_error = resp.get("error").is_some()
-        || resp["result"]["isError"].as_bool().unwrap_or(false);
+    let is_error =
+        resp.get("error").is_some() || resp["result"]["isError"].as_bool().unwrap_or(false);
     assert!(is_error, "empty var key must produce an error; got: {resp}");
 }
 
@@ -546,8 +557,8 @@ fn mcp_it_10_setup_returns_markdown_block() {
     let out = s.call_tool("tpu_setup", json!({}));
     // The block must contain the tpu-mcp:setup markers and at least one table row.
     assert_has("setup begin marker", &out, "tpu-mcp:setup:begin");
-    assert_has("setup end marker",   &out, "tpu-mcp:setup:end");
-    assert_has("tpu_read_file row",  &out, "tpu_read_file");
+    assert_has("setup end marker", &out, "tpu-mcp:setup:end");
+    assert_has("tpu_read_file row", &out, "tpu_read_file");
     // Plain text — must NOT look like a top-level JSON object.
     assert!(
         !out.trim_start().starts_with('{'),
@@ -570,14 +581,17 @@ fn mcp_it_11_setup_inject_and_replace() {
     s.initialize();
 
     // First call — inject: block is not yet present, so replaced must be false.
-    let out1 = s.call_tool(
-        "tpu_setup",
-        json!({ "target": target.to_str().unwrap() }),
-    );
+    let out1 = s.call_tool("tpu_setup", json!({ "target": target.to_str().unwrap() }));
     let v1: serde_json::Value = serde_json::from_str(&out1)
         .unwrap_or_else(|e| panic!("tpu_setup inject result must be JSON; got {out1:?}: {e}"));
-    assert_eq!(v1["updated"], true, "first inject must report updated=true; result: {v1}");
-    assert_eq!(v1["replaced"], false, "first inject must report replaced=false; result: {v1}");
+    assert_eq!(
+        v1["updated"], true,
+        "first inject must report updated=true; result: {v1}"
+    );
+    assert_eq!(
+        v1["replaced"], false,
+        "first inject must report replaced=false; result: {v1}"
+    );
     assert!(
         v1["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
         "first inject must include a non-zero mtime; result: {v1}"
@@ -591,15 +605,15 @@ fn mcp_it_11_setup_inject_and_replace() {
     );
 
     // Second call — replace: block already exists, so replaced must be true.
-    let out2 = s.call_tool(
-        "tpu_setup",
-        json!({ "target": target.to_str().unwrap() }),
-    );
+    let out2 = s.call_tool("tpu_setup", json!({ "target": target.to_str().unwrap() }));
     let v2: serde_json::Value = serde_json::from_str(&out2)
         .unwrap_or_else(|e| panic!("tpu_setup replace result must be JSON; got {out2:?}: {e}"));
     // updated may be false if the block content was already identical; the key
     // observable is that `replaced` is true (the block was found and processed).
-    assert_eq!(v2["replaced"], true, "second inject must report replaced=true; result: {v2}");
+    assert_eq!(
+        v2["replaced"], true,
+        "second inject must report replaced=true; result: {v2}"
+    );
 
     // .bak file must have been cleaned up.
     let bak = target.with_extension("md.bak");

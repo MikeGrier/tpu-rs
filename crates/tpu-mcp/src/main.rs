@@ -174,7 +174,7 @@ fn dispatch(
                             code: code::INVALID_PARAMS,
                             message: "tools/call requires params".into(),
                         },
-                    }
+                    };
                 }
             };
 
@@ -317,17 +317,13 @@ fn log_warn(out: &mut impl io::Write, message: impl Into<String>) {
 /// channel at `warning` level rather than as `[warning]`-tagged stderr.
 fn parse_config() -> (tools::ServerConfig, Vec<String>) {
     let mut verify_delay_ms: u64 = 100;
-    let mut quiet: bool = std::env::var_os("TPU_MCP_QUIET")
-        .is_some_and(|v| !v.is_empty());
+    let mut quiet: bool = std::env::var_os("TPU_MCP_QUIET").is_some_and(|v| !v.is_empty());
     let mut warnings: Vec<String> = Vec::new();
     // Default walk-error policy for tools that traverse trees (find, copy).
     // Honour the env var first so the VS Code extension can plumb the user
     // setting in without needing a CLI flag at all; the CLI flag wins if
     // explicitly supplied.
-    let mut default_on_error = match std::env::var("TPU_DEFAULT_ERROR_MODE")
-        .ok()
-        .as_deref()
-    {
+    let mut default_on_error = match std::env::var("TPU_DEFAULT_ERROR_MODE").ok().as_deref() {
         Some("strict") | Some("fail") => tpu::cmd::copy::OnError::Fail,
         Some("continue") | Some("warn") => tpu::cmd::copy::OnError::Warn,
         Some(other) if !other.is_empty() => {
@@ -338,10 +334,7 @@ fn parse_config() -> (tools::ServerConfig, Vec<String>) {
         }
         _ => tpu::cmd::copy::OnError::Warn,
     };
-    let mut progress_detail = match std::env::var("TPU_PROGRESS_DETAIL")
-        .ok()
-        .as_deref()
-    {
+    let mut progress_detail = match std::env::var("TPU_PROGRESS_DETAIL").ok().as_deref() {
         Some("summary") => tools::ProgressDetail::Summary,
         Some("each-file") | Some("each_file") => tools::ProgressDetail::EachFile,
         Some(other) if !other.is_empty() => {

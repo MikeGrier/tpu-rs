@@ -29,7 +29,10 @@ use harrier::{
 };
 use tempfile::NamedTempFile;
 
-use crate::{mojibake::{check_write_does_not_introduce_mojibake, WritePolicy}, IoMode};
+use crate::{
+    IoMode,
+    mojibake::{WritePolicy, check_write_does_not_introduce_mojibake},
+};
 
 /// Sentinel value parsed from `$` or `EOF` (case-insensitive) in any RANGE or
 /// OFFSET argument to `tpu edit`.
@@ -225,10 +228,15 @@ fn run_binary(
     crate::retry_io(|| fs::rename(file, &bak_path))?;
     let mut tmp = Some(tmp);
     crate::retry_io(|| {
-        let t = tmp.take().expect("persist retry: temp file already consumed");
+        let t = tmp
+            .take()
+            .expect("persist retry: temp file already consumed");
         match t.persist(file) {
             Ok(_) => Ok(()),
-            Err(e) => { tmp = Some(e.file); Err(e.error) }
+            Err(e) => {
+                tmp = Some(e.file);
+                Err(e.error)
+            }
         }
     })
     .map_err(|e| {
@@ -397,10 +405,15 @@ fn run_line(
     crate::retry_io(|| fs::rename(file, &bak_path))?;
     let mut tmp = Some(tmp);
     crate::retry_io(|| {
-        let t = tmp.take().expect("persist retry: temp file already consumed");
+        let t = tmp
+            .take()
+            .expect("persist retry: temp file already consumed");
         match t.persist(file) {
             Ok(_) => Ok(()),
-            Err(e) => { tmp = Some(e.file); Err(e.error) }
+            Err(e) => {
+                tmp = Some(e.file);
+                Err(e.error)
+            }
         }
     })
     .map_err(|e| {
@@ -1609,14 +1622,16 @@ mod tests {
     fn lm_out_of_range() {
         let dir = TempDir::new().unwrap();
         let p = write_tmp(&dir, "f.txt", b"abc\ndef\n");
-        assert!(run_test(
-            &p,
-            vec![EditOp::Delete { start: 5, end: 5 }],
-            false,
-            None,
-            None
-        )
-        .is_err());
+        assert!(
+            run_test(
+                &p,
+                vec![EditOp::Delete { start: 5, end: 5 }],
+                false,
+                None,
+                None
+            )
+            .is_err()
+        );
         assert_eq!(read_file_bytes(&p), b"abc\ndef\n");
     }
 

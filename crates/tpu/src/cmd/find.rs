@@ -103,11 +103,7 @@ fn line_matches(line: &str, regexes: &[Regex], all_match: bool, invert: bool) ->
     } else {
         regexes.iter().any(|re| re.is_match(line))
     };
-    if invert {
-        !raw
-    } else {
-        raw
-    }
+    if invert { !raw } else { raw }
 }
 
 // ── Glob / path expansion ─────────────────────────────────────────────────────
@@ -161,9 +157,7 @@ pub fn expand_paths_with_policy(
                                 .path()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|| "?".to_string());
-                            warnings_out.push(format!(
-                                "find: cannot access {path_hint}: {e}"
-                            ));
+                            warnings_out.push(format!("find: cannot access {path_hint}: {e}"));
                             continue;
                         }
                     },
@@ -347,9 +341,10 @@ fn run_single_file(
                         .unwrap_or(line_num);
 
                     if let Some(last) = last_output_num
-                        && first_to_emit > last + 1 {
-                            writeln!(out, "--")?;
-                        }
+                        && first_to_emit > last + 1
+                    {
+                        writeln!(out, "--")?;
+                    }
                 }
 
                 // ── before-context ─────────────────────────────────────────

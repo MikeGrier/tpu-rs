@@ -202,8 +202,7 @@ impl Shell {
     // ── Internal ──────────────────────────────────────────────────────────────
 
     fn emit_json(&mut self, msg: &Msg<'_>) -> io::Result<()> {
-        let line =
-            serde_json::to_string(msg).map_err(io::Error::other)?;
+        let line = serde_json::to_string(msg).map_err(io::Error::other)?;
         writeln!(self.out, "{line}")
     }
 }

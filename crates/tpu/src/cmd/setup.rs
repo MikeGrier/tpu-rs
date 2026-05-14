@@ -31,18 +31,14 @@
 //! tool: the block is always rewritten to the current canonical form
 //! without disturbing surrounding content.
 
-use std::{
-    fs,
-    path::Path,
-    sync::Arc,
-};
+use std::{fs, path::Path, sync::Arc};
 
 use harrier::{encoding::SourceConfig, source::Source};
 
 use crate::{
+    IoMode,
     encoding::{BomPolicy, OutputEncoding},
     mojibake::WritePolicy,
-    IoMode,
 };
 
 /// Begin marker for the managed block.
@@ -114,7 +110,10 @@ through `Get-Content` / `Set-Content` — read and write via
 
 /// Return the full managed block (markers + body), terminated by a single LF.
 pub fn full_block() -> String {
-    format!("{BEGIN_MARKER}\n{}\n{END_MARKER}\n", guidance_body().trim_end())
+    format!(
+        "{BEGIN_MARKER}\n{}\n{END_MARKER}\n",
+        guidance_body().trim_end()
+    )
 }
 
 /// Inject (or re-inject) the managed block into `target_file`.
@@ -135,10 +134,7 @@ pub fn inject(
         if let Some(parent) = target_file.parent() {
             if !parent.as_os_str().is_empty() {
                 fs::create_dir_all(parent).map_err(|e| {
-                    format!(
-                        "setup: cannot create parent {}: {e}",
-                        parent.display()
-                    )
+                    format!("setup: cannot create parent {}: {e}", parent.display())
                 })?;
             }
         }

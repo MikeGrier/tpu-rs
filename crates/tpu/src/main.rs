@@ -1138,18 +1138,17 @@ fn run(
                     OutputEncoding::Preserve
                 };
                 let bom_policy = bom.unwrap_or_default();
-                let le_override = match line_ending.as_deref() {
-                    None => None,
-                    Some("lf") => Some(harrier::encoding::LineEnding::Lf),
-                    Some("crlf") => Some(harrier::encoding::LineEnding::CrLf),
-                    Some("cr") => Some(harrier::encoding::LineEnding::Cr),
-                    Some(other) => {
-                        return Err(format!(
+                let le_override =
+                    match line_ending.as_deref() {
+                        None => None,
+                        Some("lf") => Some(harrier::encoding::LineEnding::Lf),
+                        Some("crlf") => Some(harrier::encoding::LineEnding::CrLf),
+                        Some("cr") => Some(harrier::encoding::LineEnding::Cr),
+                        Some(other) => return Err(format!(
                             "--line-ending: unrecognised value {other:?}; expected lf, crlf, or cr"
                         )
-                        .into())
-                    }
-                };
+                        .into()),
+                    };
                 cmd::write::run(
                     &file,
                     &text,
@@ -1211,17 +1210,15 @@ fn run(
                     return Err(format!(
                         "--line-ending: unrecognised value {other:?}; expected lf, crlf, or cr"
                     )
-                    .into())
+                    .into());
                 }
             };
             // Decode backslash escapes in the replacement string unless the
             // caller asked for raw/literal handling.  This is the default
             // because users typically write `\n` expecting a real newline.
-            let decoded_replacement = cmd::replace::decode_replacement(
-                &replacement,
-                literal_replacement,
-            )
-            .map_err(|e| format!("replace: {e}"))?;
+            let decoded_replacement =
+                cmd::replace::decode_replacement(&replacement, literal_replacement)
+                    .map_err(|e| format!("replace: {e}"))?;
             let n = cmd::replace::run(
                 &file,
                 &pattern,
@@ -1320,7 +1317,7 @@ fn run(
                     return Err(format!(
                         "--line-ending: unrecognised value {other:?}; expected lf, crlf, or cr"
                     )
-                    .into())
+                    .into());
                 }
             };
             cmd::validate::run_all(&validate, &file, binary, IoMode::Mmap)?;
@@ -1648,7 +1645,7 @@ fn run(
                     return Err(format!(
                         "--line-ending: unrecognised value {other:?}; expected lf, crlf, or cr"
                     )
-                    .into())
+                    .into());
                 }
             };
 
@@ -1861,8 +1858,8 @@ fn run(
             for w in &walk_warnings {
                 let _ = shell.warn(w);
             }
-            let content = String::from_utf8(buf)
-                .map_err(|e| format!("doctor: non-UTF-8 output: {e}"))?;
+            let content =
+                String::from_utf8(buf).map_err(|e| format!("doctor: non-UTF-8 output: {e}"))?;
             out.emit("doctor", None, None, format_args!("{content}"));
             if report.total_issues() > 0 {
                 std::process::exit(1);
@@ -1929,7 +1926,8 @@ fn run(
             use std::collections::BTreeMap;
             let mut vars: BTreeMap<String, String> = BTreeMap::new();
             for v in &var {
-                let (k, val) = cmd::render::parse_var(v).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                let (k, val) = cmd::render::parse_var(v)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
                 vars.insert(k, val);
             }
             let policy = match missing.as_str() {
@@ -1978,7 +1976,12 @@ fn run(
 
         Commands::Setup { inject } => match inject {
             None => {
-                out.emit("setup", None, None, format_args!("{}", cmd::setup::full_block()));
+                out.emit(
+                    "setup",
+                    None,
+                    None,
+                    format_args!("{}", cmd::setup::full_block()),
+                );
                 Ok(())
             }
             Some(path) => {

@@ -37,9 +37,9 @@ use harrier::{
 use tempfile::NamedTempFile;
 
 use crate::{
-    encoding::{BomPolicy, OutputEncoding},
-    mojibake::{check_write_does_not_introduce_mojibake, WritePolicy},
     IoMode,
+    encoding::{BomPolicy, OutputEncoding},
+    mojibake::{WritePolicy, check_write_does_not_introduce_mojibake},
 };
 
 /// UTF-8 BOM byte sequence (U+FEFF encoded as UTF-8).
@@ -89,8 +89,7 @@ pub fn run(
     policy: WritePolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Capture old bytes if needed for diff computation OR the mojibake guard.
-    let need_old_bytes = diff_out.is_some()
-        || (policy.reject_introduced_mojibake && file.exists());
+    let need_old_bytes = diff_out.is_some() || (policy.reject_introduced_mojibake && file.exists());
     let old_bytes: Option<Vec<u8>> = if need_old_bytes && file.exists() {
         Some(crate::retry_io(|| fs::read(file))?)
     } else {
@@ -193,10 +192,15 @@ pub fn run(
         crate::retry_io(|| fs::rename(file, &bak))?;
         let mut tmp = Some(tmp);
         crate::retry_io(|| {
-            let t = tmp.take().expect("persist retry: temp file already consumed");
+            let t = tmp
+                .take()
+                .expect("persist retry: temp file already consumed");
             match t.persist(file) {
                 Ok(_) => Ok(()),
-                Err(e) => { tmp = Some(e.file); Err(e.error) }
+                Err(e) => {
+                    tmp = Some(e.file);
+                    Err(e.error)
+                }
             }
         })
         .map_err(|e| {
@@ -206,10 +210,15 @@ pub fn run(
     } else {
         let mut tmp = Some(tmp);
         crate::retry_io(|| {
-            let t = tmp.take().expect("persist retry: temp file already consumed");
+            let t = tmp
+                .take()
+                .expect("persist retry: temp file already consumed");
             match t.persist(file) {
                 Ok(_) => Ok(()),
-                Err(e) => { tmp = Some(e.file); Err(e.error) }
+                Err(e) => {
+                    tmp = Some(e.file);
+                    Err(e.error)
+                }
             }
         })?;
     }
@@ -412,9 +421,10 @@ pub fn run_binary(
         }
     } else {
         if let Some(parent) = file.parent()
-            && !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
         tmp.persist(file).map_err(|e| e.error)?;
     }
 

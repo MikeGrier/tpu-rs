@@ -14,8 +14,9 @@ use std::{fmt::Write as FmtWrite, io::Write, path::Path, sync::Arc};
 use harrier::{encoding::SourceConfig, source::Source};
 
 use crate::{
+    IoMode,
     encoding::{BomPolicy, OutputEncoding},
-    escape, IoMode,
+    escape,
 };
 
 /// UTF-8 BOM byte sequence (U+FEFF encoded as UTF-8).

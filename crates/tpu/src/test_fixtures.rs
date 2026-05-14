@@ -34,8 +34,7 @@
 /// a byte vector.  Panics on invalid input — only fed compile-time
 /// literals defined in this file.
 fn b64(s: &str) -> Vec<u8> {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let clean: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
     let mut out = Vec::with_capacity(clean.len() * 3 / 4 + 2);
     let val = |b: u8| -> u8 {
@@ -197,12 +196,20 @@ mod selftests {
 
     #[test]
     fn cafe_b64_decodes_correctly() {
-        assert_bytes(CAFE_B64, &[0x63, 0x61, 0x66, 0xC3, 0x83, 0xC2, 0xA9], "CAFE_B64");
+        assert_bytes(
+            CAFE_B64,
+            &[0x63, 0x61, 0x66, 0xC3, 0x83, 0xC2, 0xA9],
+            "CAFE_B64",
+        );
     }
 
     #[test]
     fn latin1_fragment_b64_decodes_correctly() {
-        assert_bytes(LATIN1_FRAGMENT_B64, &[0xC3, 0x83, 0xC2, 0xA9], "LATIN1_FRAGMENT_B64");
+        assert_bytes(
+            LATIN1_FRAGMENT_B64,
+            &[0xC3, 0x83, 0xC2, 0xA9],
+            "LATIN1_FRAGMENT_B64",
+        );
     }
 
     #[test]
@@ -246,7 +253,9 @@ mod selftests {
     fn double_cafe_b64_decodes_correctly() {
         assert_bytes(
             DOUBLE_CAFE_B64,
-            &[0x63, 0x61, 0x66, 0xC3, 0x83, 0xC6, 0x92, 0xC3, 0x82, 0xC2, 0xA9],
+            &[
+                0x63, 0x61, 0x66, 0xC3, 0x83, 0xC6, 0x92, 0xC3, 0x82, 0xC2, 0xA9,
+            ],
             "DOUBLE_CAFE_B64",
         );
     }

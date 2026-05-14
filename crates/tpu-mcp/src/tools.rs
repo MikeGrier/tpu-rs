@@ -3,9 +3,13 @@
 //! Tool definitions and dispatch for the `tpu-mcp` MCP server.
 //!
 //! Each tool calls into the `tpu` library directly via the `call_*` dispatch
-//! functions in this module.  File-reading tools return the raw file content
-//! as plain text.  Mutating and introspection tools return a JSON-encoded
-//! result object.  On failure all tools return an MCP error response.
+//! functions in this module.  File-reading tools (`read_file`, `read_head`,
+//! `read_tail`, `read_file_binary`, `read_file_escaped`) return the raw file
+//! content as plain text.  File-mutating tools (`write_file`, `replace_in_file`,
+//! `edit_file`, `append_file`, `copy_file`) return plain status text or diffs.
+//! Structured JSON result objects are returned only by tools that explicitly
+//! advertise them (`count_file`, `find`, `setup`, `stat_file`, `render_file`,
+//! `copy_file`).  On failure all tools return an MCP error response.
 //!
 //! Tool set:
 //! - `read_file`         — read a text file with encoding/line-ending normalisation
@@ -935,9 +939,11 @@ pub fn list() -> Value {
                    directory tree    — `source` is a directory path; pass recursive:true. \
                                        `dest` is created if needed and the tree is \
                                        mirrored beneath it.\n\
-                   glob expansion    — `source` contains `*`, `?`, `[`, `{`. The matches \
-                                       (relative to the current working directory) are \
-                                       copied flat into `dest` (which must be a directory).\n\n\
+                   glob expansion    — `source` contains `*`, `?`, `[`, `{`. Relative \
+                                       patterns are resolved from the current working \
+                                       directory; absolute patterns are anchored at their \
+                                       non-glob prefix. Matches are copied flat into \
+                                       `dest` (which must be a directory).\n\n\
                  By default, an existing destination file is skipped (and counted in \
                  the report). Pass overwrite:true to replace existing targets.",
             "inputSchema": {
@@ -1647,7 +1653,14 @@ fn call_append_file(
         return Ok(format!("appended to '{file}' (no changes)"));
     }
 
-    tpu::cmd::append::run(path, &content, le_override, None, tpu::IoMode::Buffered, mojibake_policy_from_args(args))?;
+    tpu::cmd::append::run(
+        path,
+        &content,
+        le_override,
+        None,
+        tpu::IoMode::Buffered,
+        mojibake_policy_from_args(args),
+    )?;
     delete_bak_if_exists(&file);
     let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
     Ok(format!(
@@ -1724,7 +1737,13 @@ fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std:
     let on_error = match args.get("on_error").and_then(|v| v.as_str()) {
         Some("fail") => tpu::cmd::copy::OnError::Fail,
         Some("warn") => tpu::cmd::copy::OnError::Warn,
-        _ => config.default_on_error,
+        Some(other) => {
+            return Err(format!(
+                "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
+            )
+            .into());
+        }
+        None => config.default_on_error,
     };
     let mut walk_warnings: Vec<String> = Vec::new();
 
@@ -1749,8 +1768,8 @@ fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std:
 
     match result {
         Ok(_) => {
-            let mut text = String::from_utf8(buf)
-                .map_err(|e| format!("find: non-UTF-8 output: {e}"))?;
+            let mut text =
+                String::from_utf8(buf).map_err(|e| format!("find: non-UTF-8 output: {e}"))?;
             // Surface walk warnings so Copilot sees a structured note about
             // skipped paths, not silent loss. In summary mode we collapse
             // the per-entry detail into a single tail line.
@@ -1790,14 +1809,30 @@ fn call_copy_file(
 ) -> Result<String, Box<dyn std::error::Error>> {
     let source = normalize_file_path(require_str(args, "source")?);
     let dest = normalize_file_path(require_str(args, "dest")?);
-    let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
-    let overwrite = args.get("overwrite").and_then(|v| v.as_bool()).unwrap_or(false);
+    let recursive = args
+        .get("recursive")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let overwrite = args
+        .get("overwrite")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let on_error = match args.get("on_error").and_then(|v| v.as_str()) {
         Some("fail") => tpu::cmd::copy::OnError::Fail,
         Some("warn") => tpu::cmd::copy::OnError::Warn,
-        _ => config.default_on_error,
+        Some(other) => {
+            return Err(format!(
+                "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
+            )
+            .into());
+        }
+        None => config.default_on_error,
     };
-    let opts = tpu::cmd::copy::CopyOptions { recursive, overwrite, on_error };
+    let opts = tpu::cmd::copy::CopyOptions {
+        recursive,
+        overwrite,
+        on_error,
+    };
 
     // In EachFile mode, capture Shell::warn output for the `log` array.  In
     // Summary mode the warning count is already in report.warnings, so we
@@ -1810,7 +1845,9 @@ fn call_copy_file(
             self.0.lock().unwrap().extend_from_slice(b);
             Ok(b.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
     let mut shell = if matches!(config.progress_detail, ProgressDetail::EachFile) {
         tpu::shell::Shell::from_write(Box::new(SharedWriter(warn_buf.clone())))
@@ -1836,7 +1873,10 @@ fn call_copy_file(
     });
     if matches!(config.progress_detail, ProgressDetail::EachFile) {
         result["log"] = serde_json::Value::Array(
-            warn_lines.iter().map(|s| serde_json::Value::String((*s).to_string())).collect(),
+            warn_lines
+                .iter()
+                .map(|s| serde_json::Value::String((*s).to_string()))
+                .collect(),
         );
     }
     Ok(serde_json::to_string(&result)?)
@@ -1854,29 +1894,42 @@ fn call_render_file(
         .and_then(|v| v.as_str())
         .map(|s| s.replace("\r\n", "\n").replace('\r', "\n"));
     let template_inline = template_inline_owned.as_deref();
-    let template_file = args.get("template_file").and_then(|v| v.as_str()).map(normalize_file_path);
+    let template_file = args
+        .get("template_file")
+        .and_then(|v| v.as_str())
+        .map(normalize_file_path);
     let mut vars: BTreeMap<String, String> = BTreeMap::new();
     if let Some(map) = args.get("vars").and_then(|v| v.as_object()) {
         for (k, v) in map {
             // Enforce the same key constraints as the CLI parser.
-            if k.is_empty() || !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+            if k.is_empty()
+                || !k
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
                 return Err(format!(
                     "render: vars key {k:?} may only contain ASCII letters, digits, '_' or '-'"
                 )
                 .into());
             }
-            let val = v.as_str().ok_or_else(|| {
-                format!("render: vars[{k}]: value must be a string")
-            })?;
+            let val = v
+                .as_str()
+                .ok_or_else(|| format!("render: vars[{k}]: value must be a string"))?;
             // Normalize CRLF → LF so variable values don't produce doubled
             // carriage returns when written to CRLF-convention destination files.
             vars.insert(k.clone(), val.replace("\r\n", "\n").replace('\r', "\n"));
         }
     }
     let missing = match args.get("missing").and_then(|v| v.as_str()) {
+        Some("error") | None => tpu::cmd::render::MissingPolicy::Error,
         Some("empty") => tpu::cmd::render::MissingPolicy::Empty,
         Some("leave") => tpu::cmd::render::MissingPolicy::Leave,
-        _ => tpu::cmd::render::MissingPolicy::Error,
+        Some(other) => {
+            return Err(format!(
+                "render: invalid missing policy {other:?}; expected one of \"error\", \"empty\", or \"leave\""
+            )
+            .into());
+        }
     };
     let policy = mojibake_policy_from_args(args);
     let report = tpu::cmd::render::run(
@@ -1900,14 +1953,16 @@ fn call_render_file(
     }))?)
 }
 
-fn call_setup(
-    args: &Value,
-    config: &ServerConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let target = args
-        .get("target")
-        .and_then(|v| v.as_str())
-        .map(normalize_file_path);
+fn call_setup(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std::error::Error>> {
+    let target = match args.get("target") {
+        None => None,
+        Some(v) => match v.as_str() {
+            Some(s) => Some(normalize_file_path(s)),
+            None => {
+                return Err("`target` must be a string path when provided".into());
+            }
+        },
+    };
     match target {
         None => Ok(tpu::cmd::setup::full_block()),
         Some(path) => {
@@ -1919,11 +1974,9 @@ fn call_setup(
                 "replaced": replaced,
             });
             if updated {
-                let stamp =
-                    stamp_and_verify(std::path::Path::new(&path), config.verify_delay_ms)?;
+                let stamp = stamp_and_verify(std::path::Path::new(&path), config.verify_delay_ms)?;
                 delete_bak_if_exists(&path);
-                result["mtime_epoch_ms"] =
-                    serde_json::Value::Number(stamp.mtime_epoch_ms.into());
+                result["mtime_epoch_ms"] = serde_json::Value::Number(stamp.mtime_epoch_ms.into());
                 result["size"] = serde_json::Value::Number(stamp.size.into());
             }
             Ok(serde_json::to_string(&result)?)
@@ -2356,12 +2409,14 @@ fn percent_decode_path(s: &str) -> String {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len()
-            && let (Some(hi), Some(lo)) = (hex_nibble(b[i + 1]), hex_nibble(b[i + 2])) {
-                out.push(char::from(hi << 4 | lo));
-                i += 3;
-                continue;
-            }
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(hi), Some(lo)) = (hex_nibble(b[i + 1]), hex_nibble(b[i + 2]))
+        {
+            out.push(char::from(hi << 4 | lo));
+            i += 3;
+            continue;
+        }
         out.push(char::from(b[i]));
         i += 1;
     }

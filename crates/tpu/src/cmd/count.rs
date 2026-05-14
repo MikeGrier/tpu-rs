@@ -17,7 +17,7 @@ use harrier::{
 };
 use regex::Regex;
 
-use crate::{output::Output, IoMode};
+use crate::{IoMode, output::Output};
 
 /// Run the `count` subcommand.
 ///

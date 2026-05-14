@@ -84,9 +84,9 @@ use serde_json::json;
 use walkdir::WalkDir;
 
 use crate::{
+    IoMode,
     encoding::{BomPolicy, OutputEncoding},
     mojibake::{self, Pattern},
-    IoMode,
 };
 
 // ── Public option / record types ────────────────────────────────────────────
@@ -176,14 +176,11 @@ impl DoctorReport {
 /// Lowercase file extensions that are unconditionally treated as binary
 /// and skipped by the doctor walk.
 const BINARY_EXTS: &[&str] = &[
-    "exe", "dll", "so", "dylib", "a", "lib", "o", "obj", "pdb", "class",
-    "jar", "war", "zip", "7z", "gz", "tgz", "bz2", "xz", "rar", "tar",
-    "iso", "dmg", "img", "bin", "dat", "db", "sqlite",
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp",
-    "psd", "svgz",
-    "mp3", "mp4", "wav", "flac", "ogg", "avi", "mov", "mkv", "webm",
-    "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
-    "ttf", "otf", "woff", "woff2", "eot",
+    "exe", "dll", "so", "dylib", "a", "lib", "o", "obj", "pdb", "class", "jar", "war", "zip", "7z",
+    "gz", "tgz", "bz2", "xz", "rar", "tar", "iso", "dmg", "img", "bin", "dat", "db", "sqlite",
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "tif", "tiff", "webp", "psd", "svgz", "mp3", "mp4",
+    "wav", "flac", "ogg", "avi", "mov", "mkv", "webm", "pdf", "doc", "docx", "xls", "xlsx", "ppt",
+    "pptx", "ttf", "otf", "woff", "woff2", "eot",
 ];
 
 fn is_binary_extension(path: &Path) -> bool {
@@ -227,7 +224,10 @@ fn expand_paths_with_policy(
             let matcher = Glob::new(spec)
                 .map_err(|e| format!("doctor: invalid glob {spec:?}: {e}"))?
                 .compile_matcher();
-            for entry in WalkDir::new(".").into_iter().filter_entry(|e| !is_skipped_dir(e)) {
+            for entry in WalkDir::new(".")
+                .into_iter()
+                .filter_entry(|e| !is_skipped_dir(e))
+            {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => match on_error {
@@ -239,8 +239,7 @@ fn expand_paths_with_policy(
                                 .path()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|| "?".to_string());
-                            warnings_out
-                                .push(format!("doctor: cannot access {path_hint}: {e}"));
+                            warnings_out.push(format!("doctor: cannot access {path_hint}: {e}"));
                             continue;
                         }
                     },
@@ -284,7 +283,10 @@ fn expand_paths_with_policy(
 
         if meta.is_dir() {
             let ignore = load_gitignore(&p);
-            for entry in WalkDir::new(&p).into_iter().filter_entry(|e| !is_skipped_dir(e)) {
+            for entry in WalkDir::new(&p)
+                .into_iter()
+                .filter_entry(|e| !is_skipped_dir(e))
+            {
                 let entry = match entry {
                     Ok(e) => e,
                     Err(e) => match on_error {
@@ -296,8 +298,7 @@ fn expand_paths_with_policy(
                                 .path()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|| "?".to_string());
-                            warnings_out
-                                .push(format!("doctor: cannot access {path_hint}: {e}"));
+                            warnings_out.push(format!("doctor: cannot access {path_hint}: {e}"));
                             continue;
                         }
                     },
@@ -491,12 +492,14 @@ fn annotate_matches(text: &str, raw: &[mojibake::Match]) -> Vec<DoctorMatch> {
     }
 
     out.into_iter()
-        .map(|o| o.unwrap_or(DoctorMatch {
-            byte_offset: 0,
-            line: 0,
-            col: 0,
-            pattern: Pattern::Latin1,
-        }))
+        .map(|o| {
+            o.unwrap_or(DoctorMatch {
+                byte_offset: 0,
+                line: 0,
+                col: 0,
+                pattern: Pattern::Latin1,
+            })
+        })
         .collect()
 }
 
@@ -556,7 +559,11 @@ pub fn run_with_policy(
     warnings_out: &mut Vec<String>,
 ) -> Result<DoctorReport, Box<dyn Error>> {
     let default = ["."];
-    let specs: &[&str] = if path_specs.is_empty() { &default } else { path_specs };
+    let specs: &[&str] = if path_specs.is_empty() {
+        &default
+    } else {
+        path_specs
+    };
 
     let files = expand_paths_with_policy(specs, on_error, warnings_out)?;
     let mut report = DoctorReport {
@@ -582,16 +589,18 @@ pub fn run_with_policy(
 
     if options.fix == DoctorFix::Peel {
         for issue in &mut report.issues {
-            if !issue.mojibake_matches.is_empty() && issue.peel_suggested.is_some()
+            if !issue.mojibake_matches.is_empty()
+                && issue.peel_suggested.is_some()
                 && let Err(e) = apply_peel(issue, io_mode)
-                    && options.format == DoctorFormat::Human {
-                        writeln!(
-                            out,
-                            "doctor: peel-fix failed for {}: {}",
-                            issue.path.display(),
-                            e
-                        )?;
-                    }
+                && options.format == DoctorFormat::Human
+            {
+                writeln!(
+                    out,
+                    "doctor: peel-fix failed for {}: {}",
+                    issue.path.display(),
+                    e
+                )?;
+            }
         }
         report.total_repaired = report.issues.iter().filter(|i| i.repaired).count();
     }
@@ -728,10 +737,15 @@ mod tests {
         fs::create_dir(tmp.path().join("src")).unwrap();
         let mut found_src = false;
         let mut found_skipped = false;
-        for e in WalkDir::new(tmp.path()).into_iter().filter_entry(|e| !is_skipped_dir(e)) {
+        for e in WalkDir::new(tmp.path())
+            .into_iter()
+            .filter_entry(|e| !is_skipped_dir(e))
+        {
             let e = e.unwrap();
             let n = e.file_name().to_string_lossy().to_string();
-            if n == "src" { found_src = true; }
+            if n == "src" {
+                found_src = true;
+            }
             if n == ".git" || n == "target" {
                 // only top-level entry survives the filter (it's checked
                 // *before* being yielded, so we still see the dir itself).
@@ -758,7 +772,9 @@ mod tests {
         // Two lines; mojibake is on line 2 at column 5 (0-indexed bytes
         // include "first\n" = 6 bytes before the 'c' of 'caf').
         let p = write(&tmp, "bad.txt", "first\ncafÃ©\n".as_bytes());
-        let issue = diagnose_file(&p, IoMode::Buffered).unwrap().expect("flagged");
+        let issue = diagnose_file(&p, IoMode::Buffered)
+            .unwrap()
+            .expect("flagged");
         assert!(issue.valid_in_detected_encoding);
         assert_eq!(issue.mojibake_matches.len(), 1);
         let m = &issue.mojibake_matches[0];
@@ -781,18 +797,16 @@ mod tests {
         // bytes are valid and the test is moot — assert with that in mind.
         let res = diagnose_file(&p, IoMode::Buffered).unwrap();
         if let Some(issue) = res
-            && !issue.valid_in_detected_encoding {
-                assert!(issue.mojibake_matches.is_empty());
-            }
+            && !issue.valid_in_detected_encoding
+        {
+            assert!(issue.mojibake_matches.is_empty());
+        }
     }
 
     #[test]
     fn allow_marker_suppresses_diagnosis() {
         let tmp = TempDir::new().unwrap();
-        let body = format!(
-            "// {}\nthis line has cafÃ© in it\n",
-            mojibake::ALLOW_MARKER
-        );
+        let body = format!("// {}\nthis line has cafÃ© in it\n", mojibake::ALLOW_MARKER);
         let p = write(&tmp, "ok.txt", body.as_bytes());
         let res = diagnose_file(&p, IoMode::Buffered).unwrap();
         assert!(res.is_none());
@@ -854,7 +868,10 @@ mod tests {
         )
         .unwrap();
         let s = String::from_utf8(buf).unwrap();
-        assert!(!s.contains("bad.txt"), "quiet should suppress per-file lines: {s}");
+        assert!(
+            !s.contains("bad.txt"),
+            "quiet should suppress per-file lines: {s}"
+        );
         assert!(s.contains("doctor: scanned"), "summary still emitted: {s}");
     }
 
@@ -926,8 +943,7 @@ mod tests {
         let now_text = String::from_utf8_lossy(&now);
         assert!(
             mojibake::scan(&now_text).matches.is_empty()
-                || mojibake::scan(&now_text).matches.len()
-                    < mojibake::scan(single).matches.len()
+                || mojibake::scan(&now_text).matches.len() < mojibake::scan(single).matches.len()
         );
     }
 
@@ -952,7 +968,10 @@ mod tests {
 
         assert_eq!(report.total_repaired, 0);
         let bak = format!("{}.bak", p.display());
-        assert!(!Path::new(&bak).exists(), "no .bak should be created for clean files");
+        assert!(
+            !Path::new(&bak).exists(),
+            "no .bak should be created for clean files"
+        );
     }
 
     #[test]
@@ -1028,8 +1047,18 @@ mod tests {
         )
         .unwrap();
         // .gitignore + kept.txt are scanned; ignored/ + *.log skipped.
-        assert!(report.issues.iter().all(|i| !i.path.to_string_lossy().contains("ignored")));
-        assert!(report.issues.iter().all(|i| !i.path.to_string_lossy().ends_with(".log")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| !i.path.to_string_lossy().contains("ignored"))
+        );
+        assert!(
+            report
+                .issues
+                .iter()
+                .all(|i| !i.path.to_string_lossy().ends_with(".log"))
+        );
         assert!(report.issues.iter().any(|i| i.path.ends_with("kept.txt")));
     }
 
@@ -1057,7 +1086,12 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.total_files_scanned, 1);
-        assert!(report.issues.iter().any(|i| i.path.to_string_lossy().ends_with("a.txt")));
+        assert!(
+            report
+                .issues
+                .iter()
+                .any(|i| i.path.to_string_lossy().ends_with("a.txt"))
+        );
     }
 
     /// Restore the previous working directory on drop.  Used to keep

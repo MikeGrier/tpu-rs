@@ -18,19 +18,14 @@
 //! so the resulting file inherits the standard write-time mojibake guard,
 //! atomic .bak handling, and encoding-preservation behaviour.
 
-use std::{
-    collections::BTreeMap,
-    fs,
-    path::Path,
-    sync::Arc,
-};
+use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
 
 use harrier::{encoding::SourceConfig, source::Source};
 
 use crate::{
+    IoMode,
     encoding::{BomPolicy, OutputEncoding},
     mojibake::WritePolicy,
-    IoMode,
 };
 
 /// Behaviour when the template references a token that is not in `vars`.
@@ -95,7 +90,10 @@ pub fn render_str(
                     if key.is_empty() {
                         return Err("render: empty `{{}}` placeholder is not allowed".into());
                     }
-                    if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+                    if !key
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+                    {
                         return Err(format!(
                             "render: invalid placeholder `{{{{ {key} }}}}`: token names may \
                              only contain ASCII letters, digits, `_`, or `-`"
@@ -138,9 +136,7 @@ pub fn render_str(
                     continue;
                 }
                 None => {
-                    return Err(
-                        "render: unterminated `{{` placeholder (no matching `}}`)".into()
-                    );
+                    return Err("render: unterminated `{{` placeholder (no matching `}}`)".into());
                 }
             }
         }
@@ -204,7 +200,10 @@ pub fn parse_var(arg: &str) -> Result<(String, String), String> {
     if k.is_empty() {
         return Err(format!("--var {arg:?}: KEY is empty"));
     }
-    if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+    if !k
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
         return Err(format!(
             "--var {arg:?}: KEY may only contain ASCII letters, digits, '_' or '-'"
         ));
@@ -233,9 +232,16 @@ pub fn run(
         }
         (None, None, Some(s)) => s,
         (None, None, None) => {
-            return Err("render: must supply --template, --template-file, or pipe a template on stdin".into());
+            return Err(
+                "render: must supply --template, --template-file, or pipe a template on stdin"
+                    .into(),
+            );
         }
-        _ => return Err("render: --template, --template-file, and stdin are mutually exclusive".into()),
+        _ => {
+            return Err(
+                "render: --template, --template-file, and stdin are mutually exclusive".into(),
+            );
+        }
     };
 
     let (rendered, report) = render_str(template, vars, missing)?;
@@ -270,7 +276,10 @@ mod tests {
     use super::*;
 
     fn vars(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
-        pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
     }
 
     #[test]

@@ -50,7 +50,10 @@ use harrier::{
 use regex::bytes::Regex;
 use tempfile::NamedTempFile;
 
-use crate::{mojibake::{check_write_does_not_introduce_mojibake, WritePolicy}, IoMode};
+use crate::{
+    IoMode,
+    mojibake::{WritePolicy, check_write_does_not_introduce_mojibake},
+};
 
 /// Decode a user-supplied replacement string into the raw bytes that will be
 /// passed to [`run`].
@@ -72,8 +75,7 @@ pub fn decode_replacement(s: &str, literal: bool) -> Result<Vec<u8>, String> {
     if literal {
         Ok(s.as_bytes().to_vec())
     } else {
-        crate::escape::decode_bytes(s)
-            .map_err(|e| format!("invalid escape in replacement: {e}"))
+        crate::escape::decode_bytes(s).map_err(|e| format!("invalid escape in replacement: {e}"))
     }
 }
 
@@ -266,10 +268,15 @@ pub fn run(
         crate::retry_io(|| fs::rename(file, &bak_path))?;
         let mut tmp = Some(tmp);
         crate::retry_io(|| {
-            let t = tmp.take().expect("persist retry: temp file already consumed");
+            let t = tmp
+                .take()
+                .expect("persist retry: temp file already consumed");
             match t.persist(file) {
                 Ok(_) => Ok(()),
-                Err(e) => { tmp = Some(e.file); Err(e.error) }
+                Err(e) => {
+                    tmp = Some(e.file);
+                    Err(e.error)
+                }
             }
         })
         .map_err(|e| {

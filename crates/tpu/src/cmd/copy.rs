@@ -10,9 +10,10 @@
 //! - **recursive directory copy** — `tpu copy --recursive SRC DST` copies
 //!   the contents of directory `SRC` into `DST`, creating intermediate
 //!   directories as needed;
-//! - **glob-driven copy** — when `SRC` contains `*`, `?`, `[`, or `{` it is
-//!   expanded against the current directory and every matching file is
-//!   copied into `DST` (which must be a directory).
+//! - **glob-driven copy** — when `SRC` contains `*`, `?`, `[`, or `{`, a
+//!   relative pattern is expanded against the current working directory, while
+//!   an absolute pattern is anchored at its non-glob prefix; every matching
+//!   file is copied into `DST` (which must be a directory).
 //!
 //! By default the walk continues past directories or files that cannot be
 //! read; each problem produces a warning record (NDJSON) or a stderr note
@@ -158,6 +159,9 @@ pub fn run(
             )
             .into());
         }
+        // `create_dir_all` is deferred until the first match so that a typo
+        // in the pattern doesn't leave an empty destination directory behind.
+        // If dest already exists we skip the create on the first match.
         let mut dest_ready = dest.exists();
 
         // Walk from the appropriate root: for absolute patterns the anchor
@@ -167,10 +171,19 @@ pub fn run(
         let anchor_str = first_meta.map(|i| &source[..i]).unwrap_or(source);
         let anchor_path = Path::new(anchor_str);
         let (walk_root, absolute_walk) = if anchor_path.is_absolute() {
-            let root = anchor_path
-                .parent()
-                .filter(|p| !p.as_os_str().is_empty())
-                .unwrap_or(anchor_path);
+            // When the anchor_str already ends with a path separator the Path
+            // already represents the directory to search; calling `.parent()`
+            // would walk one level too high (e.g. `/repo/src/` → `/repo`).
+            let ends_with_sep =
+                anchor_str.ends_with('/') || anchor_str.ends_with(std::path::MAIN_SEPARATOR);
+            let root = if ends_with_sep {
+                anchor_path
+            } else {
+                anchor_path
+                    .parent()
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .unwrap_or(anchor_path)
+            };
             (root.to_path_buf(), true)
         } else {
             (PathBuf::from("."), false)
@@ -209,6 +222,8 @@ pub fn run(
                 None => continue,
             };
             matched += 1;
+            // Create the destination directory on the first match so that a
+            // no-match run leaves no empty directory behind.
             if !dest_ready {
                 fs::create_dir_all(dest).map_err(|e| {
                     format!("copy: cannot create destination {}: {e}", dest.display())
@@ -266,9 +281,8 @@ pub fn run(
             }
         }
         // Directory copy: walk SRC, mirror structure under DEST.
-        fs::create_dir_all(dest).map_err(|e| {
-            format!("copy: cannot create destination {}: {e}", dest.display())
-        })?;
+        fs::create_dir_all(dest)
+            .map_err(|e| format!("copy: cannot create destination {}: {e}", dest.display()))?;
         let walker = WalkDir::new(src_path).into_iter();
         for entry in walker {
             let entry = match entry {
@@ -299,9 +313,7 @@ pub fn run(
                 if let Err(e) = fs::create_dir_all(&target) {
                     report.warnings += 1;
                     if matches!(opts.on_error, OnError::Fail) {
-                        return Err(
-                            format!("copy: mkdir {}: {e}", target.display()).into()
-                        );
+                        return Err(format!("copy: mkdir {}: {e}", target.display()).into());
                     }
                     let _ = shell.warn(format!("copy: mkdir {}: {e}", target.display()));
                 }
@@ -319,19 +331,29 @@ pub fn run(
     let target: PathBuf = if dest.is_dir() {
         match src_path.file_name() {
             Some(n) => dest.join(n),
-            None => return Err(format!("copy: source has no filename: {}", src_path.display()).into()),
+            None => {
+                return Err(format!("copy: source has no filename: {}", src_path.display()).into());
+            }
         }
     } else {
         dest.to_path_buf()
     };
     if let Some(parent) = target.parent() {
         if !parent.as_os_str().is_empty() {
-            fs::create_dir_all(parent).map_err(|e| {
-                format!("copy: cannot create parent {}: {e}", parent.display())
-            })?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("copy: cannot create parent {}: {e}", parent.display()))?;
         }
     }
-    copy_one(src_path, &target, &CopyOptions { on_error: OnError::Fail, ..opts }, shell, &mut report)?;
+    copy_one(
+        src_path,
+        &target,
+        &CopyOptions {
+            on_error: OnError::Fail,
+            ..opts
+        },
+        shell,
+        &mut report,
+    )?;
     Ok(report)
 }
 
@@ -375,60 +397,69 @@ fn copy_one(
         report.skipped += 1;
         return Ok(());
     }
-    if dst.exists() && opts.overwrite {
-        // Atomic overwrite: copy to a temp file in the same directory, then
-        // rename over the destination.  This prevents a failed copy (e.g. disk
-        // full, transient read error) from leaving the existing destination
-        // partially written or truncated.
-        let tmp = {
+    // Shared helper: copy src → dst atomically via a temp file + rename so
+    // that a failed write (disk full, transient read error) never leaves a
+    // partial or corrupt destination file behind.  The temp file is created in
+    // the same directory as `dst` via `tempfile::Builder` so that the final
+    // rename is on the same filesystem and is therefore atomic.
+    let do_atomic_copy =
+        |report: &mut CopyReport, shell: &mut Shell| -> Result<(), Box<dyn std::error::Error>> {
             let parent = dst.parent().unwrap_or_else(|| Path::new("."));
-            let name = dst
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "file".to_string());
-            parent.join(format!(".tpu_tmp_{name}_{}", std::process::id()))
-        };
-        match crate::retry_io(|| fs::copy(src, &tmp)) {
-            Ok(_) => {
-                if let Err(e) = rename_replacing(&tmp, dst) {
+            // Create a uniquely-named temp file in the same directory as `dst` so
+            // the rename is always on the same filesystem.  We `keep()` immediately
+            // to release the file handle (avoiding Windows sharing violations when
+            // `fs::copy` opens the same path for writing) while still guaranteeing
+            // the name is unique on disk.
+            let (_, tmp) = tempfile::Builder::new()
+                .prefix(".tpu_tmp_")
+                .tempfile_in(parent)
+                .map_err(|e| {
+                    format!(
+                        "copy: {} -> {}: cannot create temp file: {e}",
+                        src.display(),
+                        dst.display()
+                    )
+                })?
+                .keep()
+                .map_err(|e| {
+                    format!(
+                        "copy: {} -> {}: cannot persist temp file: {e}",
+                        src.display(),
+                        dst.display()
+                    )
+                })?;
+            match crate::retry_io(|| fs::copy(src, &tmp)) {
+                Ok(_) => {
+                    if let Err(e) = crate::retry_io(|| rename_replacing(&tmp, dst)) {
+                        let _ = fs::remove_file(&tmp);
+                        let msg = format!("copy: {} -> {}: {e}", src.display(), dst.display());
+                        report.warnings += 1;
+                        if matches!(opts.on_error, OnError::Fail) {
+                            return Err(msg.into());
+                        }
+                        let _ = shell.warn(msg);
+                        return Ok(());
+                    }
+                    report.copied += 1;
+                }
+                Err(e) => {
                     let _ = fs::remove_file(&tmp);
-                    let msg = format!("copy: {} -> {}: {e}", src.display(), dst.display());
                     report.warnings += 1;
+                    let msg = format!("copy: {} -> {}: {e}", src.display(), dst.display());
                     if matches!(opts.on_error, OnError::Fail) {
                         return Err(msg.into());
                     }
                     let _ = shell.warn(msg);
-                    return Ok(());
                 }
-                report.copied += 1;
             }
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                report.warnings += 1;
-                let msg = format!("copy: {} -> {}: {e}", src.display(), dst.display());
-                if matches!(opts.on_error, OnError::Fail) {
-                    return Err(msg.into());
-                }
-                let _ = shell.warn(msg);
-            }
-        }
-        return Ok(());
-    }
-    match crate::retry_io(|| fs::copy(src, dst)) {
-        Ok(_) => {
-            report.copied += 1;
             Ok(())
-        }
-        Err(e) => {
-            report.warnings += 1;
-            let msg = format!("copy: {} -> {}: {e}", src.display(), dst.display());
-            if matches!(opts.on_error, OnError::Fail) {
-                return Err(msg.into());
-            }
-            let _ = shell.warn(msg);
-            Ok(())
-        }
+        };
+    if dst.exists() && opts.overwrite {
+        return do_atomic_copy(&mut *report, shell);
     }
+    // New file: also use temp+rename to avoid leaving a corrupt partial file
+    // if the copy fails after the destination has been created/opened.
+    do_atomic_copy(&mut *report, shell)
 }
 
 /// Rename `from` to `to`, replacing `to` if it already exists.
@@ -444,7 +475,7 @@ fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
     #[cfg(windows)]
     {
         use std::os::windows::ffi::OsStrExt;
-        use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING};
+        use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MoveFileExW};
         let from_w: Vec<u16> = from
             .as_os_str()
             .encode_wide()

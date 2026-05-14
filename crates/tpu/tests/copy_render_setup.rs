@@ -71,11 +71,7 @@ fn copy_directory_recursive() {
     write_file(&src.join("a.txt"), b"A");
     write_file(&src.join("sub").join("b.txt"), b"B");
 
-    ok(tpu()
-        .arg("copy")
-        .arg("--recursive")
-        .arg(&src)
-        .arg(&dst));
+    ok(tpu().arg("copy").arg("--recursive").arg(&src).arg(&dst));
     assert_eq!(fs::read(dst.join("a.txt")).unwrap(), b"A");
     assert_eq!(fs::read(dst.join("sub").join("b.txt")).unwrap(), b"B");
 }
@@ -114,7 +110,10 @@ fn copy_glob_copies_matching_files_flat_into_dest() {
     assert_eq!(fs::read(dest_dir.join("a.txt")).unwrap(), b"A");
     assert_eq!(fs::read(dest_dir.join("b.txt")).unwrap(), b"B");
     // Non-matching file must not be copied.
-    assert!(!dest_dir.join("skip.bin").exists(), "skip.bin must not be in dest");
+    assert!(
+        !dest_dir.join("skip.bin").exists(),
+        "skip.bin must not be in dest"
+    );
 }
 
 #[test]
@@ -129,7 +128,10 @@ fn copy_glob_no_match_errors() {
         .arg(&dest_dir)
         .output()
         .unwrap();
-    assert!(!o.status.success(), "expected non-zero exit for no-match glob");
+    assert!(
+        !o.status.success(),
+        "expected non-zero exit for no-match glob"
+    );
     let stderr = String::from_utf8_lossy(&o.stderr);
     assert!(
         stderr.contains("matched no files"),
@@ -152,8 +154,10 @@ fn render_inline_template_substitutes_tokens() {
         .arg(&out)
         .arg("--template")
         .arg("Hello, {{NAME}}! Today is {{DAY}}.")
-        .arg("--var").arg("NAME=World")
-        .arg("--var").arg("DAY=Friday"));
+        .arg("--var")
+        .arg("NAME=World")
+        .arg("--var")
+        .arg("DAY=Friday"));
     assert_eq!(
         fs::read_to_string(&out).unwrap(),
         "Hello, World! Today is Friday.",
@@ -171,7 +175,8 @@ fn render_template_file_with_whitespace_in_braces() {
         .arg(&out)
         .arg("--template-file")
         .arg(&tmpl)
-        .arg("--var").arg("NAME=ok"));
+        .arg("--var")
+        .arg("NAME=ok"));
     assert_eq!(fs::read_to_string(&out).unwrap(), "v=ok");
 }
 
@@ -197,8 +202,10 @@ fn render_missing_empty_substitutes_blank() {
     ok(tpu()
         .arg("render")
         .arg(&out)
-        .arg("--template").arg("hi {{NAME}}")
-        .arg("--missing").arg("empty"));
+        .arg("--template")
+        .arg("hi {{NAME}}")
+        .arg("--missing")
+        .arg("empty"));
     assert_eq!(fs::read_to_string(&out).unwrap(), "hi ");
 }
 
@@ -209,8 +216,10 @@ fn render_missing_leave_keeps_placeholder() {
     ok(tpu()
         .arg("render")
         .arg(&out)
-        .arg("--template").arg("hi {{NAME}}")
-        .arg("--missing").arg("leave"));
+        .arg("--template")
+        .arg("hi {{NAME}}")
+        .arg("--missing")
+        .arg("leave"));
     assert_eq!(fs::read_to_string(&out).unwrap(), "hi {{NAME}}");
 }
 
@@ -220,8 +229,14 @@ fn render_missing_leave_keeps_placeholder() {
 fn setup_print_emits_marker_block() {
     let out = ok(tpu().arg("setup")).stdout;
     let s = String::from_utf8_lossy(&out);
-    assert!(s.contains("<!-- tpu-mcp:setup:begin -->"), "begin marker missing: {s}");
-    assert!(s.contains("<!-- tpu-mcp:setup:end -->"), "end marker missing");
+    assert!(
+        s.contains("<!-- tpu-mcp:setup:begin -->"),
+        "begin marker missing: {s}"
+    );
+    assert!(
+        s.contains("<!-- tpu-mcp:setup:end -->"),
+        "end marker missing"
+    );
     assert!(s.contains("tpu_copy_file"));
     assert!(s.contains("tpu_render_file"));
 }
@@ -280,14 +295,20 @@ fn find_warn_mode_continues_past_missing_path() {
     // With default --on-error=warn, missing path should not abort the search.
     let out = tpu()
         .arg("find")
-        .arg("--pattern").arg("hit")
-        .arg("--path").arg(missing.to_str().unwrap())
-        .arg("--path").arg(real.to_str().unwrap())
+        .arg("--pattern")
+        .arg("hit")
+        .arg("--path")
+        .arg(missing.to_str().unwrap())
+        .arg("--path")
+        .arg(real.to_str().unwrap())
         .output()
         .unwrap();
     assert!(out.status.success(), "warn mode should not fail");
     let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("hit me"), "match from real file expected: {stdout}");
+    assert!(
+        stdout.contains("hit me"),
+        "match from real file expected: {stdout}"
+    );
 }
 
 #[test]
@@ -298,17 +319,22 @@ fn find_fail_mode_aborts_on_missing_path() {
     let missing = dir.path().join("does_not_exist");
 
     let out = tpu()
-        .arg("--on-error").arg("fail")
+        .arg("--on-error")
+        .arg("fail")
         .arg("find")
-        .arg("--pattern").arg("hit")
-        .arg("--path").arg(missing.to_str().unwrap())
-        .arg("--path").arg(real.to_str().unwrap())
+        .arg("--pattern")
+        .arg("hit")
+        .arg("--path")
+        .arg(missing.to_str().unwrap())
+        .arg("--path")
+        .arg(real.to_str().unwrap())
         .output()
         .unwrap();
-    assert!(!out.status.success(), "fail mode must abort on missing path");
+    assert!(
+        !out.status.success(),
+        "fail mode must abort on missing path"
+    );
 }
-
-
 
 // ─── Windows-only: recursive copy through a DACL-denied subdirectory ────────
 
@@ -347,12 +373,11 @@ impl DaclDenyGuard {
         use std::os::windows::ffi::OsStrExt as _;
         use windows_sys::Win32::{
             Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+            Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT, SetSecurityInfo},
             Security::{
-                AddAccessDeniedAce, GetLengthSid, GetTokenInformation, InitializeAcl,
-                TokenUser, ACL, ACL_REVISION, DACL_SECURITY_INFORMATION, TOKEN_QUERY,
-                TOKEN_USER,
+                ACL, ACL_REVISION, AddAccessDeniedAce, DACL_SECURITY_INFORMATION, GetLengthSid,
+                GetTokenInformation, InitializeAcl, TOKEN_QUERY, TOKEN_USER, TokenUser,
             },
-            Security::Authorization::{GetSecurityInfo, SetSecurityInfo, SE_FILE_OBJECT},
             Storage::FileSystem::{
                 CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE, FILE_SHARE_READ,
                 FILE_SHARE_WRITE, OPEN_EXISTING,
@@ -416,13 +441,7 @@ impl DaclDenyGuard {
                 "OpenProcessToken failed"
             );
             let mut needed: u32 = 0;
-            GetTokenInformation(
-                token,
-                TokenUser,
-                std::ptr::null_mut(),
-                0,
-                &mut needed,
-            );
+            GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed);
             let mut token_buf = vec![0u64; (needed as usize + 7) / 8];
             assert_ne!(
                 GetTokenInformation(
@@ -478,7 +497,11 @@ impl DaclDenyGuard {
                 "SetSecurityInfo (apply deny) failed"
             );
 
-            DaclDenyGuard { handle, orig_dacl, sd }
+            DaclDenyGuard {
+                handle,
+                orig_dacl,
+                sd,
+            }
         }
     }
 }
@@ -488,8 +511,8 @@ impl Drop for DaclDenyGuard {
     fn drop(&mut self) {
         use windows_sys::Win32::{
             Foundation::{CloseHandle, LocalFree},
+            Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo},
             Security::DACL_SECURITY_INFORMATION,
-            Security::Authorization::{SetSecurityInfo, SE_FILE_OBJECT},
         };
         unsafe {
             // Restore the original DACL through the still-open WRITE_DAC handle.
@@ -535,8 +558,10 @@ fn copy_recursive_warn_mode_continues_past_denied_subdir() {
     let _guard = DaclDenyGuard::deny_listing(&a.join("b"));
 
     let out = tpu()
-        .arg("--on-error").arg("warn")
-        .arg("copy").arg("--recursive")
+        .arg("--on-error")
+        .arg("warn")
+        .arg("copy")
+        .arg("--recursive")
         .arg(&a)
         .arg(&dst)
         .output()
@@ -578,8 +603,10 @@ fn copy_recursive_fail_mode_aborts_on_denied_subdir() {
     let _guard = DaclDenyGuard::deny_listing(&a.join("b"));
 
     let out = tpu()
-        .arg("--on-error").arg("fail")
-        .arg("copy").arg("--recursive")
+        .arg("--on-error")
+        .arg("fail")
+        .arg("copy")
+        .arg("--recursive")
         .arg(&a)
         .arg(&dst)
         .output()

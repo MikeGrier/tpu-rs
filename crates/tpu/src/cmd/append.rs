@@ -32,7 +32,10 @@ use harrier::{
     source::Source,
 };
 
-use crate::{mojibake::{check_write_does_not_introduce_mojibake, WritePolicy}, IoMode};
+use crate::{
+    IoMode,
+    mojibake::{WritePolicy, check_write_does_not_introduce_mojibake},
+};
 
 /// Run the `append` subcommand.
 ///
@@ -156,10 +159,15 @@ pub fn run(
     crate::retry_io(|| fs::rename(file, &bak))?;
     let mut tmp = Some(tmp);
     crate::retry_io(|| {
-        let t = tmp.take().expect("persist retry: temp file already consumed");
+        let t = tmp
+            .take()
+            .expect("persist retry: temp file already consumed");
         match t.persist(file) {
             Ok(_) => Ok(()),
-            Err(e) => { tmp = Some(e.file); Err(e.error) }
+            Err(e) => {
+                tmp = Some(e.file);
+                Err(e.error)
+            }
         }
     })
     .map_err(|e| {

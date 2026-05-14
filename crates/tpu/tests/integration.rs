@@ -1612,11 +1612,7 @@ fn replace_default_capture_group_with_newline_escape() {
     // so users can write things like `$1\n$2` to inject a newline between
     // captures.
     let (dir, f) = cp("singleline.txt");
-    ok(tpu()
-        .arg("replace")
-        .arg(&f)
-        .arg("(hel)(lo)")
-        .arg("$1\\n$2"));
+    ok(tpu().arg("replace").arg(&f).arg("(hel)(lo)").arg("$1\\n$2"));
     let content = fs::read(&f).unwrap();
     assert!(
         content.windows(6).any(|w| w == b"hel\nlo"),
@@ -7847,10 +7843,7 @@ fn cn_count_json_default_emits_ndjson_metrics() {
         "UTF-8",
         "encoding must be UTF-8"
     );
-    assert!(
-        !data[1]["value"].as_bool().unwrap(),
-        "bom must be false"
-    );
+    assert!(!data[1]["value"].as_bool().unwrap(), "bom must be false");
     assert_eq!(
         data[2]["value"].as_str().unwrap(),
         "LF",
