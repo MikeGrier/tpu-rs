@@ -45,6 +45,7 @@ use crate::IoMode;
 // ── Public result type ────────────────────────────────────────────────────────
 
 /// Result returned by [`run`].
+#[derive(Debug)]
 pub struct FindResult {
     /// Total number of matching lines across all files searched.
     pub total_matches: usize,
@@ -459,6 +460,7 @@ pub fn run_with_policy(
     let multi_file = files.len() > 1;
 
     let mut total_matches = 0usize;
+    let mut files_ok = 0usize;
     for file in &files {
         let prefix: Option<String> = if multi_file {
             Some(file.display().to_string())
@@ -479,7 +481,10 @@ pub fn run_with_policy(
             io_mode,
         );
         match result {
-            Ok(n) => total_matches += n,
+            Ok(n) => {
+                total_matches += n;
+                files_ok += 1;
+            }
             Err(e) => {
                 let msg = format!("find: cannot search {}: {e}", file.display());
                 // A single explicit file has no other entries to fall back on;
@@ -491,6 +496,15 @@ pub fn run_with_policy(
                 warnings_out.push(msg);
             }
         }
+    }
+
+    // If every file in a multi-file search failed, returning Ok with
+    // total_matches == 0 would silently look like a no-match result.
+    // Return an error instead so callers know nothing was searched.
+    if files_ok == 0 && !files.is_empty() {
+        return Err(
+            "find: no files could be searched; all entries were missing or unreadable".into(),
+        );
     }
 
     // Total count line is only emitted when more than one file was matched.
@@ -506,6 +520,46 @@ pub fn run_with_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_with_policy_warn_mode_all_missing_returns_error() {
+        // When every supplied file is unreadable/missing in warn mode,
+        // run_with_policy must error rather than silently returning Ok with
+        // total_matches == 0 (which would look like a legitimate no-match).
+        let mut out: Vec<u8> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let result = run_with_policy(
+            &[
+                "definitely_does_not_exist_a.txt",
+                "definitely_does_not_exist_b.txt",
+            ],
+            &["pattern"],
+            false,
+            false,
+            false,
+            false,
+            false,
+            0,
+            0,
+            false,
+            false,
+            &mut out,
+            IoMode::Buffered,
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        );
+        assert!(
+            result.is_err(),
+            "expected error when all files are unreadable"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no files could be searched"),
+            "error should mention 'no files could be searched', got: {msg}"
+        );
+        // Individual failures should have been recorded as warnings.
+        assert_eq!(warnings.len(), 2);
+    }
 
     // Helper: run search against in-memory bytes written to a temp file,
     // return the output as a String.
