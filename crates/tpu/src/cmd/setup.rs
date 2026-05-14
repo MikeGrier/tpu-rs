@@ -166,7 +166,15 @@ pub fn inject(
     let (cow, _) = encoding.decode_without_bom_handling(&view.bytes);
     let existing = cow.into_owned();
 
-    let (new_text, replaced) = match (existing.find(BEGIN_MARKER), existing.find(END_MARKER)) {
+    // Search for END_MARKER only within the span starting at BEGIN, so an
+    // occurrence of END_MARKER inside the block's prose (e.g. inside a table
+    // row describing the `tpu setup` command) doesn't trick the injector into
+    // treating it as the closing boundary.
+    let begin_opt = existing.find(BEGIN_MARKER);
+    let end_opt = begin_opt
+        .and_then(|b| existing[b..].find(END_MARKER).map(|rel| b + rel))
+        .or_else(|| existing.find(END_MARKER));
+    let (new_text, replaced) = match (begin_opt, end_opt) {
         (Some(b), Some(e)) if e > b => {
             // Replace from begin..(end + END_MARKER.len()).
             let end = e + END_MARKER.len();

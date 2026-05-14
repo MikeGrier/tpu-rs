@@ -256,7 +256,7 @@ pub fn run(
             })?;
         }
     }
-    copy_one(src_path, &target, &opts, shell, &mut report)?;
+    copy_one(src_path, &target, &CopyOptions { on_error: OnError::Fail, ..opts }, shell, &mut report)?;
     Ok(report)
 }
 

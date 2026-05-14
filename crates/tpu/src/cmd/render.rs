@@ -95,6 +95,13 @@ pub fn render_str(
                     if key.is_empty() {
                         return Err("render: empty `{{}}` placeholder is not allowed".into());
                     }
+                    if !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+                        return Err(format!(
+                            "render: invalid placeholder `{{{{ {key} }}}}`: token names may \
+                             only contain ASCII letters, digits, `_`, or `-`"
+                        )
+                        .into());
+                    }
                     match vars.get(key) {
                         Some(v) => {
                             out.push_str(v);

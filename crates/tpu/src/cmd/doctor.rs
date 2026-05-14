@@ -554,10 +554,14 @@ pub fn run_with_policy(
             Ok(Some(issue)) => report.issues.push(issue),
             Ok(None) => {}
             Err(e) => {
-                // Emit a per-file warning but keep going so one unreadable
-                // file doesn't abort a large scan.
-                if !options.quiet && options.format == DoctorFormat::Human {
-                    writeln!(out, "doctor: {}: {}", path.display(), e)?;
+                match on_error {
+                    crate::cmd::copy::OnError::Fail => return Err(e),
+                    crate::cmd::copy::OnError::Warn => {
+                        warnings_out.push(format!("doctor: {}: {e}", path.display()));
+                        if !options.quiet && options.format == DoctorFormat::Human {
+                            writeln!(out, "doctor: {}: {}", path.display(), e)?;
+                        }
+                    }
                 }
             }
         }

@@ -57,8 +57,6 @@ When you must fall back to PowerShell, never round-trip non-ASCII files
 through `Get-Content` / `Set-Content` — read and write via
 `[System.IO.File]::ReadAllBytes` / `WriteAllBytes` and validate with
 `tools/check-encoding.ps1` afterwards.
-<!-- tpu-mcp:setup:end -->`, into
-  `.github/copilot-instructions.md`.
 <!-- tpu-mcp:setup:end -->
 
 ## Tool preference (use the first available)

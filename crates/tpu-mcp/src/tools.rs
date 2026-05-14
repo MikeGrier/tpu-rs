@@ -1992,11 +1992,11 @@ pub struct ServerConfig {
 
     /// How verbose the per-call result of tree-walking tools should be.
     ///
-    /// `EachFile` (default) returns the full per-entry log along with the
-    /// summary counts. `Summary` suppresses the per-entry log and returns
-    /// only the aggregate counts (and a single tail message naming the
-    /// number of warnings). Useful for clients that want a quieter trail
-    /// in the MCP output channel.
+    /// `EachFile` (default) returns the per-entry warning log (inaccessible
+    /// paths and other walk errors) along with the summary counts. `Summary`
+    /// suppresses the per-entry warning log and returns only the aggregate
+    /// counts (and a single tail message naming the number of warnings).
+    /// Useful for clients that want a quieter trail in the MCP output channel.
     pub progress_detail: ProgressDetail,
 }
 
@@ -2004,7 +2004,7 @@ pub struct ServerConfig {
 /// JSON tool result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProgressDetail {
-    /// Include the full `log` of per-entry warnings / progress lines.
+    /// Include the `log` of per-entry warnings (inaccessible paths, skipped entries).
     #[default]
     EachFile,
     /// Suppress the per-entry log; emit only summary counts.
