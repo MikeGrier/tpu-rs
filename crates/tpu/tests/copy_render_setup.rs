@@ -97,6 +97,46 @@ fn copy_skip_existing_unless_overwrite() {
     assert_eq!(fs::read(&dst).unwrap(), b"new");
 }
 
+#[test]
+fn copy_glob_copies_matching_files_flat_into_dest() {
+    let dir = TempDir::new().unwrap();
+    let src_dir = dir.path().join("src");
+    let dest_dir = dir.path().join("dest");
+    write_file(&src_dir.join("a.txt"), b"A");
+    write_file(&src_dir.join("b.txt"), b"B");
+    write_file(&src_dir.join("skip.bin"), b"BINARY");
+
+    // Pass an absolute-path glob so the pattern is unambiguous regardless
+    // of the test process's working directory.
+    let pattern = format!("{}/*.txt", src_dir.display());
+    ok(tpu().arg("copy").arg(&pattern).arg(&dest_dir));
+
+    assert_eq!(fs::read(dest_dir.join("a.txt")).unwrap(), b"A");
+    assert_eq!(fs::read(dest_dir.join("b.txt")).unwrap(), b"B");
+    // Non-matching file must not be copied.
+    assert!(!dest_dir.join("skip.bin").exists(), "skip.bin must not be in dest");
+}
+
+#[test]
+fn copy_glob_no_match_errors() {
+    let dir = TempDir::new().unwrap();
+    let dest_dir = dir.path().join("dest");
+    let pattern = format!("{}/*.nonexistent", dir.path().display());
+
+    let o = tpu()
+        .arg("copy")
+        .arg(&pattern)
+        .arg(&dest_dir)
+        .output()
+        .unwrap();
+    assert!(!o.status.success(), "expected non-zero exit for no-match glob");
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("matched no files"),
+        "expected 'matched no files' in stderr; got: {stderr}"
+    );
+}
+
 // ─── render ──────────────────────────────────────────────────────────────────
 
 #[test]

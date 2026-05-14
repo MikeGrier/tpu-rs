@@ -926,8 +926,8 @@ pub fn list() -> Value {
                  Prefer this over PowerShell Copy-Item / shell `cp` when working in a \
                  workspace that uses tpu-mcp — copy is resilient by default: per-entry \
                  errors (unreadable directories, permission denied, write failures) \
-                 produce a streamed warning record and the operation continues with \
-                 the next entry. Set on_error:'fail' to restore the legacy 'abort on \
+                 produce a warning record (returned in the final JSON result) and \
+                 the operation continues with the next entry. Set on_error:'fail' to restore the legacy 'abort on \
                  first error' behaviour.\n\n\
                  Modes:\n\
                    single file       — `source` is a file path, `dest` is a file path \
@@ -2001,8 +2001,9 @@ pub struct ServerConfig {
     /// Default policy for tools that walk file trees (`tpu_find`,
     /// `tpu_copy_file`) when an entry cannot be read or written.
     ///
-    /// `Warn` (default) emits a streamed warning record and continues with
-    /// the next entry. `Fail` aborts the operation on the first error.
+    /// `Warn` (default) emits a warning record (included in the final JSON
+    /// result) and continues with the next entry. `Fail` aborts the operation
+    /// on the first error.
     /// Per-call `on_error` arguments override this default.
     pub default_on_error: tpu::cmd::copy::OnError,
 

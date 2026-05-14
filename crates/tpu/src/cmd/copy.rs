@@ -177,6 +177,12 @@ pub fn run(
         } else {
             (PathBuf::from("."), false)
         };
+        // Track how many entries the glob matched regardless of whether each
+        // copy succeeded or was skipped.  This is kept separate from
+        // `report.copied + report.skipped` so that warn-mode failures (which
+        // increment `report.warnings` but not copied/skipped) don't falsely
+        // trip the no-match guard below.
+        let mut matched: usize = 0;
         for entry in WalkDir::new(&walk_root) {
             let entry = match entry {
                 Ok(e) => e,
@@ -204,13 +210,14 @@ pub fn run(
                 Some(n) => n,
                 None => continue,
             };
+            matched += 1;
             let target = dest.join(leaf);
             copy_one(entry.path(), &target, &opts, shell, &mut report)?;
         }
         // A glob that matched nothing is always an error — a typo in the
         // pattern would otherwise silently create an empty destination
         // directory and exit successfully.
-        if report.copied == 0 && report.skipped == 0 {
+        if matched == 0 {
             return Err(format!("copy: glob {source:?} matched no files").into());
         }
         return Ok(report);
