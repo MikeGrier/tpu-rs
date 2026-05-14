@@ -101,7 +101,7 @@
                     "type": "string",
                     "enum": ["each-file", "summary"],
                     "enumDescriptions": [
-                        "Include a per-operation warning log: each inaccessible or skipped path appears as a separate entry (warnings only; successful copies are not individually logged).",
+                        "Include a per-operation warning log: each inaccessible path or walk error appears as a separate entry (successfully skipped destinations are counted in the summary only, not individually logged).",
                         "Suppress per-entry warning details and surface only a summary count at the end of the operation."
                     ],
                     "default": "each-file",

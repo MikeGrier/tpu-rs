@@ -379,7 +379,7 @@ impl DaclDenyGuard {
                 0,
                 &mut needed,
             );
-            let mut token_buf = vec![0u8; needed as usize];
+            let mut token_buf = vec![0u64; (needed as usize + 7) / 8];
             assert_ne!(
                 GetTokenInformation(
                     token,

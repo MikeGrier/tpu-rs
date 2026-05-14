@@ -119,7 +119,12 @@ pub fn render_str(
                                     // full template so the diagnostic can
                                     // list every missing key at once.
                                 }
-                                MissingPolicy::Empty => {}
+                                MissingPolicy::Empty => {
+                                    // Empty substitution counts the same as a
+                                    // successful substitution: the placeholder
+                                    // was consumed and replaced (with "").
+                                    report.substitutions += 1;
+                                }
                                 MissingPolicy::Leave => {
                                     // Preserve the original slice (including any
                                     // whitespace inside the braces) rather than

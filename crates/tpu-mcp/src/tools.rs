@@ -1033,7 +1033,11 @@ pub fn list() -> Value {
                              Default: false."
                     }
                 },
-                "required": ["output"]
+                "required": ["output"],
+                "description":
+                    "Exactly one of `template` or `template_file` must also be provided \
+                     alongside `output`; calls that omit both will fail at runtime with \
+                     a descriptive error."
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": false }
         },
@@ -2006,7 +2010,7 @@ pub struct ServerConfig {
 /// JSON tool result.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ProgressDetail {
-    /// Include the `log` of per-entry warnings (inaccessible paths, skipped entries).
+    /// Include the `log` of per-entry warnings (inaccessible paths and walk errors).
     #[default]
     EachFile,
     /// Suppress the per-entry log; emit only summary counts.

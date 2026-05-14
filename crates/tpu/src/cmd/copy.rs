@@ -291,6 +291,29 @@ pub fn run(
     Ok(report)
 }
 
+/// Returns `true` when `a` and `b` refer to the same underlying file.
+///
+/// On Unix this compares the (device, inode) pair so hard-linked paths are
+/// correctly identified as identical.  On other platforms the check falls back
+/// to canonical-path comparison, which misses hard links but correctly handles
+/// the common case of the same file reached through different symlinks or
+/// relative paths.
+fn is_same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let (Ok(ma), Ok(mb)) = (a.metadata(), b.metadata()) {
+            return ma.dev() == mb.dev() && ma.ino() == mb.ino();
+        }
+    }
+    // Fallback: canonical paths.
+    if let (Ok(ca), Ok(cb)) = (a.canonicalize(), b.canonicalize()) {
+        ca == cb
+    } else {
+        false
+    }
+}
+
 fn copy_one(
     src: &Path,
     dst: &Path,
@@ -298,16 +321,53 @@ fn copy_one(
     shell: &mut Shell,
     report: &mut CopyReport,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Same-file guard: silently skip if src and dst resolve to the same path,
-    // rather than truncating the file by overwriting it with itself.
-    if let (Ok(a), Ok(b)) = (src.canonicalize(), dst.canonicalize()) {
-        if a == b {
-            report.skipped += 1;
-            return Ok(());
-        }
+    // Same-file guard: silently skip if src and dst refer to the same
+    // underlying file (including hard-linked paths).
+    if is_same_file(src, dst) {
+        report.skipped += 1;
+        return Ok(());
     }
     if dst.exists() && !opts.overwrite {
         report.skipped += 1;
+        return Ok(());
+    }
+    if dst.exists() && opts.overwrite {
+        // Atomic overwrite: copy to a temp file in the same directory, then
+        // rename over the destination.  This prevents a failed copy (e.g. disk
+        // full, transient read error) from leaving the existing destination
+        // partially written or truncated.
+        let tmp = {
+            let parent = dst.parent().unwrap_or_else(|| Path::new("."));
+            let name = dst
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "file".to_string());
+            parent.join(format!(".tpu_tmp_{name}_{}", std::process::id()))
+        };
+        match fs::copy(src, &tmp) {
+            Ok(_) => {
+                if let Err(e) = fs::rename(&tmp, dst) {
+                    let _ = fs::remove_file(&tmp);
+                    let msg = format!("copy: {} -> {}: {e}", src.display(), dst.display());
+                    report.warnings += 1;
+                    if matches!(opts.on_error, OnError::Fail) {
+                        return Err(msg.into());
+                    }
+                    let _ = shell.warn(msg);
+                    return Ok(());
+                }
+                report.copied += 1;
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                report.warnings += 1;
+                let msg = format!("copy: {} -> {}: {e}", src.display(), dst.display());
+                if matches!(opts.on_error, OnError::Fail) {
+                    return Err(msg.into());
+                }
+                let _ = shell.warn(msg);
+            }
+        }
         return Ok(());
     }
     match fs::copy(src, dst) {
