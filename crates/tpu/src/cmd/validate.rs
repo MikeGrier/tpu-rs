@@ -640,52 +640,60 @@ mod tests {
     #[test]
     fn text_validator_line_contains_pass() {
         let (_f, path) = utf8_lf_file("hello world\n");
-        assert!(run_text_validator(
-            &ValidateSelector::LineContains(1),
-            "world",
-            &path,
-            IoMode::Mmap
-        )
-        .is_ok());
+        assert!(
+            run_text_validator(
+                &ValidateSelector::LineContains(1),
+                "world",
+                &path,
+                IoMode::Mmap
+            )
+            .is_ok()
+        );
     }
 
     // text: line-contains:N full line also passes (substring)
     #[test]
     fn text_validator_line_contains_full_line_pass() {
         let (_f, path) = utf8_lf_file("hello\n");
-        assert!(run_text_validator(
-            &ValidateSelector::LineContains(1),
-            "hello",
-            &path,
-            IoMode::Mmap
-        )
-        .is_ok());
+        assert!(
+            run_text_validator(
+                &ValidateSelector::LineContains(1),
+                "hello",
+                &path,
+                IoMode::Mmap
+            )
+            .is_ok()
+        );
     }
 
     // text: line-contains:N substring not found gives error
     #[test]
     fn text_validator_line_contains_not_found() {
         let (_f, path) = utf8_lf_file("hello world\n");
-        assert!(run_text_validator(
-            &ValidateSelector::LineContains(1),
-            "rust",
-            &path,
-            IoMode::Mmap
-        )
-        .is_err());
+        assert!(
+            run_text_validator(
+                &ValidateSelector::LineContains(1),
+                "rust",
+                &path,
+                IoMode::Mmap
+            )
+            .is_err()
+        );
     }
 
     // text: line-contains:N out-of-range gives error
     #[test]
     fn text_validator_line_contains_out_of_range() {
         let (_f, path) = utf8_lf_file("hello\n");
-        assert!(run_text_validator(
-            &ValidateSelector::LineContains(99),
-            "hello",
-            &path,
-            IoMode::Mmap
-        )
-        .is_err());
+        assert!(
+            run_text_validator(
+                &ValidateSelector::LineContains(99),
+                "hello",
+                &path,
+                IoMode::Mmap
+            )
+            .is_err()
+        );
     }
 
     // binary: bytes:lo-hi exact match passes
@@ -705,39 +713,45 @@ mod tests {
         let data = b"abcde";
         let (_f, path) = binary_file(data);
         // b"bcd" = 62 63 64
-        assert!(run_binary_validator(
-            &ValidateSelector::Bytes(1, 4),
-            "626364",
-            &path,
-            IoMode::Mmap
-        )
-        .is_ok());
+        assert!(
+            run_binary_validator(
+                &ValidateSelector::Bytes(1, 4),
+                "626364",
+                &path,
+                IoMode::Mmap
+            )
+            .is_ok()
+        );
     }
 
     // binary: bytes:lo-hi mismatch gives error
     #[test]
     fn binary_validator_bytes_mismatch_fail() {
         let (_f, path) = binary_file(b"hello");
-        assert!(run_binary_validator(
-            &ValidateSelector::Bytes(0, 5),
-            "0000000000",
-            &path,
-            IoMode::Mmap
-        )
-        .is_err());
+        assert!(
+            run_binary_validator(
+                &ValidateSelector::Bytes(0, 5),
+                "0000000000",
+                &path,
+                IoMode::Mmap
+            )
+            .is_err()
+        );
     }
 
     // binary: bytes:lo-hi beyond file end gives error
     #[test]
     fn binary_validator_bytes_out_of_range() {
         let (_f, path) = binary_file(b"hi");
-        assert!(run_binary_validator(
-            &ValidateSelector::Bytes(0, 100),
-            "0000",
-            &path,
-            IoMode::Mmap
-        )
-        .is_err());
+        assert!(
+            run_binary_validator(
+                &ValidateSelector::Bytes(0, 100),
+                "0000",
+                &path,
+                IoMode::Mmap
+            )
+            .is_err()
+        );
     }
 
     // binary: md5:lo-hi correct digest passes
@@ -770,13 +784,15 @@ mod tests {
     #[test]
     fn binary_validator_md5_mismatch_fail() {
         let (_f, path) = binary_file(b"hello");
-        assert!(run_binary_validator(
-            &ValidateSelector::Md5(0, 5),
-            "00000000000000000000000000000000",
-            &path,
-            IoMode::Mmap,
-        )
-        .is_err());
+        assert!(
+            run_binary_validator(
+                &ValidateSelector::Md5(0, 5),
+                "00000000000000000000000000000000",
+                &path,
+                IoMode::Mmap,
+            )
+            .is_err()
+        );
     }
 
     // binary: crc32:lo-hi correct checksum passes
@@ -785,13 +801,15 @@ mod tests {
         let data = b"hello";
         let (_f, path) = binary_file(data);
         let expected = format!("{:08x}", crc32fast::hash(data));
-        assert!(run_binary_validator(
-            &ValidateSelector::Crc32(0, 5),
-            &expected,
-            &path,
-            IoMode::Mmap
-        )
-        .is_ok());
+        assert!(
+            run_binary_validator(
+                &ValidateSelector::Crc32(0, 5),
+                &expected,
+                &path,
+                IoMode::Mmap
+            )
+            .is_ok()
+        );
     }
 
     // binary: crc32:lo-hi uppercase checksum also passes (case-insensitive)
@@ -800,26 +818,30 @@ mod tests {
         let data = b"hello";
         let (_f, path) = binary_file(data);
         let expected = format!("{:08x}", crc32fast::hash(data)).to_uppercase();
-        assert!(run_binary_validator(
-            &ValidateSelector::Crc32(0, 5),
-            &expected,
-            &path,
-            IoMode::Mmap
-        )
-        .is_ok());
+        assert!(
+            run_binary_validator(
+                &ValidateSelector::Crc32(0, 5),
+                &expected,
+                &path,
+                IoMode::Mmap
+            )
+            .is_ok()
+        );
     }
 
     // binary: crc32:lo-hi wrong checksum gives error
     #[test]
     fn binary_validator_crc32_mismatch_fail() {
         let (_f, path) = binary_file(b"hello");
-        assert!(run_binary_validator(
-            &ValidateSelector::Crc32(0, 5),
-            "00000000",
-            &path,
-            IoMode::Mmap
-        )
-        .is_err());
+        assert!(
+            run_binary_validator(
+                &ValidateSelector::Crc32(0, 5),
+                "00000000",
+                &path,
+                IoMode::Mmap
+            )
+            .is_err()
+        );
     }
 
     // run_all: two passing validators both succeed

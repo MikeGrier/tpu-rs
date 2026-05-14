@@ -45,6 +45,7 @@ use crate::IoMode;
 // ── Public result type ────────────────────────────────────────────────────────
 
 /// Result returned by [`run`].
+#[derive(Debug)]
 pub struct FindResult {
     /// Total number of matching lines across all files searched.
     pub total_matches: usize,
@@ -103,11 +104,7 @@ fn line_matches(line: &str, regexes: &[Regex], all_match: bool, invert: bool) ->
     } else {
         regexes.iter().any(|re| re.is_match(line))
     };
-    if invert {
-        !raw
-    } else {
-        raw
-    }
+    if invert { !raw } else { raw }
 }
 
 // ── Glob / path expansion ─────────────────────────────────────────────────────
@@ -120,7 +117,26 @@ fn line_matches(line: &str, regexes: &[Regex], all_match: bool, invert: bool) ->
 ///
 /// Returns an error if a glob pattern is syntactically invalid or matches no
 /// files.
+///
+/// Equivalent to [`expand_paths_with_policy`] with [`crate::cmd::copy::OnError::Fail`]
+/// — i.e. the legacy "abort on first walk error" behaviour.
+#[allow(dead_code)]
 pub fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
+    expand_paths_with_policy(path_specs, crate::cmd::copy::OnError::Fail, &mut Vec::new())
+}
+
+/// Expand path specifications with explicit handling of walk errors.
+///
+/// When `on_error` is [`crate::cmd::copy::OnError::Warn`] (the default for
+/// CLI/MCP use), unreadable directories produce a textual warning appended
+/// to `warnings_out` instead of aborting the whole expansion. The caller
+/// can then route those warnings to its [`crate::shell::Shell`] (NDJSON
+/// `{"reason":"warning"}` records or stderr notes).
+pub fn expand_paths_with_policy(
+    path_specs: &[&str],
+    on_error: crate::cmd::copy::OnError,
+    warnings_out: &mut Vec<String>,
+) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut paths: Vec<PathBuf> = Vec::new();
     for &spec in path_specs {
         let is_glob =
@@ -131,7 +147,22 @@ pub fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn std::er
                 .compile_matcher();
             let before = paths.len();
             for entry in WalkDir::new(".") {
-                let entry = entry.map_err(|e| format!("find: glob walk error: {e}"))?;
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => match on_error {
+                        crate::cmd::copy::OnError::Fail => {
+                            return Err(format!("find: glob walk error: {e}").into());
+                        }
+                        crate::cmd::copy::OnError::Warn => {
+                            let path_hint = e
+                                .path()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "?".to_string());
+                            warnings_out.push(format!("find: cannot access {path_hint}: {e}"));
+                            continue;
+                        }
+                    },
+                };
                 if entry.file_type().is_file() {
                     let rel = entry.path().strip_prefix(".").unwrap_or(entry.path());
                     if matcher.is_match(rel) {
@@ -311,9 +342,10 @@ fn run_single_file(
                         .unwrap_or(line_num);
 
                     if let Some(last) = last_output_num
-                        && first_to_emit > last + 1 {
-                            writeln!(out, "--")?;
-                        }
+                        && first_to_emit > last + 1
+                    {
+                        writeln!(out, "--")?;
+                    }
                 }
 
                 // ── before-context ─────────────────────────────────────────
@@ -366,7 +398,7 @@ fn run_single_file(
 ///
 /// The caller maps the returned [`FindResult`] to an exit code:
 /// `total_matches > 0` → 0, `total_matches == 0` → 1, `Err` → 2.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, dead_code)]
 pub fn run(
     path_specs: &[&str],
     patterns: &[&str],
@@ -382,18 +414,60 @@ pub fn run(
     out: &mut dyn Write,
     io_mode: IoMode,
 ) -> Result<FindResult, Box<dyn std::error::Error>> {
+    run_with_policy(
+        path_specs,
+        patterns,
+        fixed_string,
+        multiline,
+        ignore_case,
+        all_match,
+        invert,
+        lines_before,
+        lines_after,
+        count_only,
+        numbers,
+        out,
+        io_mode,
+        crate::cmd::copy::OnError::Fail,
+        &mut Vec::new(),
+    )
+}
+
+/// Variant of [`run`] that accepts an explicit walk-error policy and a
+/// sink for collected per-entry warnings. Use this from the CLI / MCP
+/// dispatch so inaccessible directories append warning records to
+/// `warnings_out` instead of aborting the entire find.
+#[allow(clippy::too_many_arguments)]
+pub fn run_with_policy(
+    path_specs: &[&str],
+    patterns: &[&str],
+    fixed_string: bool,
+    multiline: bool,
+    ignore_case: bool,
+    all_match: bool,
+    invert: bool,
+    lines_before: usize,
+    lines_after: usize,
+    count_only: bool,
+    numbers: bool,
+    out: &mut dyn Write,
+    io_mode: IoMode,
+    on_error: crate::cmd::copy::OnError,
+    warnings_out: &mut Vec<String>,
+) -> Result<FindResult, Box<dyn std::error::Error>> {
     let regexes = build_patterns(patterns, fixed_string, multiline, ignore_case)?;
-    let files = expand_paths(path_specs)?;
+    let files = expand_paths_with_policy(path_specs, on_error, warnings_out)?;
     let multi_file = files.len() > 1;
 
     let mut total_matches = 0usize;
+    let mut files_ok = 0usize;
     for file in &files {
         let prefix: Option<String> = if multi_file {
             Some(file.display().to_string())
         } else {
             None
         };
-        let n = run_single_file(
+        let result = run_single_file(
             file,
             &regexes,
             all_match,
@@ -405,9 +479,32 @@ pub fn run(
             prefix.as_deref(),
             out,
             io_mode,
-        )
-        .map_err(|e| format!("find: {}: {e}", file.display()))?;
-        total_matches += n;
+        );
+        match result {
+            Ok(n) => {
+                total_matches += n;
+                files_ok += 1;
+            }
+            Err(e) => {
+                let msg = format!("find: cannot search {}: {e}", file.display());
+                // A single explicit file has no other entries to fall back on;
+                // downgrade to a warning only when there are multiple files so
+                // the rest of the scan can continue.
+                if matches!(on_error, crate::cmd::copy::OnError::Fail) || files.len() == 1 {
+                    return Err(msg.into());
+                }
+                warnings_out.push(msg);
+            }
+        }
+    }
+
+    // If every file in a multi-file search failed, returning Ok with
+    // total_matches == 0 would silently look like a no-match result.
+    // Return an error instead so callers know nothing was searched.
+    if files_ok == 0 && !files.is_empty() {
+        return Err(
+            "find: no files could be searched; all entries were missing or unreadable".into(),
+        );
     }
 
     // Total count line is only emitted when more than one file was matched.
@@ -423,6 +520,46 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_with_policy_warn_mode_all_missing_returns_error() {
+        // When every supplied file is unreadable/missing in warn mode,
+        // run_with_policy must error rather than silently returning Ok with
+        // total_matches == 0 (which would look like a legitimate no-match).
+        let mut out: Vec<u8> = Vec::new();
+        let mut warnings: Vec<String> = Vec::new();
+        let result = run_with_policy(
+            &[
+                "definitely_does_not_exist_a.txt",
+                "definitely_does_not_exist_b.txt",
+            ],
+            &["pattern"],
+            false,
+            false,
+            false,
+            false,
+            false,
+            0,
+            0,
+            false,
+            false,
+            &mut out,
+            IoMode::Buffered,
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        );
+        assert!(
+            result.is_err(),
+            "expected error when all files are unreadable"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("no files could be searched"),
+            "error should mention 'no files could be searched', got: {msg}"
+        );
+        // Individual failures should have been recorded as warnings.
+        assert_eq!(warnings.len(), 2);
+    }
 
     // Helper: run search against in-memory bytes written to a temp file,
     // return the output as a String.

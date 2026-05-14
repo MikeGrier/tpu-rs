@@ -95,10 +95,7 @@ fn read_corrupt_file_emits_advisory_to_stderr_and_content_to_stdout() {
 fn read_corrupt_file_with_no_mojibake_warning_is_silent() {
     let body = cafe_line();
     let (_dir, p) = write_temp("corrupt.txt", body.as_bytes());
-    let o = ok(tpu()
-        .arg("--no-mojibake-warning")
-        .arg("read")
-        .arg(&p));
+    let o = ok(tpu().arg("--no-mojibake-warning").arg("read").arg(&p));
     assert_eq!(String::from_utf8_lossy(&o.stdout), body);
     let stderr = String::from_utf8_lossy(&o.stderr);
     assert!(
@@ -176,10 +173,7 @@ fn json_mode_does_not_emit_plaintext_advisory() {
     // JSON mode: stderr is silent and stdout is NDJSON.  We must not
     // contaminate the NDJSON stream with a `note: ...` line.
     let (_dir, p) = write_temp("corrupt.txt", cafe_line().as_bytes());
-    let o = ok(tpu()
-        .arg("--message-format=json")
-        .arg("read")
-        .arg(&p));
+    let o = ok(tpu().arg("--message-format=json").arg("read").arg(&p));
     let stdout = String::from_utf8_lossy(&o.stdout);
     // Every line of stdout must be a JSON object (NDJSON).  No bare
     // `note:` line should appear.

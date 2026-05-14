@@ -254,7 +254,7 @@ pub fn encode_base64(data: &[u8]) -> String {
 ///
 /// Suitable for use with `--output-format base64` on binary reads.
 /// Decodes symmetrically via [`decode`] using [`DataFormat::Base64`] because
-/// [`decode_base64`] strips all ASCII whitespace (including `\r` and `\n`)
+/// `decode_base64` strips all ASCII whitespace (including `\r` and `\n`)
 /// before processing.
 pub fn encode_base64_pem(data: &[u8]) -> String {
     let flat = encode_base64(data);

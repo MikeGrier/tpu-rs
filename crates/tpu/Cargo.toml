@@ -4,6 +4,13 @@
 name = "tpu"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+description = "Encoding-aware file I/O CLI: read, write, replace, search, and validate files with correct handling of UTF-8, UTF-16LE/BE, Windows-1252, Shift-JIS, and CRLF/LF/CR line endings."
 
 [lib]
 name = "tpu"
@@ -31,7 +38,14 @@ crc32fast = "1"
 globset = "0.4"
 walkdir = "2"
 
+[target."cfg(windows)".dependencies]
+# MoveFileExW for atomic replace-existing rename in copy_one.
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Storage_FileSystem"] }
+
 [dev-dependencies]
 encoding_rs = "0.8"
 md-5 = "0.10"
 crc32fast = "1"
+
+[target."cfg(windows)".dev-dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }

@@ -29,10 +29,10 @@ use std::{
 };
 
 use tempfile::TempDir;
+use tpu::IoMode;
 use tpu::cmd::doctor::{self, DoctorFix, DoctorFormat, DoctorOptions};
 use tpu::mojibake::WritePolicy;
 use tpu::test_fixtures::{box_drawing, em_dash};
-use tpu::IoMode;
 
 fn tpu_cli() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_tpu"));
@@ -115,7 +115,11 @@ fn corruption_doom_loop_is_broken_end_to_end() {
     //         stderr contains exactly one mojibake `note:` advisory,
     //         exit code 0.
     let o = run_ok(tpu_cli().arg("read").arg(&path));
-    assert_eq!(o.stdout, corrupt_text.as_bytes(), "stdout must be unchanged");
+    assert_eq!(
+        o.stdout,
+        corrupt_text.as_bytes(),
+        "stdout must be unchanged"
+    );
     let stderr = String::from_utf8_lossy(&o.stderr);
     let advisory_lines: Vec<&str> = stderr
         .lines()
