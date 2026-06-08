@@ -110,6 +110,7 @@ pub fn run(
     io_mode: IoMode,
     policy: WritePolicy,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let _ = crate::recover_stranded_backup(file);
     if binary {
         let _ = diff_out; // binary mode: --diff is skipped (not meaningful in unified-diff format)
         // Binary mode operates on raw bytes that may not be valid UTF-8 in any

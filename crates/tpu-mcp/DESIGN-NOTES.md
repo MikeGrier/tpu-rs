@@ -177,3 +177,107 @@ forks. Combined with the publisher PAT being limited to the
 leaked secret is bounded to "malicious publish to the `reirGleahciM`
 publisher namespace" -- it cannot pivot to any other Azure DevOps or
 GitHub resource.
+
+---
+
+## Out-of-process I/O isolation (`--io-worker`)
+
+### Problem
+
+Windows Defender's minifilter has historically terminated the long-running
+`tpu-mcp` process when it performs file I/O at high rates: LLVM-built
+binaries doing rapid file operations match Defender's heuristics for
+suspicious behaviour, and the kill takes down the active MCP session. The
+file-bytes-vs-mmap mitigation (`IoMode::Buffered` in the `tpu` crate) was
+necessary but not sufficient.
+
+### Mechanism
+
+`tpu-mcp` now spawns one child of *itself* via `--io-worker` and forwards
+every `tools/call` request to it over an anonymous stdin/stdout pipe pair.
+The child runs the exact same `tools::call(name, args, config)` dispatch
+function the parent would use in-process, so behaviour is byte-identical
+— only the address space hosting the I/O changes.
+
+Wire format (newline-delimited JSON, one object per line):
+
+- Request: `{"id": N, "name": "tpu_write_file", "args": {...},
+  "config": {...}}` — `config` is `ServerConfig::to_wire()`.
+- Response: `{"id": N, "ok": "<text>"}` or `{"id": N, "err": "<msg>"}`.
+
+The worker connection is held in an `IoWorkerHandle` guarded by a
+`Mutex<Option<IoWorker>>`. Calls serialise on the mutex, which is fine —
+the MCP server is already single-threaded per stdio session.
+
+### Fault tolerance
+
+Worker turbulence is surfaced to the client via MCP
+`notifications/message` (`warning` level) so the user sees it in the
+chat UI without having to consult stderr. Each retryable event emits
+one notification.
+
+Retry budget: 1 initial attempt + 3 retries with escalating backoff
+(200 ms, 500 ms, 1000 ms). The whole-document write model — every
+mutating tool replaces the file in full via a temp-file swap — makes
+retries idempotent: rerunning a `write_file` / `replace_in_file` /
+`edit_file` / `append_file` after a worker death produces the same
+final on-disk state as a single successful call, so transparent retry
+is safe.
+
+- **Spawn failure** (`current_exe()` or `Command::spawn` errors): treated
+  the same as a worker death — back off, retry, fall through to
+  in-process execution only after the budget is exhausted. The handle's
+  `inner` stays `None` between attempts so the next loop iteration
+  retries the spawn.
+- **Pipe error or EOF on read** (worker killed mid-call): drop the dead
+  worker, emit a `notifications/message` warning naming the attempt
+  number and reason, sleep the next backoff, respawn, retry.
+- **All retries exhausted**: emit a final warning and fall back to
+  in-process execution so the user-visible operation still succeeds.
+- **Recovered after retry**: emit a `notifications/message` warning
+  noting the successful attempt number, so the user can tell the
+  difference between a clean call and a noisy-but-eventually-successful
+  call without scraping logs.
+- **Tool returned an error** (worker ran the tool, tool failed): this is
+  a normal result, *not* a worker failure. The error string is propagated
+  verbatim to the MCP client as the tool's `isError: true` payload, and the
+  worker is reused for the next call. No retry.
+
+### Atomic-write window
+
+The existing write path (`tempfile::NamedTempFile` → rename original to
+`<file>.bak` → persist temp → original path) has a small window where a
+crash between the two renames leaves the file at `<file>.bak` and nothing
+at the original path. This was already true in-process; running the same
+code in a child does not widen it. Auto-recovery in the `tpu` library
+closes the user-visible failure mode: every read path (`open_as_branch`,
+`read_raw_bytes`) and every mutating command (`write`, `append`, `edit`)
+calls `recover_stranded_backup(path)` before touching the file, which
+promotes `<path>.bak` back to `<path>` if and only if `<path>` is missing
+and `<path>.bak` is present. The recovery is silent (no warning emitted),
+because the operation is fully safe — the `.bak` *is* the prior contents
+— and the next operation proceeds against a fully recovered file. The
+chaos test suite (`tests/io_worker_chaos.rs::stranded_backup_*`) verifies
+this for both read and append entry points.
+
+### Why the same binary as the worker
+
+A separate `tpu-io-worker` bin target would have required either
+duplicating the entire `tools::call` dispatch surface in another crate or
+making `tools` a library. Reusing `tpu-mcp.exe --io-worker` keeps the
+build, install, packaging, and VSIX paths unchanged: there is exactly one
+binary to ship, and `std::env::current_exe()` finds it for free.
+
+### Configuration
+
+- Default: on (`cfg!(windows)`), off elsewhere.
+- Disable: `--no-io-worker` CLI flag, or `TPU_MCP_NO_IO_WORKER=1`
+  environment variable. Useful when running under a debugger, on a
+  machine with a Defender exclusion already in place, or while
+  investigating worker-related issues.
+
+The protocol-level integration tests in `tests/mcp_protocol.rs` exercise
+the io-worker path end-to-end on Windows because they spawn the real
+binary; the same suite runs in-process on non-Windows targets because the
+default flips off.
+

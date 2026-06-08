@@ -11,7 +11,7 @@ pub mod rsp;
 pub mod shell;
 pub mod test_fixtures;
 
-use std::{error::Error, fs, io, path::Path, sync::Arc, time::Duration};
+use std::{error::Error, fs, io, path::{Path, PathBuf}, sync::Arc, time::Duration};
 
 use memmap2::MmapOptions;
 use redwing::Branch;
@@ -42,6 +42,7 @@ pub enum IoMode {
 ///
 /// The returned branch is the `.main()` handle of a fresh `Thicket`.
 pub fn open_as_branch(path: &Path, mode: IoMode) -> Result<Arc<dyn Branch>, Box<dyn Error>> {
+    let _ = recover_stranded_backup(path);
     match mode {
         IoMode::Mmap => {
             let f = retry_io(|| fs::File::open(path))?;
@@ -65,6 +66,7 @@ pub fn open_as_branch(path: &Path, mode: IoMode) -> Result<Arc<dyn Branch>, Box<
 /// Use this for commands that need raw `&[u8]` access without going through
 /// a harrier `Source` (e.g. binary-mode head/tail, binary validators).
 pub fn read_raw_bytes(path: &Path, mode: IoMode) -> io::Result<Vec<u8>> {
+    let _ = recover_stranded_backup(path);
     match mode {
         IoMode::Mmap => {
             let f = retry_io(|| fs::File::open(path))?;
@@ -122,5 +124,94 @@ fn is_transient_io_error(e: &io::Error) -> bool {
     {
         let _ = e;
         false
+    }
+}
+
+// ── Stranded-backup recovery ──────────────────────────────────────────────────
+
+/// Return the `<file>.bak` companion path used by the atomic-write swap in
+/// `cmd::write`, `cmd::replace`, `cmd::append`, and `cmd::edit`.
+pub fn backup_path_for(file: &Path) -> PathBuf {
+    let mut s = file.as_os_str().to_owned();
+    s.push(".bak");
+    PathBuf::from(s)
+}
+
+/// If `file` is missing but `<file>.bak` exists, rename the `.bak` back to
+/// the original path.  Returns `Ok(true)` when a recovery happened,
+/// `Ok(false)` when nothing needed doing.
+///
+/// ## Why
+///
+/// The atomic-write swap (tempfile in same dir → rename original to
+/// `<file>.bak` → persist temp into `<file>`) has a small crash window
+/// between the two renames.  If the process is terminated there — Windows
+/// Defender killing the worker, power loss, etc. — the file ends up at
+/// `<file>.bak` with nothing at the original path.  Without recovery, every
+/// subsequent `append`/`replace`/`edit`/read against the original path
+/// fails with "file does not exist", even though the prior contents are
+/// sitting one directory entry away.
+///
+/// This helper is called automatically by [`open_as_branch`] and
+/// [`read_raw_bytes`], and is also called explicitly at the top of each
+/// mutating `cmd::*` entry point (those have their own `file.exists()`
+/// pre-flight checks that fire before any read).
+///
+/// All errors are non-fatal — recovery is best-effort.  If the rename
+/// fails (sharing violation, permission denied, …) the caller will see
+/// the original "file does not exist" error on the next operation, which
+/// is the same behaviour as before this helper existed.
+pub fn recover_stranded_backup(file: &Path) -> io::Result<bool> {
+    // Cheap exit: file present, nothing to recover.
+    if file.try_exists().unwrap_or(false) {
+        return Ok(false);
+    }
+    let bak = backup_path_for(file);
+    if !bak.try_exists().unwrap_or(false) {
+        return Ok(false);
+    }
+    // Recover.  Use retry_io because the .bak may still be held briefly by
+    // an AV scan triggered by the very crash that stranded it.
+    retry_io(|| fs::rename(&bak, file))?;
+    Ok(true)
+}
+
+#[cfg(test)]
+mod recover_tests {
+    use super::*;
+
+    #[test]
+    fn recover_no_file_no_bak_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("missing.txt");
+        let recovered = recover_stranded_backup(&f).unwrap();
+        assert!(!recovered);
+        assert!(!f.exists());
+    }
+
+    #[test]
+    fn recover_file_present_is_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("present.txt");
+        fs::write(&f, b"hi").unwrap();
+        let bak = backup_path_for(&f);
+        fs::write(&bak, b"stale").unwrap();
+        let recovered = recover_stranded_backup(&f).unwrap();
+        assert!(!recovered, "must not touch an extant file");
+        assert_eq!(fs::read(&f).unwrap(), b"hi");
+        assert_eq!(fs::read(&bak).unwrap(), b"stale");
+    }
+
+    #[test]
+    fn recover_promotes_bak_when_file_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("stranded.txt");
+        let bak = backup_path_for(&f);
+        fs::write(&bak, b"recovered content").unwrap();
+        assert!(!f.exists());
+        let recovered = recover_stranded_backup(&f).unwrap();
+        assert!(recovered);
+        assert_eq!(fs::read(&f).unwrap(), b"recovered content");
+        assert!(!bak.exists(), ".bak should be consumed by recovery");
     }
 }

@@ -2117,6 +2117,14 @@ pub struct ServerConfig {
     /// return only the numeric count in the JSON result.)
     /// Useful for clients that want a quieter trail in the MCP output channel.
     pub progress_detail: ProgressDetail,
+
+    /// When true, route every `tools/call` through a child
+    /// `tpu-mcp --io-worker` process for fault isolation from Windows
+    /// Defender (and similar) process-kill incidents.  Not propagated to the
+    /// worker itself — the worker always runs its dispatch in-process.
+    /// Default: `true` on Windows, `false` elsewhere.  Disable with
+    /// `--no-io-worker` (or `TPU_MCP_NO_IO_WORKER=1`).
+    pub io_worker_enabled: bool,
 }
 
 /// How much per-entry detail tree-walking tools should include in their
@@ -2138,7 +2146,62 @@ impl Default for ServerConfig {
             trace: true,
             default_on_error: tpu::cmd::copy::OnError::Warn,
             progress_detail: ProgressDetail::EachFile,
+            io_worker_enabled: cfg!(windows),
         }
+    }
+}
+
+impl ServerConfig {
+    /// Encode the config as a JSON object suitable for transport to a child
+    /// `tpu-mcp --io-worker` process.  Enum fields are serialised as the
+    /// short string values accepted by the matching CLI flags.
+    pub fn to_wire(&self) -> Value {
+        let on_error = match self.default_on_error {
+            tpu::cmd::copy::OnError::Warn => "warn",
+            tpu::cmd::copy::OnError::Fail => "fail",
+        };
+        let progress_detail = match self.progress_detail {
+            ProgressDetail::EachFile => "each-file",
+            ProgressDetail::Summary => "summary",
+        };
+        serde_json::json!({
+            "verify_delay_ms": self.verify_delay_ms,
+            "trace": self.trace,
+            "default_on_error": on_error,
+            "progress_detail": progress_detail,
+        })
+    }
+
+    /// Decode a `ServerConfig` previously produced by [`Self::to_wire`].
+    /// Missing fields fall back to defaults so a worker can tolerate a
+    /// slightly newer parent process.
+    pub fn from_wire(v: &Value) -> Result<Self, String> {
+        let d = Self::default();
+        let verify_delay_ms = v
+            .get("verify_delay_ms")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(d.verify_delay_ms);
+        let trace = v.get("trace").and_then(|x| x.as_bool()).unwrap_or(d.trace);
+        let default_on_error = match v.get("default_on_error").and_then(|x| x.as_str()) {
+            Some("warn") | None => tpu::cmd::copy::OnError::Warn,
+            Some("fail") => tpu::cmd::copy::OnError::Fail,
+            Some(other) => return Err(format!("unknown default_on_error: {other:?}")),
+        };
+        let progress_detail = match v.get("progress_detail").and_then(|x| x.as_str()) {
+            Some("each-file") | Some("each_file") | None => ProgressDetail::EachFile,
+            Some("summary") => ProgressDetail::Summary,
+            Some(other) => return Err(format!("unknown progress_detail: {other:?}")),
+        };
+        Ok(ServerConfig {
+            verify_delay_ms,
+            trace,
+            default_on_error,
+            progress_detail,
+            // Always false inside the worker — the worker is the leaf that
+            // actually performs file I/O.  Routing through another worker
+            // would loop.
+            io_worker_enabled: false,
+        })
     }
 }
 
@@ -2862,6 +2925,7 @@ mod integration_tests {
                 trace: false,
                 default_on_error: tpu::cmd::copy::OnError::Warn,
                 progress_detail: ProgressDetail::EachFile,
+                io_worker_enabled: false,
             },
         )
     }
