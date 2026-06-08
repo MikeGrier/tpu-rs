@@ -228,7 +228,7 @@ fn dispatch(
             };
             let result = match outcome {
                 Ok(Some(text)) => Ok(text),
-                Err(e) => Err(e.into()),
+                Err(e) => Err(io::Error::new(io::ErrorKind::Other, e).into()),
                 Ok(None) => tools::call(name, &args, config),
             };
 
