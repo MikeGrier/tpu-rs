@@ -18,11 +18,11 @@
 //! dispatch path the parent would use in-process, so behaviour is identical;
 //! only the address space hosting the I/O changes.  If Defender (or any
 //! other failure) kills the worker, the parent survives: the manager
-//! observes a broken pipe / EOF, emits a warning to stderr, and respawns
-//! a fresh worker before retrying the failing call once.  If the retry also
-//! crashes — or the worker cannot be spawned in the first place — the
-//! manager transparently falls back to performing the call in-process so
-//! the user-visible operation still succeeds.
+//! observes a broken pipe / EOF, emits a warning to the MCP client via
+//! `notifications/message`, and respawns a fresh worker before retrying the
+//! failing call once. If the retry also crashes — or the worker cannot be
+//! spawned in the first place — the manager transparently falls back to
+//! performing the call in-process so the user-visible operation still succeeds.
 //!
 //! ## What about an atomic-write swap that crashes mid-rename?
 //!
