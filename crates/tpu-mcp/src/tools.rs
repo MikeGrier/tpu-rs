@@ -61,6 +61,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "tpu_render_file",
     "tpu_setup",
     "tpu_stat_file",
+    "tpu_doctor",
 ];
 
 /// Return the names (in advertising order) of every tool exposed by [`list()`].
@@ -1102,6 +1103,73 @@ pub fn list() -> Value {
                 "required": ["file"]
             },
             "annotations": { "readOnlyHint": true, "destructiveHint": false }
+        },
+        {
+            "name": "tpu_doctor",
+            "description":
+                "Diagnose (and optionally repair) mojibake and encoding damage in one or \
+                 more files. Use this when a file looks garbled (`Ã©` instead of `é`, \
+                 `â€\"` instead of `—`, `â\"€` instead of `─`, stray `Â ` before \
+                 numbers, …) or when a `tpu_read_file` call surfaced a `note: ... \
+                 file appears to contain mojibake` warning. \n\n\
+                 SCANS ONLY by default — returns a structured JSON report listing \
+                 every flagged file with its detected encoding, per-pattern match counts, \
+                 line/column locations, and whether a one-layer 'peel' repair would \
+                 strictly improve the file. Safe to call on directories and globs; \
+                 binary file extensions and `.git/` subtrees are skipped automatically. \n\n\
+                 REPAIRS only when called with `fix: \"peel\"`. The repair is conservative: \
+                 the file is rewritten only if the peel produces strictly fewer mojibake \
+                 matches than the original. The original content is preserved at \
+                 `<file>.bak` (the standard atomic-write backup). To preview without \
+                 writing, leave `fix` unset and inspect `peel_suggested` in the report. \n\n\
+                 Files containing the literal sentinel `encoding-check: allow-mojibake` \
+                 are treated as legitimate (test fixtures, regex sources, docs about \
+                 mojibake) and reported as clean. \n\n\
+                 When a teammate or another tool (e.g. PowerShell `Get-Content` / \
+                 `Set-Content`, a misconfigured generator) appears to have introduced \
+                 corruption, `git log -p -- <file>` will identify the introducing commit \
+                 and therefore the offending writer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description":
+                            "A file, directory, or shell-style glob to scan. Either `path` \
+                             or `paths` must be provided; both may be combined."
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description":
+                            "Additional paths to scan, accumulated with `path`. Each may \
+                             be a file, directory, or shell-style glob."
+                    },
+                    "fix": {
+                        "type": "string",
+                        "enum": ["none", "peel"],
+                        "description":
+                            "Repair mode. `none` (default) reports only; `peel` applies a \
+                             single-layer mojibake undo to any file whose peel produces \
+                             strictly fewer matches than the original, rewriting it \
+                             atomically with a `.bak` backup."
+                    },
+                    "on_error": {
+                        "type": "string",
+                        "enum": ["fail", "warn"],
+                        "description":
+                            "How to handle per-entry walk errors (e.g. an inaccessible \
+                             subdirectory). `warn` (default) collects warnings into the \
+                             report and continues; `fail` stops on the first error."
+                    }
+                },
+                "required": [],
+                "anyOf": [
+                    { "required": ["path"] },
+                    { "required": ["paths"] }
+                ]
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": true }
         }
     ])
 }
@@ -1134,6 +1202,7 @@ pub fn call(
         "tpu_setup" => call_setup(args, config),
         "tpu_find" => call_find(args, config),
         "tpu_stat_file" => call_stat_file(args),
+        "tpu_doctor" => call_doctor(args, config),
         _ => Err(format!("unknown tool: {name}").into()),
     }
 }
@@ -2051,6 +2120,113 @@ fn call_stat_file(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     }))?)
 }
 
+fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std::error::Error>> {
+    let mut all_paths: Vec<String> = Vec::new();
+    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+        all_paths.push(normalize_file_path(p));
+    }
+    if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
+        for p in arr {
+            if let Some(s) = p.as_str() {
+                all_paths.push(normalize_file_path(s));
+            }
+        }
+    }
+    if all_paths.is_empty() {
+        return Err("doctor: at least one `path` or entry in `paths` is required".into());
+    }
+
+    let fix = match args.get("fix") {
+        None => tpu::cmd::doctor::DoctorFix::None,
+        Some(v) => match v.as_str() {
+            Some("none") => tpu::cmd::doctor::DoctorFix::None,
+            Some("peel") => tpu::cmd::doctor::DoctorFix::Peel,
+            Some(other) => {
+                return Err(format!(
+                    "invalid value for `fix`: {other:?}; expected \"none\" or \"peel\""
+                )
+                .into());
+            }
+            None => {
+                return Err(format!("invalid value for `fix`: expected a string, got {v}").into());
+            }
+        },
+    };
+
+    let on_error = match args.get("on_error") {
+        None => config.default_on_error,
+        Some(v) => match v.as_str() {
+            Some("warn") => tpu::cmd::copy::OnError::Warn,
+            Some("fail") => tpu::cmd::copy::OnError::Fail,
+            Some(other) => {
+                return Err(format!(
+                    "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
+                )
+                .into());
+            }
+            None => {
+                return Err(
+                    format!("invalid value for `on_error`: expected a string, got {v}").into(),
+                );
+            }
+        },
+    };
+
+    let opts = tpu::cmd::doctor::DoctorOptions {
+        format: tpu::cmd::doctor::DoctorFormat::Json,
+        fix,
+        quiet: true,
+    };
+
+    let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
+    let mut walk_warnings: Vec<String> = Vec::new();
+    let mut sink: Vec<u8> = Vec::new();
+    let report = tpu::cmd::doctor::run_with_policy(
+        &path_refs,
+        opts,
+        &mut sink,
+        tpu::IoMode::Buffered,
+        on_error,
+        &mut walk_warnings,
+    )?;
+
+    let files: Vec<Value> = report
+        .issues
+        .iter()
+        .map(|issue| {
+            let matches: Vec<Value> = issue
+                .mojibake_matches
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "byte_offset": m.byte_offset,
+                        "line": m.line,
+                        "col": m.col,
+                        "pattern": m.pattern.name(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "path": issue.path.display().to_string(),
+                "encoding_detected": issue.encoding_detected,
+                "valid_in_detected_encoding": issue.valid_in_detected_encoding,
+                "mojibake_matches": matches,
+                "peel_suggested": issue.peel_suggested.is_some(),
+                "repaired": issue.repaired,
+            })
+        })
+        .collect();
+
+    let doc = serde_json::json!({
+        "files": files,
+        "total_files_scanned": report.total_files_scanned,
+        "total_issues": report.total_issues(),
+        "total_repaired": report.total_repaired,
+        "walk_warnings": walk_warnings,
+    });
+    Ok(serde_json::to_string(&doc)?)
+}
+
 fn call_validate_file(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     // `tpu` has no standalone `validate` subcommand; --validate is a pre-write
     // flag on `tpu write`.  This tool calls the library directly to avoid an
@@ -2117,6 +2293,14 @@ pub struct ServerConfig {
     /// return only the numeric count in the JSON result.)
     /// Useful for clients that want a quieter trail in the MCP output channel.
     pub progress_detail: ProgressDetail,
+
+    /// When true, route every `tools/call` through a child
+    /// `tpu-mcp --io-worker` process for fault isolation from Windows
+    /// Defender (and similar) process-kill incidents.  Not propagated to the
+    /// worker itself — the worker always runs its dispatch in-process.
+    /// Default: `true` on Windows, `false` elsewhere.  Disable with
+    /// `--no-io-worker` (or `TPU_MCP_NO_IO_WORKER=1`).
+    pub io_worker_enabled: bool,
 }
 
 /// How much per-entry detail tree-walking tools should include in their
@@ -2138,7 +2322,62 @@ impl Default for ServerConfig {
             trace: true,
             default_on_error: tpu::cmd::copy::OnError::Warn,
             progress_detail: ProgressDetail::EachFile,
+            io_worker_enabled: cfg!(windows),
         }
+    }
+}
+
+impl ServerConfig {
+    /// Encode the config as a JSON object suitable for transport to a child
+    /// `tpu-mcp --io-worker` process.  Enum fields are serialised as the
+    /// short string values accepted by the matching CLI flags.
+    pub fn to_wire(&self) -> Value {
+        let on_error = match self.default_on_error {
+            tpu::cmd::copy::OnError::Warn => "warn",
+            tpu::cmd::copy::OnError::Fail => "fail",
+        };
+        let progress_detail = match self.progress_detail {
+            ProgressDetail::EachFile => "each-file",
+            ProgressDetail::Summary => "summary",
+        };
+        serde_json::json!({
+            "verify_delay_ms": self.verify_delay_ms,
+            "trace": self.trace,
+            "default_on_error": on_error,
+            "progress_detail": progress_detail,
+        })
+    }
+
+    /// Decode a `ServerConfig` previously produced by [`Self::to_wire`].
+    /// Missing fields fall back to defaults so a worker can tolerate a
+    /// slightly newer parent process.
+    pub fn from_wire(v: &Value) -> Result<Self, String> {
+        let d = Self::default();
+        let verify_delay_ms = v
+            .get("verify_delay_ms")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(d.verify_delay_ms);
+        let trace = v.get("trace").and_then(|x| x.as_bool()).unwrap_or(d.trace);
+        let default_on_error = match v.get("default_on_error").and_then(|x| x.as_str()) {
+            Some("warn") | None => tpu::cmd::copy::OnError::Warn,
+            Some("fail") => tpu::cmd::copy::OnError::Fail,
+            Some(other) => return Err(format!("unknown default_on_error: {other:?}")),
+        };
+        let progress_detail = match v.get("progress_detail").and_then(|x| x.as_str()) {
+            Some("each-file") | Some("each_file") | None => ProgressDetail::EachFile,
+            Some("summary") => ProgressDetail::Summary,
+            Some(other) => return Err(format!("unknown progress_detail: {other:?}")),
+        };
+        Ok(ServerConfig {
+            verify_delay_ms,
+            trace,
+            default_on_error,
+            progress_detail,
+            // Always false inside the worker — the worker is the leaf that
+            // actually performs file I/O.  Routing through another worker
+            // would loop.
+            io_worker_enabled: false,
+        })
     }
 }
 
@@ -2862,6 +3101,7 @@ mod integration_tests {
                 trace: false,
                 default_on_error: tpu::cmd::copy::OnError::Warn,
                 progress_detail: ProgressDetail::EachFile,
+                io_worker_enabled: false,
             },
         )
     }

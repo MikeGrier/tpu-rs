@@ -88,6 +88,7 @@ pub fn run(
     io_mode: IoMode,
     policy: WritePolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = crate::recover_stranded_backup(file);
     // Capture old bytes if needed for diff computation OR the mojibake guard.
     let need_old_bytes = diff_out.is_some() || (policy.reject_introduced_mojibake && file.exists());
     let old_bytes: Option<Vec<u8>> = if need_old_bytes && file.exists() {

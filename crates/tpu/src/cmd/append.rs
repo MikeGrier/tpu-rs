@@ -58,6 +58,7 @@ pub fn run(
     io_mode: IoMode,
     policy: WritePolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = crate::recover_stranded_backup(file);
     if !file.exists() {
         return Err(format!(
             "append: file does not exist: {}; use 'tpu write' to create new files",

@@ -32,6 +32,7 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 | `tpu_copy_file` | copy a file or recursively copy a tree (resilient: per-entry warnings, never aborts mid-walk by default) |
 | `tpu_render_file` | populate a file from a `{{TOKEN}}` template |
 | `tpu_stat_file` | verify a write actually persisted (mtime / size) |
+| `tpu_doctor` | scan files/dirs/globs for mojibake or encoding damage; optionally repair with `fix: "peel"` |
 | `tpu_setup` | (re)write this guidance block into the active `copilot-instructions.md` |
 
 ### When to use each
@@ -50,6 +51,43 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
   records (configurable via the `on_error` argument).
 - **Dependency-free templating** — `tpu_render_file` substitutes
   `{{NAME}}`-style tokens. Use `\{{` to emit literal braces.
+
+### When a file looks corrupted (mojibake)
+
+Symptoms: `Ã©` where `é` should be, `â€"` where `—` should be, `â"€` instead
+of `─`, stray `Â ` before numbers, `ð\u009f...` blobs instead of emoji.
+This is *mojibake* — text that was decoded in the wrong encoding and then
+re-encoded as UTF-8. It is almost always caused by a non-tpu writer round-
+tripping the file through the OS code page (PowerShell `Get-Content` /
+`Set-Content` / `Out-File` / `>` / `Add-Content`, a misconfigured editor,
+a generator that assumed ASCII).
+
+Workflow:
+
+1. **Diagnose**: call `tpu_doctor` with the suspect file (or the
+   surrounding directory / glob). It returns a JSON report listing every
+   flagged file, its detected encoding, per-pattern match counts, exact
+   line/column locations, and whether a one-layer "peel" repair would
+   strictly improve the file (`peel_suggested: true`).
+2. **Identify the offender**: when a file is corrupted in a git repo, run
+   `git log -p -- <file>` (or `git blame -- <file>`) to find the
+   introducing commit. The commit reveals which tool wrote the damage so
+   you can stop the leak at the source rather than only repairing
+   downstream.
+3. **Repair (conservative)**: call `tpu_doctor` again with
+   `fix: "peel"`. Only files whose peel produces *strictly fewer* mojibake
+   matches are rewritten; the prior content is preserved at `<file>.bak`.
+   Re-run `tpu_doctor` after the repair to confirm the report is clean.
+4. **Don't paper over it**: if a file legitimately contains mojibake
+   digraphs (test fixtures, regex sources, documentation about mojibake),
+   add the line `encoding-check: allow-mojibake` (typically inside a
+   comment) — `tpu_doctor` and the write-time guard will treat it as
+   clean.
+
+The write-time guard in `tpu_write_file` / `tpu_append_file` /
+`tpu_replace_in_file` / `tpu_edit_file` already refuses to *introduce* new
+mojibake (pre-existing damage passes through). If you genuinely intend to
+write curated mojibake fixtures, pass `allow_mojibake: true`.
 
 ### File encoding
 

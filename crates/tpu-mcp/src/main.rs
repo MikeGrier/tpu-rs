@@ -8,13 +8,28 @@
 //! Each tool invocation calls `tpu` library functions directly (via the `tpu`
 //! crate) so that argument values — even those starting with `--` — are never
 //! misinterpreted as CLI options.
+//!
+//! ## I/O worker mode (`--io-worker`)
+//!
+//! When invoked with [`worker::WORKER_ARG`] on its command line, the binary
+//! re-enters as a private subprocess of the MCP server, reading JSON
+//! requests from stdin and writing JSON responses to stdout (see
+//! [`worker::run_worker`]).  This is the out-of-process I/O isolation path
+//! used by default on Windows to keep Defender-induced process kills from
+//! taking down the MCP session.
 
 mod tools;
+mod worker;
 
-use std::io::{self, BufRead};
+use std::{
+    io::{self, BufRead},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use worker::IoWorkerHandle;
 
 // ── JSON-RPC 2.0 wire types ───────────────────────────────────────────────────
 
@@ -60,7 +75,12 @@ mod code {
 
 // ── event loop ────────────────────────────────────────────────────────────────
 
-fn main() {
+fn main() {    // I/O-worker mode short-circuits everything else: the process becomes a
+    // private child of the parent MCP server, talking the simple JSON wire
+    // protocol defined in `worker.rs` and never touching the MCP framing.
+    if std::env::args_os().any(|a| a == worker::WORKER_ARG) {
+        worker::run_worker();
+    }
     let (config, startup_warnings) = parse_config();
 
     let stdin = io::stdin();
@@ -85,6 +105,18 @@ fn main() {
         &mut out,
         format!("advertising {} tools: {}", names.len(), quoted.join(", ")),
     );
+
+    // Out-of-process I/O isolation: default on Windows, opt-in elsewhere.
+    // Disabled by `--no-io-worker` or `TPU_MCP_NO_IO_WORKER=1`.
+    let io_worker = Arc::new(if config.io_worker_enabled {
+        log_info(
+            &mut out,
+            "io worker enabled (out-of-process file I/O for fault isolation)",
+        );
+        IoWorkerHandle::enabled()
+    } else {
+        IoWorkerHandle::disabled()
+    });
 
     // Replay any warnings collected during CLI parsing through the same
     // log channel (warning level) now that the stdout writer is available.
@@ -126,7 +158,7 @@ fn main() {
             Some(v) => v,
         };
 
-        let body = dispatch(msg.method.as_str(), msg.params, &config, &mut out);
+        let body = dispatch(msg.method.as_str(), msg.params, &config, &io_worker, &mut out);
         if config.trace {
             log_info(&mut out, format!("dispatched '{}'", msg.method));
         }
@@ -147,6 +179,7 @@ fn dispatch(
     method: &str,
     params: Option<Value>,
     config: &tools::ServerConfig,
+    io_worker: &IoWorkerHandle,
     out: &mut impl io::Write,
 ) -> ResponseBody {
     match method {
@@ -184,7 +217,22 @@ fn dispatch(
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
 
-            match tools::call(name, &args, config) {
+            // Try the out-of-process worker first; fall back to in-process
+            // execution only after the worker subsystem has exhausted its
+            // retry budget.  Worker turbulence is surfaced to the client
+            // via MCP `notifications/message` (warning level) so the user
+            // can see it in their chat UI without consulting stderr.
+            let outcome = {
+                let mut warn = |msg: &str| log_warn(out, msg.to_string());
+                io_worker.try_call(name, &args, config, &mut warn)
+            };
+            let result = match outcome {
+                Ok(Some(text)) => Ok(text),
+                Err(e) => Err(e.into()),
+                Ok(None) => tools::call(name, &args, config),
+            };
+
+            match result {
                 Ok(text) => ResponseBody::Ok {
                     result: serde_json::json!({
                         "content": [{ "type": "text", "text": text }]
@@ -318,6 +366,10 @@ fn log_warn(out: &mut impl io::Write, message: impl Into<String>) {
 fn parse_config() -> (tools::ServerConfig, Vec<String>) {
     let mut verify_delay_ms: u64 = 100;
     let mut quiet: bool = std::env::var_os("TPU_MCP_QUIET").is_some_and(|v| !v.is_empty());
+    // Out-of-process I/O isolation: default on Windows, off elsewhere.
+    // The env var lets users disable it without editing `mcp.json`.
+    let mut io_worker_enabled: bool = cfg!(windows)
+        && std::env::var_os("TPU_MCP_NO_IO_WORKER").is_none_or(|v| v.is_empty());
     let mut warnings: Vec<String> = Vec::new();
     // Default walk-error policy for tools that traverse trees (find, copy).
     // Honour the env var first so the VS Code extension can plumb the user
@@ -373,6 +425,11 @@ fn parse_config() -> (tools::ServerConfig, Vec<String>) {
             }
         } else if s == "--quiet" {
             quiet = true;
+        } else if s == worker::DISABLE_ARG {
+            io_worker_enabled = false;
+        } else if s == worker::WORKER_ARG {
+            // Handled earlier (process never reaches here in worker mode);
+            // ignore silently if it ever appears here.
         }
     }
     (
@@ -381,6 +438,7 @@ fn parse_config() -> (tools::ServerConfig, Vec<String>) {
             trace: !quiet,
             default_on_error,
             progress_detail,
+            io_worker_enabled,
         },
         warnings,
     )
