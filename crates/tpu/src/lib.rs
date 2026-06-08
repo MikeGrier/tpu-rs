@@ -131,7 +131,7 @@ fn is_transient_io_error(e: &io::Error) -> bool {
 
 /// Return the `<file>.bak` companion path used by the atomic-write swap in
 /// `cmd::write`, `cmd::replace`, `cmd::append`, and `cmd::edit`.
-pub fn backup_path_for(file: &Path) -> PathBuf {
+fn backup_path_for(file: &Path) -> PathBuf {
     let mut s = file.as_os_str().to_owned();
     s.push(".bak");
     PathBuf::from(s)
