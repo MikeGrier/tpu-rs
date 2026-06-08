@@ -427,7 +427,7 @@ fn parse_config() -> (tools::ServerConfig, Vec<String>) {
             quiet = true;
         } else if s == worker::DISABLE_ARG {
             io_worker_enabled = false;
-        } else if s == "--io-worker" {
+        } else if s == worker::WORKER_ARG {
             // Handled earlier (process never reaches here in worker mode);
             // ignore silently if it ever appears here.
         }

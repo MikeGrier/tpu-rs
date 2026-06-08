@@ -153,22 +153,34 @@ pub fn backup_path_for(file: &Path) -> PathBuf {
 /// sitting one directory entry away.
 ///
 /// This helper is called automatically by [`open_as_branch`] and
-/// [`read_raw_bytes`], and is also called explicitly at the top of each
-/// mutating `cmd::*` entry point (those have their own `file.exists()`
-/// pre-flight checks that fire before any read).
+/// [`read_raw_bytes`], and is also called explicitly at the top of the
+/// mutating `cmd::write`, `cmd::append`, and `cmd::edit` entry points so
+/// that recovery happens before their own `file.exists()` pre-flight
+/// checks decide a fresh-create vs. update path.  `cmd::replace` does not
+/// need a separate call: it reaches the file through [`open_as_branch`],
+/// which already performs recovery.
 ///
 /// All errors are non-fatal — recovery is best-effort.  If the rename
 /// fails (sharing violation, permission denied, …) the caller will see
 /// the original "file does not exist" error on the next operation, which
-/// is the same behaviour as before this helper existed.
+/// is the same behaviour as before this helper existed.  Likewise, if
+/// `try_exists` itself fails (permission/ACL errors), recovery is
+/// skipped so we never rename based on an indeterminate existence
+/// check.
 pub fn recover_stranded_backup(file: &Path) -> io::Result<bool> {
-    // Cheap exit: file present, nothing to recover.
-    if file.try_exists().unwrap_or(false) {
-        return Ok(false);
+    // Cheap exit: file present, nothing to recover.  If existence cannot
+    // be determined (e.g. permission/ACL error), skip recovery rather
+    // than risk an unintended rename.
+    match file.try_exists() {
+        Ok(true) => return Ok(false),
+        Ok(false) => {}
+        Err(_) => return Ok(false),
     }
     let bak = backup_path_for(file);
-    if !bak.try_exists().unwrap_or(false) {
-        return Ok(false);
+    match bak.try_exists() {
+        Ok(true) => {}
+        Ok(false) => return Ok(false),
+        Err(_) => return Ok(false),
     }
     // Recover.  Use retry_io because the .bak may still be held briefly by
     // an AV scan triggered by the very crash that stranded it.

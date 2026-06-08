@@ -33,7 +33,10 @@
 //! process isolation does not make it worse.  On retry the operation
 //! reruns from scratch, which works as long as the input file is still
 //! present (the operating assumption noted in the design discussion).
-//! Diagnosing and repairing this corner case is left for a separate change.
+//! Recovery for the stranded-`.bak` case is provided by
+//! [`tpu::recover_stranded_backup`], which is invoked automatically by
+//! the read helpers and by the mutating `cmd::*` entry points so the
+//! original path is restored before the next operation runs.
 
 use std::{
     io::{BufRead, BufReader, Write},

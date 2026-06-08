@@ -1163,9 +1163,13 @@ pub fn list() -> Value {
                              report and continues; `fail` stops on the first error."
                     }
                 },
-                "required": []
+                "required": [],
+                "anyOf": [
+                    { "required": ["path"] },
+                    { "required": ["paths"] }
+                ]
             },
-            "annotations": { "readOnlyHint": true, "destructiveHint": false }
+            "annotations": { "readOnlyHint": false, "destructiveHint": true }
         }
     ])
 }
@@ -2147,7 +2151,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn st
     };
 
     let on_error = match args.get("on_error") {
-        None => tpu::cmd::copy::OnError::Warn,
+        None => config.default_on_error,
         Some(v) => match v.as_str() {
             Some("warn") => tpu::cmd::copy::OnError::Warn,
             Some("fail") => tpu::cmd::copy::OnError::Fail,
@@ -2164,7 +2168,6 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn st
             }
         },
     };
-    let _ = config;
 
     let opts = tpu::cmd::doctor::DoctorOptions {
         format: tpu::cmd::doctor::DoctorFormat::Json,
