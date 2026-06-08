@@ -61,6 +61,7 @@ pub const TOOL_NAMES: &[&str] = &[
     "tpu_render_file",
     "tpu_setup",
     "tpu_stat_file",
+    "tpu_doctor",
 ];
 
 /// Return the names (in advertising order) of every tool exposed by [`list()`].
@@ -1102,6 +1103,69 @@ pub fn list() -> Value {
                 "required": ["file"]
             },
             "annotations": { "readOnlyHint": true, "destructiveHint": false }
+        },
+        {
+            "name": "tpu_doctor",
+            "description":
+                "Diagnose (and optionally repair) mojibake and encoding damage in one or \
+                 more files. Use this when a file looks garbled (`Ã©` instead of `é`, \
+                 `â€\"` instead of `—`, `â\"€` instead of `─`, stray `Â ` before \
+                 numbers, …) or when a `tpu_read_file` call surfaced a `note: ... \
+                 file appears to contain mojibake` warning. \n\n\
+                 SCANS ONLY by default — returns a structured JSON report listing \
+                 every flagged file with its detected encoding, per-pattern match counts, \
+                 line/column locations, and whether a one-layer 'peel' repair would \
+                 strictly improve the file. Safe to call on directories and globs; \
+                 binary file extensions and `.git/` subtrees are skipped automatically. \n\n\
+                 REPAIRS only when called with `fix: \"peel\"`. The repair is conservative: \
+                 the file is rewritten only if the peel produces strictly fewer mojibake \
+                 matches than the original. The original content is preserved at \
+                 `<file>.bak` (the standard atomic-write backup). To preview without \
+                 writing, leave `fix` unset and inspect `peel_suggested` in the report. \n\n\
+                 Files containing the literal sentinel `encoding-check: allow-mojibake` \
+                 are treated as legitimate (test fixtures, regex sources, docs about \
+                 mojibake) and reported as clean. \n\n\
+                 When a teammate or another tool (e.g. PowerShell `Get-Content` / \
+                 `Set-Content`, a misconfigured generator) appears to have introduced \
+                 corruption, `git log -p -- <file>` will identify the introducing commit \
+                 and therefore the offending writer.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description":
+                            "A file, directory, or shell-style glob to scan. Either `path` \
+                             or `paths` must be provided; both may be combined."
+                    },
+                    "paths": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description":
+                            "Additional paths to scan, accumulated with `path`. Each may \
+                             be a file, directory, or shell-style glob."
+                    },
+                    "fix": {
+                        "type": "string",
+                        "enum": ["none", "peel"],
+                        "description":
+                            "Repair mode. `none` (default) reports only; `peel` applies a \
+                             single-layer mojibake undo to any file whose peel produces \
+                             strictly fewer matches than the original, rewriting it \
+                             atomically with a `.bak` backup."
+                    },
+                    "on_error": {
+                        "type": "string",
+                        "enum": ["fail", "warn"],
+                        "description":
+                            "How to handle per-entry walk errors (e.g. an inaccessible \
+                             subdirectory). `warn` (default) collects warnings into the \
+                             report and continues; `fail` stops on the first error."
+                    }
+                },
+                "required": []
+            },
+            "annotations": { "readOnlyHint": true, "destructiveHint": false }
         }
     ])
 }
@@ -1134,6 +1198,7 @@ pub fn call(
         "tpu_setup" => call_setup(args, config),
         "tpu_find" => call_find(args, config),
         "tpu_stat_file" => call_stat_file(args),
+        "tpu_doctor" => call_doctor(args, config),
         _ => Err(format!("unknown tool: {name}").into()),
     }
 }
@@ -2049,6 +2114,111 @@ fn call_stat_file(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
         "created_epoch_ms": created_epoch_ms,
         "readonly": readonly,
     }))?)
+}
+
+fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std::error::Error>> {
+    let mut all_paths: Vec<String> = Vec::new();
+    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+        all_paths.push(normalize_file_path(p));
+    }
+    if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
+        for p in arr {
+            if let Some(s) = p.as_str() {
+                all_paths.push(normalize_file_path(s));
+            }
+        }
+    }
+    if all_paths.is_empty() {
+        return Err("doctor: at least one `path` or entry in `paths` is required".into());
+    }
+
+    let fix = match args.get("fix") {
+        None => tpu::cmd::doctor::DoctorFix::None,
+        Some(v) => match v.as_str() {
+            Some("none") | None => tpu::cmd::doctor::DoctorFix::None,
+            Some("peel") => tpu::cmd::doctor::DoctorFix::Peel,
+            Some(other) => {
+                return Err(format!(
+                    "invalid value for `fix`: {other:?}; expected \"none\" or \"peel\""
+                )
+                .into());
+            }
+        },
+    };
+
+    let on_error = match args.get("on_error") {
+        None => tpu::cmd::copy::OnError::Warn,
+        Some(v) => match v.as_str() {
+            Some("warn") => tpu::cmd::copy::OnError::Warn,
+            Some("fail") => tpu::cmd::copy::OnError::Fail,
+            Some(other) => {
+                return Err(format!(
+                    "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
+                )
+                .into());
+            }
+            None => {
+                return Err(
+                    format!("invalid value for `on_error`: expected a string, got {v}").into(),
+                );
+            }
+        },
+    };
+    let _ = config;
+
+    let opts = tpu::cmd::doctor::DoctorOptions {
+        format: tpu::cmd::doctor::DoctorFormat::Json,
+        fix,
+        quiet: true,
+    };
+
+    let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
+    let mut walk_warnings: Vec<String> = Vec::new();
+    let mut sink: Vec<u8> = Vec::new();
+    let report = tpu::cmd::doctor::run_with_policy(
+        &path_refs,
+        opts,
+        &mut sink,
+        tpu::IoMode::Buffered,
+        on_error,
+        &mut walk_warnings,
+    )?;
+
+    let files: Vec<Value> = report
+        .issues
+        .iter()
+        .map(|issue| {
+            let matches: Vec<Value> = issue
+                .mojibake_matches
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "byte_offset": m.byte_offset,
+                        "line": m.line,
+                        "col": m.col,
+                        "pattern": m.pattern.name(),
+                    })
+                })
+                .collect();
+            serde_json::json!({
+                "path": issue.path.display().to_string(),
+                "encoding_detected": issue.encoding_detected,
+                "valid_in_detected_encoding": issue.valid_in_detected_encoding,
+                "mojibake_matches": matches,
+                "peel_suggested": issue.peel_suggested.is_some(),
+                "repaired": issue.repaired,
+            })
+        })
+        .collect();
+
+    let doc = serde_json::json!({
+        "files": files,
+        "total_files_scanned": report.total_files_scanned,
+        "total_issues": report.total_issues(),
+        "total_repaired": report.total_repaired,
+        "walk_warnings": walk_warnings,
+    });
+    Ok(serde_json::to_string(&doc)?)
 }
 
 fn call_validate_file(args: &Value) -> Result<String, Box<dyn std::error::Error>> {

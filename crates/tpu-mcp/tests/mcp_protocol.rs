@@ -210,6 +210,7 @@ fn mcp_it_1_initialize_and_tools_list() {
         "tpu_render_file",
         "tpu_setup",
         "tpu_stat_file",
+        "tpu_doctor",
     ] {
         assert!(
             names.contains(&expected),
@@ -621,5 +622,85 @@ fn mcp_it_11_setup_inject_and_replace() {
         !bak.exists(),
         ".bak file must not remain after successful inject; found: {}",
         bak.display()
+    );
+}
+
+/// MCP-IT-12: `tpu_doctor` returns structured JSON; with `fix: "peel"` it
+/// repairs a single-layer mojibake file.
+#[test]
+fn mcp_it_12_doctor_scan_and_peel() {
+    let dir = tempfile::tempdir().unwrap();
+    let clean = dir.path().join("clean.txt");
+    let dirty = dir.path().join("dirty.txt");
+    std::fs::write(&clean, "Hello, world.\n").unwrap();
+    // Single-layer mojibake fixture: original "cafe" with the `e` replaced
+    // by a double-encoded `\xc3\xa9` (the canonical Latin-1 mojibake
+    // signature `\xc3\x83 \xc2\xa9` rendered as UTF-8 bytes).  Built from
+    // raw byte sequences so this test source itself stays clean.
+    let dirty_bytes: &[u8] = b"caf\xc3\x83\xc2\xa9\n";
+    std::fs::write(&dirty, dirty_bytes).unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // Scan — must report only the dirty file with a peel suggestion.
+    let scan = s.call_tool(
+        "tpu_doctor",
+        json!({ "paths": [clean.to_str().unwrap(), dirty.to_str().unwrap()] }),
+    );
+    let v: serde_json::Value = serde_json::from_str(&scan)
+        .unwrap_or_else(|e| panic!("tpu_doctor scan must return JSON; got {scan:?}: {e}"));
+    assert_eq!(v["total_files_scanned"].as_u64().unwrap(), 2);
+    assert_eq!(v["total_issues"].as_u64().unwrap(), 1);
+    assert_eq!(v["total_repaired"].as_u64().unwrap(), 0);
+    let files = v["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1, "only the dirty file should be flagged: {v}");
+    assert!(files[0]["path"].as_str().unwrap().ends_with("dirty.txt"));
+    assert_eq!(files[0]["peel_suggested"], true);
+    assert_eq!(files[0]["repaired"], false);
+    assert!(
+        !files[0]["mojibake_matches"].as_array().unwrap().is_empty(),
+        "must report at least one mojibake match: {v}"
+    );
+
+    // Repair — peel must rewrite the dirty file with strictly fewer matches.
+    let peel = s.call_tool(
+        "tpu_doctor",
+        json!({ "path": dirty.to_str().unwrap(), "fix": "peel" }),
+    );
+    let vp: serde_json::Value = serde_json::from_str(&peel)
+        .unwrap_or_else(|e| panic!("tpu_doctor peel must return JSON; got {peel:?}: {e}"));
+    assert_eq!(vp["total_repaired"].as_u64().unwrap(), 1, "peel result: {vp}");
+
+    // Post-repair, the file's bytes must be the UTF-8 for "cafe<U+00E9>\n"
+    // (one peel layer removes the spurious wrapping).
+    let repaired_bytes = std::fs::read(&dirty).expect("dirty file readable post-repair");
+    assert_eq!(
+        repaired_bytes,
+        b"caf\xc3\xa9\n",
+        "peel must recover the original UTF-8 bytes; got: {repaired_bytes:?}"
+    );
+
+    // Re-scan must now show zero issues.
+    let rescan = s.call_tool("tpu_doctor", json!({ "path": dirty.to_str().unwrap() }));
+    let vr: serde_json::Value = serde_json::from_str(&rescan)
+        .unwrap_or_else(|e| panic!("rescan JSON: {rescan:?}: {e}"));
+    assert_eq!(
+        vr["total_issues"].as_u64().unwrap(),
+        0,
+        "post-repair rescan must be clean: {vr}"
+    );
+}
+
+/// MCP-IT-13: `tpu_doctor` rejects calls with no path argument.
+#[test]
+fn mcp_it_13_doctor_requires_path() {
+    let mut s = McpSession::start();
+    s.initialize();
+    let result = s.rpc("tools/call", json!({ "name": "tpu_doctor", "arguments": {} }));
+    assert_eq!(
+        result.get("isError").and_then(|v| v.as_bool()),
+        Some(true),
+        "missing `path` must surface as isError=true; got result: {result}"
     );
 }
