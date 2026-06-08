@@ -75,11 +75,13 @@ mod code {
 
 // ── event loop ────────────────────────────────────────────────────────────────
 
-fn main() {    // I/O-worker mode short-circuits everything else: the process becomes a
+fn main() {
+    // I/O-worker mode short-circuits everything else: the process becomes a
     // private child of the parent MCP server, talking the simple JSON wire
     // protocol defined in `worker.rs` and never touching the MCP framing.
     if std::env::args_os().any(|a| a == worker::WORKER_ARG) {
         worker::run_worker();
+    }
     }
     let (config, startup_warnings) = parse_config();
 
