@@ -2139,13 +2139,16 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn st
     let fix = match args.get("fix") {
         None => tpu::cmd::doctor::DoctorFix::None,
         Some(v) => match v.as_str() {
-            Some("none") | None => tpu::cmd::doctor::DoctorFix::None,
+            Some("none") => tpu::cmd::doctor::DoctorFix::None,
             Some("peel") => tpu::cmd::doctor::DoctorFix::Peel,
             Some(other) => {
                 return Err(format!(
                     "invalid value for `fix`: {other:?}; expected \"none\" or \"peel\""
                 )
                 .into());
+            }
+            None => {
+                return Err(format!("invalid value for `fix`: expected a string, got {v}").into());
             }
         },
     };
