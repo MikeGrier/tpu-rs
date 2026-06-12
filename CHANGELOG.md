@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.3.1](https://github.com/MikeGrier/tpu-rs/compare/v0.3.0...v0.3.1) (2026-06-12)
+
+
+### Bug Fixes
+
+* **extension:** split configuration into two blocks for deterministic ordering ([5c6f280](https://github.com/MikeGrier/tpu-rs/commit/5c6f280b6740dce876c69288b583859472c6ed1b))
+* **extension:** surface Copilot setup chat in extension settings ([5e3307b](https://github.com/MikeGrier/tpu-rs/commit/5e3307b13b14a461bb20940ece9cd82025a7fc8f))
+
 ## [0.3.0](https://github.com/MikeGrier/tpu-rs/compare/v0.2.0...v0.3.0) (2026-06-12)
 
 
