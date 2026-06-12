@@ -2,7 +2,7 @@
     "name": "tpu-mcp",
     "displayName": "tpu-mcp — encoding-safe file I/O for Copilot",
     "description": "MCP server for encoding-aware file I/O: read, write, replace, search, and validate files with correct handling of UTF-8, UTF-16LE/BE, Windows-1252, Shift-JIS, and CRLF/LF/CR line endings. Use from Copilot Chat instead of PowerShell/shell file commands to avoid encoding corruption.",
-    "version": "0.3.0",
+    "version": "0.3.1",
     "publisher": "MikeGrierTools",
     "license": "MIT",
     "author": {
@@ -71,7 +71,7 @@
                 "properties": {
                     "tpu-mcp.gettingStarted": {
                         "type": "null",
-                        "markdownDescription": "[Open Copilot setup chat](command:tpu-mcp.openSetupChat) \u2014 asks Copilot to run the `tpu_setup` MCP tool, which (re)writes the managed `tpu-mcp` guidance block into your repository's `.github/copilot-instructions.md` so Copilot prefers the encoding-safe `tpu_*` tools over `Get-Content` / `Set-Content` / shell redirection in every future session in this workspace."
+                        "markdownDescription": "[Open Copilot setup chat](command:tpu-mcp.openSetupChat) — asks Copilot to run the `tpu_setup` MCP tool, which (re)writes the managed `tpu-mcp` guidance block into your repository's `.github/copilot-instructions.md` so Copilot prefers the encoding-safe `tpu_*` tools over `Get-Content` / `Set-Content` / shell redirection in every future session in this workspace."
                     }
                 }
             },
@@ -123,7 +123,7 @@
                             "Suppress per-entry warning details and surface only a summary count at the end of the operation."
                         ],
                         "default": "each-file",
-                        "markdownDescription": "How much walk-error detail tree-walking tools include in their results. `each-file` (default) includes a `log` array of warning strings in `tpu_copy_file` results and individual warning lines in `tpu_find` output \u2014 each entry represents an inaccessible path or walk error. `summary` suppresses those per-entry details and collapses all walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
+                        "markdownDescription": "How much walk-error detail tree-walking tools include in their results. `each-file` (default) includes a `log` array of warning strings in `tpu_copy_file` results and individual warning lines in `tpu_find` output — each entry represents an inaccessible path or walk error. `summary` suppresses those per-entry details and collapses all walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
                     }
                 }
             }
