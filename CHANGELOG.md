@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.2.0](https://github.com/MikeGrier/tpu-rs/compare/v0.1.5...v0.2.0) (2026-06-08)
+
+
+### Features
+
+* force a feature version bump ([#30](https://github.com/MikeGrier/tpu-rs/issues/30)) ([9315ffd](https://github.com/MikeGrier/tpu-rs/commit/9315ffd20aad0ac0ed145d6e895ce07ee3ddffe5))
+
 ## [0.1.5](https://github.com/MikeGrier/tpu-rs/compare/v0.1.4...v0.1.5) (2026-05-14)
 
 
