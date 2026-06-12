@@ -64,61 +64,70 @@
                 "category": "tpu-mcp"
             }
         ],
-        "configuration": {
-            "title": "tpu-mcp",
-            "properties": {
-                "tpu-mcp.gettingStarted": {
-                    "type": "null",
-                    "markdownDescription": "[Open Copilot setup chat](command:tpu-mcp.openSetupChat) \u2014 asks Copilot to run the `tpu_setup` MCP tool, which (re)writes the managed `tpu-mcp` guidance block into your repository's `.github/copilot-instructions.md` so Copilot prefers the encoding-safe `tpu_*` tools over `Get-Content` / `Set-Content` / shell redirection in every future session in this workspace."
-                },
-                "tpu-mcp.verifyDelayMs": {
-                    "type": "integer",
-                    "default": 100,
-                    "minimum": 0,
-                    "maximum": 60000,
-                    "markdownDescription": "Delay in milliseconds after a write before tpu-mcp re-reads file metadata to detect Windows Defender minifilter reverts. Set to `0` once a Defender exclusion is in place to skip the verification entirely. See the README for details."
-                },
-                "tpu-mcp.binaryPath": {
-                    "type": "string",
-                    "default": "",
-                    "markdownDescription": "Override the path to the `tpu-mcp` binary. Leave blank to use the binary bundled with the extension. Intended for development against a locally-built `tpu-mcp`."
-                },
-                "tpu-mcp.extraArgs": {
-                    "type": "array",
-                    "items": {
-                        "type": "string"
+        "configuration": [
+            {
+                "title": "tpu-mcp",
+                "order": 1,
+                "properties": {
+                    "tpu-mcp.gettingStarted": {
+                        "type": "null",
+                        "markdownDescription": "[Open Copilot setup chat](command:tpu-mcp.openSetupChat) \u2014 asks Copilot to run the `tpu_setup` MCP tool, which (re)writes the managed `tpu-mcp` guidance block into your repository's `.github/copilot-instructions.md` so Copilot prefers the encoding-safe `tpu_*` tools over `Get-Content` / `Set-Content` / shell redirection in every future session in this workspace."
+                    }
+                }
+            },
+            {
+                "title": "tpu-mcp",
+                "order": 2,
+                "properties": {
+                    "tpu-mcp.verifyDelayMs": {
+                        "type": "integer",
+                        "default": 100,
+                        "minimum": 0,
+                        "maximum": 60000,
+                        "markdownDescription": "Delay in milliseconds after a write before tpu-mcp re-reads file metadata to detect Windows Defender minifilter reverts. Set to `0` once a Defender exclusion is in place to skip the verification entirely. See the README for details."
                     },
-                    "default": [],
-                    "markdownDescription": "Additional command-line arguments appended to the `tpu-mcp` invocation. Intended for advanced/debug scenarios."
-                },
-                "tpu-mcp.errorMode": {
-                    "type": "string",
-                    "enum": [
-                        "continue",
-                        "strict"
-                    ],
-                    "enumDescriptions": [
-                        "Tools that walk file trees (`tpu_find`, `tpu_copy_file`) emit a warning and skip past unreadable entries instead of aborting the whole operation.",
-                        "Tools abort on the first walk error (the legacy 'fail-fast' behaviour). Use this when you want any inaccessible path to surface as a hard error."
-                    ],
-                    "default": "continue",
-                    "markdownDescription": "Default error policy for `tpu_find` and `tpu_copy_file` when an entry cannot be read or written. Per-call `on_error` arguments still override this default. Forwarded to the server via the `TPU_DEFAULT_ERROR_MODE` environment variable."
-                },
-                "tpu-mcp.progressDetail": {
-                    "type": "string",
-                    "enum": [
-                        "each-file",
-                        "summary"
-                    ],
-                    "enumDescriptions": [
-                        "Include a per-operation warning log: each inaccessible path or walk error appears as a separate entry (successfully skipped destinations are counted in the summary only, not individually logged).",
-                        "Suppress per-entry warning details and surface only a summary count at the end of the operation."
-                    ],
-                    "default": "each-file",
-                    "markdownDescription": "How much walk-error detail tree-walking tools include in their results. `each-file` (default) includes a `log` array of warning strings in `tpu_copy_file` results and individual warning lines in `tpu_find` output — each entry represents an inaccessible path or walk error. `summary` suppresses those per-entry details and collapses all walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
+                    "tpu-mcp.binaryPath": {
+                        "type": "string",
+                        "default": "",
+                        "markdownDescription": "Override the path to the `tpu-mcp` binary. Leave blank to use the binary bundled with the extension. Intended for development against a locally-built `tpu-mcp`."
+                    },
+                    "tpu-mcp.extraArgs": {
+                        "type": "array",
+                        "items": {
+                            "type": "string"
+                        },
+                        "default": [],
+                        "markdownDescription": "Additional command-line arguments appended to the `tpu-mcp` invocation. Intended for advanced/debug scenarios."
+                    },
+                    "tpu-mcp.errorMode": {
+                        "type": "string",
+                        "enum": [
+                            "continue",
+                            "strict"
+                        ],
+                        "enumDescriptions": [
+                            "Tools that walk file trees (`tpu_find`, `tpu_copy_file`) emit a warning and skip past unreadable entries instead of aborting the whole operation.",
+                            "Tools abort on the first walk error (the legacy 'fail-fast' behaviour). Use this when you want any inaccessible path to surface as a hard error."
+                        ],
+                        "default": "continue",
+                        "markdownDescription": "Default error policy for `tpu_find` and `tpu_copy_file` when an entry cannot be read or written. Per-call `on_error` arguments still override this default. Forwarded to the server via the `TPU_DEFAULT_ERROR_MODE` environment variable."
+                    },
+                    "tpu-mcp.progressDetail": {
+                        "type": "string",
+                        "enum": [
+                            "each-file",
+                            "summary"
+                        ],
+                        "enumDescriptions": [
+                            "Include a per-operation warning log: each inaccessible path or walk error appears as a separate entry (successfully skipped destinations are counted in the summary only, not individually logged).",
+                            "Suppress per-entry warning details and surface only a summary count at the end of the operation."
+                        ],
+                        "default": "each-file",
+                        "markdownDescription": "How much walk-error detail tree-walking tools include in their results. `each-file` (default) includes a `log` array of warning strings in `tpu_copy_file` results and individual warning lines in `tpu_find` output \u2014 each entry represents an inaccessible path or walk error. `summary` suppresses those per-entry details and collapses all walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
+                    }
                 }
             }
-        }
+        ]
     },
     "scripts": {
         "clean": "rimraf out",

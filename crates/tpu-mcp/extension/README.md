@@ -46,8 +46,10 @@ You have three ways to inject (or refresh) that section:
    `.github/copilot-instructions.md`. Review the diff Copilot proposes,
    accept, and commit.
 2. **Extension settings page** \u2014 search settings for **tpu-mcp**; the
-   first entry, **Getting started**, has a clickable
-   **Open Copilot setup chat** link that does the same thing.
+   top section (titled **tpu-mcp**) contains a single **Getting started**
+   entry with a clickable **Open Copilot setup chat** link that does the
+   same thing. The remaining technical settings appear in a second
+   **tpu-mcp** section below.
 3. **From the CLI** \u2014 if you have the `tpu` binary on your `PATH`,
    `tpu setup --inject` writes the block directly without going through
    Copilot. Useful in scripted setup.
