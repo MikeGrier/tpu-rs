@@ -706,7 +706,9 @@ enum Commands {
         /// Pattern to search for (positional shorthand for the first --pattern).
         pattern: Option<String>,
 
-        /// File or glob to search in (positional shorthand for the first --path).
+        /// File, directory, or glob to search in (positional shorthand for
+        /// the first --path). A directory must be paired with --glob to
+        /// select which files under it to search.
         path: Option<String>,
 
         /// Pattern(s) to search for (Rust regex syntax).  Repeatable.
@@ -714,8 +716,9 @@ enum Commands {
         #[arg(long = "pattern", value_name = "PATTERN", action = clap::ArgAction::Append)]
         patterns: Vec<String>,
 
-        /// Path(s) or glob(s) to search in.  Repeatable.
-        /// A glob is any path containing `*`, `?`, `[`, or `{`.
+        /// Path(s) to search in.  Repeatable.  Each value may be a file, a
+        /// directory (paired with --glob to select files under it), or a
+        /// glob containing `*`, `?`, `[`, or `{`.
         #[arg(long = "path", value_name = "GLOB", action = clap::ArgAction::Append)]
         paths: Vec<String>,
 

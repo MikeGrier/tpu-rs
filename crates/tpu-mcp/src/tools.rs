@@ -848,14 +848,18 @@ pub fn list() -> Value {
                     "path": {
                         "type": "string",
                         "description":
-                            "Absolute file path or wax glob to search. \
-                             At least one of 'path' or 'paths' must be supplied."
+                            "Absolute path to a file, directory, or wax glob to \
+                             search. A directory must be paired with `glob` to \
+                             select which files under it to search. At least one \
+                             of 'path' or 'paths' must be supplied."
                     },
                     "paths": {
                         "type": "array",
                         "description":
-                            "Additional file paths or wax globs. Combined with 'path' \
-                             (if present).",
+                            "Additional file paths, directories, or wax globs. \
+                             Combined with 'path' (if present). When `glob` is \
+                             supplied it applies to every directory entry in \
+                             `path`/`paths`; literal file entries are searched as-is.",
                         "items": { "type": "string" }
                     },
                     "glob": {
