@@ -184,3 +184,35 @@ Run it after fallback edits, and rely on CI to run it on every PR.
 For richer per-file diagnostics or in-place repair, use
 `tpu doctor <path>` (optionally with `--fix=peel`); `check-encoding.ps1`
 is the cheap binary gate, `tpu doctor` is the structured tool.
+
+## Responding to PR review comments
+
+When addressing review comments on a pull request (Copilot reviewer or
+human), **reply on each individual review thread**, not only with a
+summary comment on the PR conversation.
+
+Why: as a PR accumulates more rounds of review, a single summary comment
+makes it impossible to tell from the GitHub UI which inline threads are
+old vs. new, or which have been addressed. A per-thread reply leaves an
+"author replied" marker on each line where the reviewer raised an issue.
+
+Procedure:
+
+1. Fetch the inline review comments and their IDs:
+   ```pwsh
+   gh api repos/<owner>/<repo>/pulls/<num>/comments --jq '.[] | {id, path, line, user: .user.login, body: (.body | .[0:80])}'
+   ```
+2. For each comment, post a reply to that specific thread:
+   ```pwsh
+   gh api -X POST "repos/<owner>/<repo>/pulls/<num>/comments/<comment-id>/replies" -F body=@reply.md
+   ```
+3. Keep each reply short and concrete: name the commit SHA that
+   addressed it and (when small) quote the new behaviour. If you
+   intentionally chose not to act on a comment, say so on that thread.
+4. A summary comment on the PR conversation is fine *in addition*, but
+   never *instead*.
+
+The VS Code GitHub Pull Request extension's `resolveReviewThread` tool
+often reports `canResolve: false` for Copilot-authored threads; in that
+case post the per-thread reply via `gh api` as above and let the human
+maintainer resolve.
