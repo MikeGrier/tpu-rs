@@ -719,6 +719,14 @@ enum Commands {
         #[arg(long = "path", value_name = "GLOB", action = clap::ArgAction::Append)]
         paths: Vec<String>,
 
+        /// Filename glob applied when a `--path` (or positional PATH) is a
+        /// directory: walk that directory recursively and search every file
+        /// whose path-relative-to-it matches this glob (e.g.
+        /// `--glob "**/*.ndjson"`). File paths are included as-is and are
+        /// not filtered. Mutually exclusive with glob-shaped path specs.
+        #[arg(long = "glob", value_name = "GLOB")]
+        glob: Option<String>,
+
         /// In multi-pattern mode, require ALL patterns to match (AND).
         /// By default any single pattern match is sufficient (OR).
         #[arg(long)]
@@ -1745,6 +1753,7 @@ fn run(
             path,
             patterns,
             paths,
+            glob,
             all_match,
             fixed_strings,
             ignore_case,
@@ -1788,6 +1797,7 @@ fn run(
             let result = cmd::find::run_with_policy(
                 &path_refs,
                 &pattern_refs,
+                glob.as_deref(),
                 fixed_strings,
                 multiline,
                 ignore_case,

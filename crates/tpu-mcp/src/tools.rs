@@ -858,6 +858,19 @@ pub fn list() -> Value {
                              (if present).",
                         "items": { "type": "string" }
                     },
+                    "glob": {
+                        "type": "string",
+                        "description":
+                            "Filename glob applied when a `path` is a directory. The \
+                             directory is walked recursively and every file whose path \
+                             relative to it matches the glob is searched. Use this for \
+                             the common `find DIR -name PAT` shape, e.g. \
+                             path:\"q:/src/foo/.scratch\", glob:\"**/*.ndjson\". \
+                             Literal file paths supplied via `path`/`paths` are included \
+                             as-is and are not filtered. Mutually exclusive with paths \
+                             that themselves contain glob metacharacters (`*`, `?`, `[`, \
+                             `{`)."
+                    },
                     "all_match": {
                         "type": "boolean",
                         "description":
@@ -1802,6 +1815,11 @@ fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std:
     let after = args.get("after").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
     let before = args.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
+    let glob = args
+        .get("glob")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
     let pattern_refs: Vec<&str> = all_patterns.iter().map(String::as_str).collect();
     let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
 
@@ -1829,6 +1847,7 @@ fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std:
     let result = tpu::cmd::find::run_with_policy(
         &path_refs,
         &pattern_refs,
+        glob.as_deref(),
         fixed_strings,
         multiline,
         ignore_case,
