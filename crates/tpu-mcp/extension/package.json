@@ -60,13 +60,17 @@
             },
             {
                 "command": "tpu-mcp.openSetupChat",
-                "title": "tpu-mcp: Open chat to inject Copilot guidance (tpu setup --inject)",
+                "title": "tpu-mcp: Open Copilot setup chat",
                 "category": "tpu-mcp"
             }
         ],
         "configuration": {
             "title": "tpu-mcp",
             "properties": {
+                "tpu-mcp.gettingStarted": {
+                    "type": "null",
+                    "markdownDescription": "[Open Copilot setup chat](command:tpu-mcp.openSetupChat) \u2014 asks Copilot to run the `tpu_setup` MCP tool, which (re)writes the managed `tpu-mcp` guidance block into your repository's `.github/copilot-instructions.md` so Copilot prefers the encoding-safe `tpu_*` tools over `Get-Content` / `Set-Content` / shell redirection in every future session in this workspace."
+                },
                 "tpu-mcp.verifyDelayMs": {
                     "type": "integer",
                     "default": 100,

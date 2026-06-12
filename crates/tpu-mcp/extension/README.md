@@ -30,6 +30,41 @@ After install, reload the window (Command Palette \u2192 **Developer: Reload
 Window**) and the `tpu-mcp` server will appear under
 **MCP: List Servers**.
 
+## Tell Copilot to use the tools
+
+The extension makes the `tpu_*` tools available, but Copilot still needs to
+know it should prefer them over `Get-Content` / `Set-Content` / `cat` /
+shell redirection. The most reliable way to do that is a short managed
+section in your repository's Copilot instruction file
+(`.github/copilot-instructions.md`).
+
+You have three ways to inject (or refresh) that section:
+
+1. **Command Palette** \u2014 `Ctrl+Shift+P` \u2192 **tpu-mcp: Open Copilot
+   setup chat**. Opens Copilot Chat with a one-shot prompt that asks the
+   agent to call the `tpu_setup` MCP tool against your workspace's
+   `.github/copilot-instructions.md`. Review the diff Copilot proposes,
+   accept, and commit.
+2. **Extension settings page** \u2014 search settings for **tpu-mcp**; the
+   first entry, **Getting started**, has a clickable
+   **Open Copilot setup chat** link that does the same thing.
+3. **From the CLI** \u2014 if you have the `tpu` binary on your `PATH`,
+   `tpu setup --inject` writes the block directly without going through
+   Copilot. Useful in scripted setup.
+
+The injected block is delimited by
+`<!-- tpu-mcp:setup:begin -->` / `<!-- tpu-mcp:setup:end -->` markers, so
+re-running setup is idempotent: it replaces the managed section in place
+and leaves any surrounding content untouched.
+
+Why is this step necessary? MCP tool descriptions are only visible to
+Copilot after it has already chosen how to carry out a task. A repository
+instruction file is loaded *before* that decision, so it reliably
+intercepts the choice before Copilot reaches for a terminal. Without it
+Copilot may use `tpu_*` correctly in isolation but fall back to PowerShell
+in the middle of a multi-step workflow, silently corrupting non-ASCII
+files.
+
 ## Settings
 
 | Setting | Default | Purpose |
@@ -37,13 +72,18 @@ Window**) and the `tpu-mcp` server will appear under
 | `tpu-mcp.verifyDelayMs` | `100` | Delay (ms) after a write before re-reading file metadata, to detect Windows Defender minifilter reverts. Set to `0` once a Defender exclusion is in place. |
 | `tpu-mcp.binaryPath` | `""` | Override the bundled binary path (developer use, against a locally-built `tpu-mcp`). |
 | `tpu-mcp.extraArgs` | `[]` | Extra CLI args appended to the server invocation. |
+| `tpu-mcp.errorMode` | `continue` | Default error policy for `tpu_find` / `tpu_copy_file` when an entry can't be read. Per-call `on_error` overrides. |
+| `tpu-mcp.progressDetail` | `each-file` | How much walk-error detail tree-walking tools include in their results. |
 
 ## Commands
 
-- **tpu-mcp: Copy bundled server binary path** -- puts the absolute path
-  on the clipboard, useful for VS proper / external clients.
-- **tpu-mcp: Show bundled server version** -- displays the version of the
-  bundled `tpu-mcp` binary.
+- **tpu-mcp: Open Copilot setup chat** \u2014 opens Copilot Chat with a
+  prompt that asks the agent to run the `tpu_setup` MCP tool and inject
+  the managed guidance block into `.github/copilot-instructions.md`.
+- **tpu-mcp: Copy bundled server binary path** \u2014 puts the absolute
+  path on the clipboard, useful for external MCP clients.
+- **tpu-mcp: Show bundled server version** \u2014 displays the version of
+  the bundled `tpu-mcp` binary.
 
 ## Tools exposed to Copilot
 
