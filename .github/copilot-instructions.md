@@ -28,7 +28,7 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 | `tpu_edit_file` | targeted insert/delete/splice at known line numbers |
 | `tpu_validate_file` | pre-flight assertion that a file is in the expected state |
 | `tpu_count_file` | line / word / char / byte / pattern counts |
-| `tpu_find` | encoding-aware grep across files and globs |
+| `tpu_find` | encoding-aware grep across files and globs (pass `glob` to filter a directory walk, e.g. `path: "DIR", glob: "**/*.ndjson"`) |
 | `tpu_copy_file` | copy a file or recursively copy a tree (resilient: per-entry warnings, never aborts mid-walk by default) |
 | `tpu_render_file` | populate a file from a `{{TOKEN}}` template |
 | `tpu_stat_file` | verify a write actually persisted (mtime / size) |
@@ -48,7 +48,11 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
   not in the expected state.
 - **Globs / recursion** — `tpu_find` and `tpu_copy_file` accept glob
   patterns and tolerate inaccessible directories by emitting warning
-  records (configurable via the `on_error` argument).
+  records (configurable via the `on_error` argument). To search a directory
+  tree with `tpu_find`, pass the directory as `path` and the filename
+  pattern as `glob` (e.g. `path: "q:/src/foo/.scratch", glob: "**/*.ndjson"`)
+  — this is the `find DIR -name PAT` shape and is the only way to recurse
+  into an absolute directory.
 - **Dependency-free templating** — `tpu_render_file` substitutes
   `{{NAME}}`-style tokens. Use `\{{` to emit literal braces.
 

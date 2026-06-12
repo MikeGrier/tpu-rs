@@ -118,14 +118,26 @@ fn line_matches(line: &str, regexes: &[Regex], all_match: bool, invert: bool) ->
 /// Returns an error if a glob pattern is syntactically invalid or matches no
 /// files.
 ///
-/// Equivalent to [`expand_paths_with_policy`] with [`crate::cmd::copy::OnError::Fail`]
-/// — i.e. the legacy "abort on first walk error" behaviour.
+/// Equivalent to [`expand_paths_with_policy`] with no `glob` and
+/// [`crate::cmd::copy::OnError::Fail`] — i.e. the legacy "abort on first walk
+/// error" behaviour.
 #[allow(dead_code)]
 pub fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
-    expand_paths_with_policy(path_specs, crate::cmd::copy::OnError::Fail, &mut Vec::new())
+    expand_paths_with_policy(
+        path_specs,
+        None,
+        crate::cmd::copy::OnError::Fail,
+        &mut Vec::new(),
+    )
 }
 
 /// Expand path specifications with explicit handling of walk errors.
+///
+/// When `glob` is `Some`, each directory in `path_specs` is walked
+/// recursively and every file whose path-relative-to-that-directory matches
+/// the supplied glob is included. File specs are included as-is (the caller
+/// asked for that exact file). Path specs that themselves contain glob
+/// metacharacters are rejected in this mode — pick one form.
 ///
 /// When `on_error` is [`crate::cmd::copy::OnError::Warn`] (the default for
 /// CLI/MCP use), unreadable directories produce a textual warning appended
@@ -134,13 +146,87 @@ pub fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn std::er
 /// `{"reason":"warning"}` records or stderr notes).
 pub fn expand_paths_with_policy(
     path_specs: &[&str],
+    glob: Option<&str>,
     on_error: crate::cmd::copy::OnError,
     warnings_out: &mut Vec<String>,
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut paths: Vec<PathBuf> = Vec::new();
+
+    // Pre-compile the filename matcher once when `glob` is supplied so we
+    // don't recompile per spec.
+    let glob_matcher = match glob {
+        Some(g) => Some(
+            Glob::new(g)
+                .map_err(|e| format!("find: invalid glob {:?}: {e}", g))?
+                .compile_matcher(),
+        ),
+        None => None,
+    };
+
     for &spec in path_specs {
         let is_glob =
             spec.contains('*') || spec.contains('?') || spec.contains('[') || spec.contains('{');
+
+        if let Some(ref matcher) = glob_matcher {
+            // `glob` mode: every spec is either a directory (walked and
+            // filtered by the glob) or a literal file (included as-is).
+            // Mixing in a glob-shaped path spec is ambiguous, so reject.
+            if is_glob {
+                return Err(format!(
+                    "find: path {:?} contains glob metacharacters but a \
+                     separate `glob` was also supplied; pick one form",
+                    spec,
+                )
+                .into());
+            }
+            let p = PathBuf::from(spec);
+            if p.is_dir() {
+                let before = paths.len();
+                for entry in WalkDir::new(&p) {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(e) => match on_error {
+                            crate::cmd::copy::OnError::Fail => {
+                                return Err(format!("find: walk error in {spec:?}: {e}").into());
+                            }
+                            crate::cmd::copy::OnError::Warn => {
+                                let path_hint = e
+                                    .path()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or_else(|| "?".to_string());
+                                warnings_out
+                                    .push(format!("find: cannot access {path_hint}: {e}"));
+                                continue;
+                            }
+                        },
+                    };
+                    if entry.file_type().is_file() {
+                        // Match the path relative to the walk root so the
+                        // glob is anchored at the user-supplied directory,
+                        // not at CWD.
+                        let rel = entry.path().strip_prefix(&p).unwrap_or(entry.path());
+                        if matcher.is_match(rel) {
+                            paths.push(entry.path().to_path_buf());
+                        }
+                    }
+                }
+                if paths.len() == before {
+                    return Err(format!(
+                        "find: glob {:?} matched no files under {:?}",
+                        glob.unwrap(),
+                        spec,
+                    )
+                    .into());
+                }
+            } else {
+                // Literal file path: include as-is. The caller explicitly
+                // picked this file, so the glob does not filter it out.
+                paths.push(p);
+            }
+            continue;
+        }
+
+        // ── Legacy mode (no separate `glob`) ──────────────────────────────
         if is_glob {
             let matcher = Glob::new(spec)
                 .map_err(|e| format!("find: invalid glob {:?}: {e}", spec))?
@@ -177,12 +263,14 @@ pub fn expand_paths_with_policy(
             let p = PathBuf::from(spec);
             if p.is_dir() {
                 if p.is_absolute() {
-                    // The glob walker starts at "." and only matches relative
-                    // paths, so an absolute glob would never match anything.
-                    // Give a tailored message instead of a broken suggestion.
+                    // The legacy glob walker starts at "." and only matches
+                    // relative paths, so an absolute glob would never match
+                    // anything. Point the caller at the `glob` parameter,
+                    // which walks the supplied directory directly.
                     return Err(format!(
-                        "find: {:?} is a directory — pass individual file \
-                         paths or a relative glob pattern instead",
+                        "find: {:?} is a directory — pass a `glob` (e.g. \
+                         glob:\"**/*.txt\") to search it recursively, or \
+                         pass individual file paths instead",
                         spec,
                     )
                     .into());
@@ -205,8 +293,9 @@ pub fn expand_paths_with_policy(
                     format!("{normalized}/**")
                 };
                 return Err(format!(
-                    "find: {:?} is a directory — pass a glob pattern to search \
-                     recursively, e.g. {:?}",
+                    "find: {:?} is a directory — pass a `glob` (e.g. \
+                     glob:\"**/*.txt\") to search it recursively, or pass \
+                     a path-glob like {:?}",
                     spec, example,
                 )
                 .into());
@@ -402,6 +491,7 @@ fn run_single_file(
 pub fn run(
     path_specs: &[&str],
     patterns: &[&str],
+    glob: Option<&str>,
     fixed_string: bool,
     multiline: bool,
     ignore_case: bool,
@@ -417,6 +507,7 @@ pub fn run(
     run_with_policy(
         path_specs,
         patterns,
+        glob,
         fixed_string,
         multiline,
         ignore_case,
@@ -441,6 +532,7 @@ pub fn run(
 pub fn run_with_policy(
     path_specs: &[&str],
     patterns: &[&str],
+    glob: Option<&str>,
     fixed_string: bool,
     multiline: bool,
     ignore_case: bool,
@@ -456,7 +548,7 @@ pub fn run_with_policy(
     warnings_out: &mut Vec<String>,
 ) -> Result<FindResult, Box<dyn std::error::Error>> {
     let regexes = build_patterns(patterns, fixed_string, multiline, ignore_case)?;
-    let files = expand_paths_with_policy(path_specs, on_error, warnings_out)?;
+    let files = expand_paths_with_policy(path_specs, glob, on_error, warnings_out)?;
     let multi_file = files.len() > 1;
 
     let mut total_matches = 0usize;
@@ -534,6 +626,7 @@ mod tests {
                 "definitely_does_not_exist_b.txt",
             ],
             &["pattern"],
+            None,
             false,
             false,
             false,
@@ -1088,20 +1181,114 @@ mod tests {
     }
 
     #[test]
-    fn expand_paths_absolute_dir_gives_tailored_message() {
+    fn expand_paths_absolute_dir_suggests_glob_param() {
         let dir = tempfile::TempDir::new().unwrap();
         let abs = dir.path().to_str().unwrap();
         let err = expand_paths(&[abs]).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("is a directory"), "got: {msg}");
-        // Should NOT contain a glob suggestion (it would be non-functional)
+        // The new guidance points the caller at the `glob` parameter,
+        // which walks the supplied directory directly.
         assert!(
-            !msg.contains("/**"),
-            "absolute dir should not suggest a glob; got: {msg}"
+            msg.contains("`glob`"),
+            "should mention the `glob` parameter; got: {msg}"
         );
+    }
+
+    // ── expand_paths_with_policy: --glob mode ─────────────────────────────────
+
+    /// Helper: create a temp directory populated with the given relative
+    /// file paths.  Each file is created empty.
+    fn make_dir_with_files(files: &[&str]) -> tempfile::TempDir {
+        let dir = tempfile::TempDir::new().unwrap();
+        for rel in files {
+            let p = dir.path().join(rel);
+            if let Some(parent) = p.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(&p, b"").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn expand_paths_glob_walks_absolute_directory() {
+        // The motivating bug: an absolute directory + glob filter should
+        // walk that directory and return only files matching the glob.
+        let dir = make_dir_with_files(&[
+            "md31_t1.ndjson",
+            "md31_t2.ndjson",
+            "other.ndjson",
+            "subdir/md31_t3.ndjson",
+            "subdir/notes.txt",
+        ]);
+        let abs = dir.path().to_str().unwrap().to_owned();
+        let mut warnings: Vec<String> = Vec::new();
+        let paths = expand_paths_with_policy(
+            &[abs.as_str()],
+            Some("**/md31_t*.ndjson"),
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 3, "got: {paths:?}");
+        for p in &paths {
+            let name = p.file_name().unwrap().to_string_lossy();
+            assert!(name.starts_with("md31_t"), "unexpected: {name}");
+        }
+    }
+
+    #[test]
+    fn expand_paths_glob_matches_no_files_errors() {
+        let dir = make_dir_with_files(&["a.txt", "b.txt"]);
+        let abs = dir.path().to_str().unwrap().to_owned();
+        let mut warnings: Vec<String> = Vec::new();
+        let err = expand_paths_with_policy(
+            &[abs.as_str()],
+            Some("**/*.ndjson"),
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("matched no files"), "got: {msg}");
+    }
+
+    #[test]
+    fn expand_paths_glob_passes_through_file_specs() {
+        // A literal file path is included as-is when `glob` is supplied;
+        // the glob does not filter explicitly-named files.
+        let dir = make_dir_with_files(&["only.txt"]);
+        let file = dir.path().join("only.txt");
+        let file_str = file.to_str().unwrap().to_owned();
+        let mut warnings: Vec<String> = Vec::new();
+        let paths = expand_paths_with_policy(
+            &[file_str.as_str()],
+            Some("**/*.ndjson"),
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0], file);
+    }
+
+    #[test]
+    fn expand_paths_glob_rejects_glob_in_path_spec() {
+        // Mixing a glob-shaped path spec with a separate `glob` is
+        // ambiguous and must be rejected.
+        let mut warnings: Vec<String> = Vec::new();
+        let err = expand_paths_with_policy(
+            &["some/**/path"],
+            Some("*.txt"),
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        )
+        .unwrap_err();
+        let msg = err.to_string();
         assert!(
-            msg.contains("relative glob"),
-            "should mention 'relative glob'; got: {msg}"
+            msg.contains("glob metacharacters") && msg.contains("pick one form"),
+            "got: {msg}"
         );
     }
 }
