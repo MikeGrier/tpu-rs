@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.3.0](https://github.com/MikeGrier/tpu-rs/compare/v0.2.0...v0.3.0) (2026-06-12)
+
+
+### Features
+
+* **find:** add explicit glob parameter to filter directory walks ([bb16e6a](https://github.com/MikeGrier/tpu-rs/commit/bb16e6a322d4e8d764cd2f869521a21e5923316b))
+
+
+### Bug Fixes
+
+* **find:** name both CLI --glob and MCP glob: in directory-error hints ([5e3d595](https://github.com/MikeGrier/tpu-rs/commit/5e3d595b0e88bcca1d79a2c65785694cdf0268f7))
+
 ## [0.2.0](https://github.com/MikeGrier/tpu-rs/compare/v0.1.5...v0.2.0) (2026-06-08)
 
 
