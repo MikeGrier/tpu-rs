@@ -13,8 +13,9 @@ line endings. The common offenders &mdash; PowerShell `Get-Content` /
 editors &mdash; silently mangle UTF-8, UTF-16, smart quotes, em-dashes, and
 box-drawing characters. `tpu` detects the actual on-disk encoding (UTF-8,
 UTF-16LE/BE, Windows-1252, Shift-JIS, &hellip;) and CRLF/LF/CR convention and
-round-trips them faithfully, with atomic writes and automatic `.bak`
-backups.
+round-trips them faithfully with atomic writes. The CLI keeps the prior
+contents at `<file>.bak`; the MCP server cleans up successful `.bak`
+backups after verification.
 
 ## Crates in this workspace
 
