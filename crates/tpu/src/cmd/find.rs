@@ -174,7 +174,8 @@ pub fn expand_paths_with_policy(
             if is_glob {
                 return Err(format!(
                     "find: path {:?} contains glob metacharacters but a \
-                     separate `glob` was also supplied; pick one form",
+                     separate `glob` (CLI `--glob`, MCP `glob:`) was also \
+                     supplied; pick one form",
                     spec,
                 )
                 .into());
@@ -268,9 +269,10 @@ pub fn expand_paths_with_policy(
                     // anything. Point the caller at the `glob` parameter,
                     // which walks the supplied directory directly.
                     return Err(format!(
-                        "find: {:?} is a directory — pass a `glob` (e.g. \
-                         glob:\"**/*.txt\") to search it recursively, or \
-                         pass individual file paths instead",
+                        "find: {:?} is a directory — pass a `glob` to search \
+                         it recursively (CLI: --glob \"**/*.txt\", MCP: \
+                         glob:\"**/*.txt\"), or pass individual file paths \
+                         instead",
                         spec,
                     )
                     .into());
@@ -293,9 +295,9 @@ pub fn expand_paths_with_policy(
                     format!("{normalized}/**")
                 };
                 return Err(format!(
-                    "find: {:?} is a directory — pass a `glob` (e.g. \
-                     glob:\"**/*.txt\") to search it recursively, or pass \
-                     a path-glob like {:?}",
+                    "find: {:?} is a directory — pass a `glob` to search it \
+                     recursively (CLI: --glob \"**/*.txt\", MCP: \
+                     glob:\"**/*.txt\"), or pass a path-glob like {:?}",
                     spec, example,
                 )
                 .into());
