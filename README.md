@@ -54,7 +54,8 @@ code --install-extension MikeGrierTools.tpu-mcp
 
 The extension carries its own bundled `tpu-mcp` binary and registers an MCP
 server with VS Code on startup; no separate `cargo install` is required for
-the Copilot Chat integration.
+the Copilot Chat integration (currently published for Windows: win32-x64 and
+win32-arm64).
 
 ## Why use it
 
