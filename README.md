@@ -77,8 +77,8 @@ crates/
 tools/        # repo-local helpers (e.g. check-encoding.ps1)
 ```
 
-See each crate's README for full command reference, configuration, and
-integration notes.
+See `crates/tpu-mcp/README.md` for command reference, configuration, and integration notes,
+and run `tpu --help` for the full CLI command reference.
 
 ## License
 
