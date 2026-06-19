@@ -118,6 +118,25 @@ through `Get-Content` / `Set-Content` — read and write via
    - the file is known to be ASCII-only (no non-ASCII bytes anywhere), and
    - none of the tools above are available.
 
+### ⚠️ `tpu_replace_in_file` replacement-string escaping
+
+`tpu_replace_in_file` (and `tpu replace` CLI) **always expand** `\n`, `\r`,
+`\t`, and `\\` in the `replacement` parameter to real newline / CR / tab /
+backslash before writing.  This is intentional and documented behaviour, but
+it makes the tool **unsuitable for writing source-code escape sequences** like
+`"\n"`, `"\t"` in Rust, C, Python, or JSON string literals — those sequences
+become real control characters in the file.
+
+**Rule**: when the replacement text must contain a literal `\n`, `\t`, `\r`,
+or `\\` (e.g. a Rust string literal, a JSON value, a regex), use the
+**VS Code editor `replace_string_in_file`** tool instead, which treats
+`newString` as verbatim text with no secondary escape expansion.
+
+To write a literal backslash-n via `tpu_replace_in_file` anyway, quadruple-
+escape in JSON: `"\\\\n"` → post-JSON `\\n` → tool expands `\\` → `\` and
+passes `n` through → file gets `\n`.  This is error-prone; prefer the editor
+tool for any replacement that contains source-level escape sequences.
+
 PowerShell is fine — and preferred — for read-only inspection
 (`Get-ChildItem`, `Select-String`, `git status`, …) and for running build
 or test commands. The restriction is specifically on *editing* files.
