@@ -120,6 +120,11 @@ pub struct DoctorOptions {
     /// Suppress per-file lines in human mode; the summary is still
     /// printed.  No effect on JSON mode (which is always one document).
     pub quiet: bool,
+    /// When `true`, annotate each [`DoctorReplacementCharMatch`] with a
+    /// heuristic suggestion for what the original character might have been.
+    /// Off by default — guesses may be wrong; the user must opt in explicitly
+    /// via `--guess` / `guess: true`.
+    pub guess: bool,
 }
 
 /// One mojibake match within a single file.
@@ -133,6 +138,24 @@ pub struct DoctorMatch {
     pub pattern: Pattern,
 }
 
+/// One `U+FFFD` (replacement character) occurrence within a single file.
+///
+/// This is a **separate, non-peelable diagnostic class** from [`DoctorMatch`].
+/// The original byte is gone; no automatic repair is possible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DoctorReplacementCharMatch {
+    pub byte_offset: usize,
+    /// 1-based line number.
+    pub line: usize,
+    /// 1-based column number, in `char`s.
+    pub col: usize,
+    /// Short excerpt of surrounding text for context (~20 chars each side).
+    pub context: String,
+    /// Heuristic suggested replacement.  Only set when [`DoctorOptions::guess`]
+    /// is `true`; `None` when no confident inference is available.
+    pub suggested: Option<char>,
+}
+
 /// Per-file diagnostic record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DoctorIssue {
@@ -140,6 +163,10 @@ pub struct DoctorIssue {
     pub encoding_detected: &'static str,
     pub valid_in_detected_encoding: bool,
     pub mojibake_matches: Vec<DoctorMatch>,
+    /// `U+FFFD` replacement-character occurrences (non-peelable; manual repair
+    /// only).  Empty when none were found or when the file's opt-out marker
+    /// (`encoding-check: allow-replacement-char`) is present.
+    pub replacement_char_matches: Vec<DoctorReplacementCharMatch>,
     /// `Some(text)` if a one-layer peel produces strictly fewer matches.
     /// Only populated when at least one mojibake pattern was found.
     pub peel_suggested: Option<String>,
@@ -148,10 +175,12 @@ pub struct DoctorIssue {
 }
 
 impl DoctorIssue {
-    /// True when the file has anything worth reporting (invalid encoding
-    /// or one-or-more mojibake matches).
+    /// True when the file has anything worth reporting (invalid encoding,
+    /// mojibake matches, or replacement-character residue).
     pub fn is_problem(&self) -> bool {
-        !self.valid_in_detected_encoding || !self.mojibake_matches.is_empty()
+        !self.valid_in_detected_encoding
+            || !self.mojibake_matches.is_empty()
+            || !self.replacement_char_matches.is_empty()
     }
 }
 
@@ -399,7 +428,7 @@ fn load_gitignore(root: &Path) -> Option<GlobSet> {
 /// Returns `Ok(None)` for a clean file (and the file is not included in
 /// the report), `Ok(Some(issue))` when there is anything to report, and
 /// `Err` for I/O / open failures.
-fn diagnose_file(path: &Path, io_mode: IoMode) -> Result<Option<DoctorIssue>, Box<dyn Error>> {
+fn diagnose_file(path: &Path, io_mode: IoMode, guess: bool) -> Result<Option<DoctorIssue>, Box<dyn Error>> {
     let branch = crate::open_as_branch(path, io_mode)?;
     let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
     let encoding = source.encoding();
@@ -415,7 +444,7 @@ fn diagnose_file(path: &Path, io_mode: IoMode) -> Result<Option<DoctorIssue>, Bo
     let (decoded, _, had_errors) = encoding.decode(body);
     let decoded_text: &str = &decoded;
 
-    // Allow-marker opt-out for the *whole file*.
+    // Allow-marker opt-out for the *whole file* (suppresses all diagnostics).
     if mojibake::allowed_by_marker(decoded_text) {
         return Ok(None);
     }
@@ -428,26 +457,49 @@ fn diagnose_file(path: &Path, io_mode: IoMode) -> Result<Option<DoctorIssue>, Bo
             encoding_detected: encoding.name(),
             valid_in_detected_encoding: false,
             mojibake_matches: Vec::new(),
+            replacement_char_matches: Vec::new(),
             peel_suggested: None,
             repaired: false,
         }));
     }
 
     let report = mojibake::scan(decoded_text);
-    if report.matches.is_empty() {
+
+    // Scan for U+FFFD replacement-character residue (unless the file opts out).
+    let rc_matches = if mojibake::has_replacement_char_allow_marker(decoded_text) {
+        Vec::new()
+    } else {
+        let raw_rc = mojibake::scan_replacement_chars(decoded_text, guess);
+        if raw_rc.is_empty() {
+            Vec::new()
+        } else {
+            annotate_replacement_char_matches(decoded_text, &raw_rc)
+        }
+    };
+
+    if report.matches.is_empty() && rc_matches.is_empty() {
         return Ok(None);
     }
 
     // Build line/col index by streaming through the decoded text once.
-    let matches = annotate_matches(decoded_text, &report.matches);
+    let matches = if report.matches.is_empty() {
+        Vec::new()
+    } else {
+        annotate_matches(decoded_text, &report.matches)
+    };
 
-    let peel_suggested = mojibake::looks_like_one_layer_peel(decoded_text);
+    let peel_suggested = if report.matches.is_empty() {
+        None
+    } else {
+        mojibake::looks_like_one_layer_peel(decoded_text)
+    };
 
     Ok(Some(DoctorIssue {
         path: path.to_path_buf(),
         encoding_detected: encoding.name(),
         valid_in_detected_encoding: true,
         mojibake_matches: matches,
+        replacement_char_matches: rc_matches,
         peel_suggested,
         repaired: false,
     }))
@@ -510,6 +562,71 @@ fn annotate_matches(text: &str, raw: &[mojibake::Match]) -> Vec<DoctorMatch> {
                 line: 0,
                 col: 0,
                 pattern: Pattern::Latin1,
+            })
+        })
+        .collect()
+}
+
+/// Annotate raw [`mojibake::ReplacementCharMatch`]es with 1-based line and
+/// column numbers by streaming through the decoded text once.
+fn annotate_replacement_char_matches(
+    text: &str,
+    raw: &[mojibake::ReplacementCharMatch],
+) -> Vec<DoctorReplacementCharMatch> {
+    let mut sorted: Vec<(usize, usize)> = raw
+        .iter()
+        .enumerate()
+        .map(|(i, m)| (m.byte_offset, i))
+        .collect();
+    sorted.sort_by_key(|&(off, _)| off);
+
+    let mut out: Vec<Option<DoctorReplacementCharMatch>> = vec![None; raw.len()];
+    let mut next = 0usize;
+    let mut line = 1usize;
+    let mut col = 1usize;
+    let mut byte_pos = 0usize;
+
+    for ch in text.chars() {
+        while next < sorted.len() && sorted[next].0 == byte_pos {
+            let idx = sorted[next].1;
+            out[idx] = Some(DoctorReplacementCharMatch {
+                byte_offset: raw[idx].byte_offset,
+                line,
+                col,
+                context: raw[idx].context.clone(),
+                suggested: raw[idx].suggested,
+            });
+            next += 1;
+        }
+        let len = ch.len_utf8();
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
+        byte_pos += len;
+    }
+    while next < sorted.len() && sorted[next].0 == byte_pos {
+        let idx = sorted[next].1;
+        out[idx] = Some(DoctorReplacementCharMatch {
+            byte_offset: raw[idx].byte_offset,
+            line,
+            col,
+            context: raw[idx].context.clone(),
+            suggested: raw[idx].suggested,
+        });
+        next += 1;
+    }
+
+    out.into_iter()
+        .map(|o| {
+            o.unwrap_or(DoctorReplacementCharMatch {
+                byte_offset: 0,
+                line: 0,
+                col: 0,
+                context: String::new(),
+                suggested: None,
             })
         })
         .collect()
@@ -581,7 +698,7 @@ pub fn run_with_policy(
     let mut report = DoctorReport::default();
 
     for path in &files {
-        match diagnose_file(path, io_mode) {
+        match diagnose_file(path, io_mode, options.guess) {
             Ok(Some(issue)) => {
                 report.total_files_scanned += 1;
                 report.issues.push(issue);
@@ -662,24 +779,50 @@ fn emit_human(out: &mut dyn Write, report: &DoctorReport, quiet: bool) -> std::i
                 .collect::<Vec<_>>()
                 .join(" ");
             let repaired_tag = if issue.repaired { " [REPAIRED]" } else { "" };
-            writeln!(
-                out,
-                "{}: {} ({}) [{}]{}",
-                issue.path.display(),
-                issue.mojibake_matches.len(),
-                summary,
-                issue.encoding_detected,
-                repaired_tag
-            )?;
-            for m in &issue.mojibake_matches {
+            let rc_count = issue.replacement_char_matches.len();
+            if !issue.mojibake_matches.is_empty() {
                 writeln!(
                     out,
-                    "  {}:{}: [{}] (byte offset {})",
-                    m.line,
-                    m.col,
-                    m.pattern.name(),
-                    m.byte_offset
+                    "{}: {} ({}) [{}]{}",
+                    issue.path.display(),
+                    issue.mojibake_matches.len(),
+                    summary,
+                    issue.encoding_detected,
+                    repaired_tag
                 )?;
+                for m in &issue.mojibake_matches {
+                    writeln!(
+                        out,
+                        "  {}:{}: [{}] (byte offset {})",
+                        m.line,
+                        m.col,
+                        m.pattern.name(),
+                        m.byte_offset
+                    )?;
+                }
+            }
+            if rc_count > 0 {
+                writeln!(
+                    out,
+                    "{}: {} lossy-replacement char{} (U+FFFD residue; manual repair only) [{}]",
+                    issue.path.display(),
+                    rc_count,
+                    if rc_count == 1 { "" } else { "s" },
+                    issue.encoding_detected,
+                )?;
+                for m in &issue.replacement_char_matches {
+                    let suggestion = match m.suggested {
+                        Some(c) => format!(" (suggest: U+{:04X} '{c}')", c as u32),
+                        None => String::new(),
+                    };
+                    writeln!(
+                        out,
+                        "  {}:{}: [lossy-replacement] (byte offset {}){suggestion}",
+                        m.line,
+                        m.col,
+                        m.byte_offset,
+                    )?;
+                }
             }
         }
     }
@@ -710,11 +853,32 @@ fn emit_json(out: &mut dyn Write, report: &DoctorReport) -> std::io::Result<()> 
                     })
                 })
                 .collect();
+            let rc_matches: Vec<_> = issue
+                .replacement_char_matches
+                .iter()
+                .map(|m| {
+                    let mut obj = json!({
+                        "byte_offset": m.byte_offset,
+                        "line": m.line,
+                        "col": m.col,
+                        "context": m.context,
+                    });
+                    if let Some(c) = m.suggested {
+                        obj["suggested"] = json!(format!("U+{:04X}", c as u32));
+                        obj["suggested_char"] = json!(c.to_string());
+                    } else {
+                        obj["suggested"] = json!(null);
+                        obj["suggested_char"] = json!(null);
+                    }
+                    obj
+                })
+                .collect();
             json!({
                 "path": issue.path.display().to_string(),
                 "encoding_detected": issue.encoding_detected,
                 "valid_in_detected_encoding": issue.valid_in_detected_encoding,
                 "mojibake_matches": matches,
+                "replacement_char_matches": rc_matches,
                 "peel_suggested": issue.peel_suggested.is_some(),
                 "repaired": issue.repaired,
             })
@@ -855,7 +1019,7 @@ mod tests {
     fn diagnose_clean_utf8_file_returns_none() {
         let tmp = TempDir::new().unwrap();
         let p = write(&tmp, "clean.txt", "hello world\n".as_bytes());
-        let res = diagnose_file(&p, IoMode::Buffered).unwrap();
+        let res = diagnose_file(&p, IoMode::Buffered, false).unwrap();
         assert!(res.is_none());
     }
 
@@ -865,7 +1029,7 @@ mod tests {
         // Two lines; mojibake is on line 2 at column 5 (0-indexed bytes
         // include "first\n" = 6 bytes before the 'c' of 'caf').
         let p = write(&tmp, "bad.txt", "first\ncafÃ©\n".as_bytes());
-        let issue = diagnose_file(&p, IoMode::Buffered)
+        let issue = diagnose_file(&p, IoMode::Buffered, false)
             .unwrap()
             .expect("flagged");
         assert!(issue.valid_in_detected_encoding);
@@ -888,7 +1052,7 @@ mod tests {
         // assertion is only that *if* it's not valid in its encoding,
         // we report it correctly.  If harrier picks Win-1252 then the
         // bytes are valid and the test is moot — assert with that in mind.
-        let res = diagnose_file(&p, IoMode::Buffered).unwrap();
+        let res = diagnose_file(&p, IoMode::Buffered, false).unwrap();
         if let Some(issue) = res
             && !issue.valid_in_detected_encoding
         {
@@ -901,7 +1065,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let body = format!("// {}\nthis line has cafÃ© in it\n", mojibake::ALLOW_MARKER);
         let p = write(&tmp, "ok.txt", body.as_bytes());
-        let res = diagnose_file(&p, IoMode::Buffered).unwrap();
+        let res = diagnose_file(&p, IoMode::Buffered, false).unwrap();
         assert!(res.is_none());
     }
 
@@ -909,7 +1073,7 @@ mod tests {
     fn empty_file_is_clean() {
         let tmp = TempDir::new().unwrap();
         let p = write(&tmp, "empty.txt", b"");
-        let res = diagnose_file(&p, IoMode::Buffered).unwrap();
+        let res = diagnose_file(&p, IoMode::Buffered, false).unwrap();
         assert!(res.is_none());
     }
 
@@ -929,6 +1093,7 @@ mod tests {
                 format: DoctorFormat::Human,
                 fix: DoctorFix::None,
                 quiet: false,
+                guess: false,
             },
             &mut buf,
             IoMode::Buffered,
@@ -955,6 +1120,7 @@ mod tests {
                 format: DoctorFormat::Human,
                 fix: DoctorFix::None,
                 quiet: true,
+                guess: false,
             },
             &mut buf,
             IoMode::Buffered,
@@ -981,6 +1147,7 @@ mod tests {
                 format: DoctorFormat::Json,
                 fix: DoctorFix::None,
                 quiet: false,
+                guess: false,
             },
             &mut buf,
             IoMode::Buffered,
@@ -1019,6 +1186,7 @@ mod tests {
                 format: DoctorFormat::Human,
                 fix: DoctorFix::Peel,
                 quiet: true,
+                guess: false,
             },
             &mut buf,
             IoMode::Buffered,
@@ -1053,6 +1221,7 @@ mod tests {
                 format: DoctorFormat::Human,
                 fix: DoctorFix::Peel,
                 quiet: true,
+                guess: false,
             },
             &mut buf,
             IoMode::Buffered,
@@ -1074,6 +1243,7 @@ mod tests {
             encoding_detected: "UTF-8",
             valid_in_detected_encoding: true,
             mojibake_matches: Vec::new(),
+            replacement_char_matches: Vec::new(),
             peel_suggested: None,
             repaired: false,
         };
@@ -1103,6 +1273,7 @@ mod tests {
                 col: 1,
                 pattern: Pattern::Latin1,
             }],
+            replacement_char_matches: Vec::new(),
             peel_suggested: None,
             repaired: false,
         });
@@ -1134,6 +1305,7 @@ mod tests {
                 format: DoctorFormat::Human,
                 fix: DoctorFix::None,
                 quiet: true,
+                guess: false,
             },
             &mut buf,
             IoMode::Buffered,
@@ -1173,6 +1345,7 @@ mod tests {
                 format: DoctorFormat::Human,
                 fix: DoctorFix::None,
                 quiet: true,
+                guess: false,
             },
             &mut buf,
             IoMode::Buffered,

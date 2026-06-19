@@ -2199,6 +2199,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn st
         format: tpu::cmd::doctor::DoctorFormat::Json,
         fix,
         quiet: true,
+        guess: false,
     };
 
     let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
@@ -2229,11 +2230,26 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn st
                     })
                 })
                 .collect();
+            let rc_matches: Vec<Value> = issue
+                .replacement_char_matches
+                .iter()
+                .map(|m| {
+                    serde_json::json!({
+                        "byte_offset": m.byte_offset,
+                        "line": m.line,
+                        "col": m.col,
+                        "context": m.context,
+                        "suggested": m.suggested.map(|c| format!("U+{:04X}", c as u32)),
+                        "suggested_char": m.suggested.map(|c| c.to_string()),
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "path": issue.path.display().to_string(),
                 "encoding_detected": issue.encoding_detected,
                 "valid_in_detected_encoding": issue.valid_in_detected_encoding,
                 "mojibake_matches": matches,
+                "replacement_char_matches": rc_matches,
                 "peel_suggested": issue.peel_suggested.is_some(),
                 "repaired": issue.repaired,
             })

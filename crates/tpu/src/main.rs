@@ -824,6 +824,13 @@ enum Commands {
         /// printed.  No effect on JSON mode.
         #[arg(long, short = 'q')]
         quiet: bool,
+
+        /// Annotate each `U+FFFD` replacement-character match with a
+        /// heuristic guess at what the original character was (e.g.
+        /// em-dash when flanked by spaces, en-dash when flanked by
+        /// digits).  Off by default — guesses may be wrong.
+        #[arg(long)]
+        guess: bool,
     },
 
     /// Copy a file or recursively copy a directory tree.
@@ -1841,6 +1848,7 @@ fn run(
             format,
             fix,
             quiet,
+            guess,
         } => {
             let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
             let opts = cmd::doctor::DoctorOptions {
@@ -1854,6 +1862,7 @@ fn run(
                     _ => cmd::doctor::DoctorFix::None,
                 },
                 quiet,
+                guess,
             };
 
             // Buffer the doctor output and route it through the standard

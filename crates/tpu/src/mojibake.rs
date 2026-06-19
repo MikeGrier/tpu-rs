@@ -307,6 +307,112 @@ fn try_peel_once(text: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+// ── Lossy-replacement (U+FFFD residue) diagnostic ───────────────────────────
+
+/// Opt-out sentinel specific to the `lossy-replacement` diagnostic class.
+/// A file containing this exact substring (typically inside a comment) will
+/// not be flagged for `U+FFFD` replacement-character occurrences.  The
+/// existing [`ALLOW_MARKER`] sentinel also suppresses replacement-character
+/// detection — it opts out of *all* encoding-check diagnostics.
+pub const ALLOW_REPLACEMENT_CHAR_MARKER: &str = "encoding-check: allow-replacement-char";
+
+/// `true` if `text` contains either [`ALLOW_MARKER`] or
+/// [`ALLOW_REPLACEMENT_CHAR_MARKER`].
+///
+/// Callers that already tested [`allowed_by_marker`] and returned early do
+/// not need to call this separately, but it is safe to call unconditionally.
+pub fn has_replacement_char_allow_marker(text: &str) -> bool {
+    text.contains(ALLOW_REPLACEMENT_CHAR_MARKER)
+}
+
+/// A single occurrence of `U+FFFD` (the Unicode Replacement Character) within
+/// the scanned text.
+///
+/// This is a **separate diagnostic class** from [`Match`] / [`ScanReport`].
+/// `U+FFFD` in an otherwise valid UTF-8 file is the *terminal* residue of a
+/// prior lossy decode (the original byte is gone and cannot be recovered by a
+/// peel).  [`scan_replacement_chars`] never sets `peel_suggested`; callers
+/// must surface this as `repair: manual`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplacementCharMatch {
+    /// Byte offset (within the input `&str`) of the `U+FFFD` character.
+    pub byte_offset: usize,
+    /// A short excerpt of surrounding text (up to 20 chars on each side)
+    /// for context in the report.  May contain further `U+FFFD` chars.
+    pub context: String,
+    /// Heuristic suggested replacement, set only when the caller passes
+    /// `guess: true`.  `None` when no confident inference can be made.
+    ///
+    /// Current heuristics:
+    /// - flanked by spaces on both sides → em-dash `—` (U+2014)
+    /// - flanked by ASCII digits on both sides → en-dash `–` (U+2013)
+    pub suggested: Option<char>,
+}
+
+/// Scan `text` for every occurrence of `U+FFFD` (Unicode Replacement
+/// Character, bytes `EF BF BD`).
+///
+/// Returns one [`ReplacementCharMatch`] per occurrence, sorted by ascending
+/// byte offset.  When `guess` is `true` each match is annotated with a
+/// heuristic suggested replacement based on immediately surrounding chars.
+///
+/// This function does **not** consult [`ALLOW_MARKER`] or
+/// [`ALLOW_REPLACEMENT_CHAR_MARKER`]; callers must check those first.
+pub fn scan_replacement_chars(text: &str, guess: bool) -> Vec<ReplacementCharMatch> {
+    // Build a char-indexed view so context windows and neighbour lookups
+    // can work in O(n) without multiple passes.
+    let chars: Vec<char> = text.chars().collect();
+    let mut byte_offsets = Vec::with_capacity(chars.len());
+    let mut pos = 0usize;
+    for &c in &chars {
+        byte_offsets.push(pos);
+        pos += c.len_utf8();
+    }
+
+    let mut results = Vec::new();
+    for (i, &c) in chars.iter().enumerate() {
+        if c != '\u{FFFD}' {
+            continue;
+        }
+        const WINDOW: usize = 20;
+        let start = i.saturating_sub(WINDOW);
+        let end = (i + 1 + WINDOW).min(chars.len());
+        let context: String = chars[start..end].iter().collect();
+
+        let suggested = if guess {
+            guess_replacement_char(i, &chars)
+        } else {
+            None
+        };
+
+        results.push(ReplacementCharMatch {
+            byte_offset: byte_offsets[i],
+            context,
+            suggested,
+        });
+    }
+    results
+}
+
+/// Infer a likely original character for a `U+FFFD` at `chars[idx]` based
+/// on immediately surrounding characters.
+///
+/// Returns `None` when no heuristic applies.
+fn guess_replacement_char(idx: usize, chars: &[char]) -> Option<char> {
+    let prev = idx.checked_sub(1).map(|i| chars[i]);
+    let next = chars.get(idx + 1).copied();
+
+    // Flanked by ASCII spaces → almost always an em-dash.
+    if prev == Some(' ') && next == Some(' ') {
+        return Some('\u{2014}'); // —
+    }
+    // Flanked by ASCII digits (directly adjacent) → en-dash range separator.
+    if prev.map_or(false, |c| c.is_ascii_digit()) && next.map_or(false, |c| c.is_ascii_digit()) {
+        return Some('\u{2013}'); // –
+    }
+    None
+}
+
 // ── Write-time guard (Milestone 2) ──────────────────────────────────────────
 
 /// Policy controlling write-time mojibake checks performed by the
