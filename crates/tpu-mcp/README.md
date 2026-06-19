@@ -296,3 +296,16 @@ represent non-printable characters.
 
 Notifications (messages without an `id` field) are handled without sending a response,
 which is correct MCP behaviour.
+
+### Tool output format
+
+Tool call results are returned as **NDJSON** (one JSON object per line) inside the
+MCP `content[0].text` field:
+
+| Line | Content |
+|---|---|
+| First | `{"reason":"x-tpu-mcp-invocation","tool":"tpu_NAME","args":{...}}` — invocation echo; large text fields replaced with `"<N bytes>"` |
+| Body (mutating tools) | Optional unified diff lines, then `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N}` |
+| Body (structured tools) | `{"reason":"x-tpu-mcp-result",...}` then `{"status":"success"}` |
+| Body (read/find tools) | Raw file content or matching lines (no JSON trailer on success) |
+| On error | `{"status":"error","message":"..."}` as the final line; `isError: true` in the MCP wrapper |
