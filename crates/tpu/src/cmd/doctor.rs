@@ -864,7 +864,7 @@ fn emit_json(out: &mut dyn Write, report: &DoctorReport) -> std::io::Result<()> 
                         "byte_offset": m.byte_offset,
                         "line": m.line,
                         "col": m.col,
-                        "context": m.context,
+                        "context": m.context.as_str(),
                     });
                     if let Some(c) = m.suggested {
                         obj["suggested"] = json!(format!("U+{:04X}", c as u32));
