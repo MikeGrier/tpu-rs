@@ -120,9 +120,11 @@ through `Get-Content` / `Set-Content` — read and write via
 
 ### ⚠️ `tpu_replace_in_file` replacement-string escaping
 
-`tpu_replace_in_file` (and `tpu replace` CLI) **always expand** `\n`, `\r`,
-`\t`, and `\\` in the `replacement` parameter to real newline / CR / tab /
-backslash before writing.  This is intentional and documented behaviour, but
+`tpu_replace_in_file` **always expands** `\n`, `\r`, `\t`, and `\\` in the
+`replacement` parameter to real newline / CR / tab / backslash before writing.
+The `tpu replace` CLI does the same by default; pass `--literal-replacement`
+(`-L`) to keep backslashes verbatim. This is intentional and documented
+behaviour, but
 it makes the tool **unsuitable for writing source-code escape sequences** like
 `"\n"`, `"\t"` in Rust, C, Python, or JSON string literals — those sequences
 become real control characters in the file.
