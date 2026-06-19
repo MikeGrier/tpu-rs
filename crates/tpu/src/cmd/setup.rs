@@ -104,6 +104,22 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 - **Dependency-free templating** — `tpu_render_file` substitutes
   `{{NAME}}`-style tokens. Use `\{{` to emit literal braces.
 
+### Tool output format
+
+Every tool response is **NDJSON** (one JSON object per line):
+
+- **Line 1** — invocation header:
+  `{"reason":"x-tpu-mcp-invocation","tool":"tpu_NAME","args":{...}}`
+  Large `content`/`replacement`/`template` fields appear as `"<N bytes>"` placeholders.
+- **Mutating tools** (write, replace, edit, append) — status trailer:
+  `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N}`
+- **Structured tools** (count_file, stat_file, copy_file, render_file,
+  setup+target, doctor) — result line
+  `{"reason":"x-tpu-mcp-result",...}` followed by `{"status":"success"}`.
+- **Read / find tools** — header then raw file content (no JSON trailer on success).
+- **Errors** — `{"status":"error","message":"..."}` as the final line;
+  `isError: true` in the MCP wrapper.
+
 ### When a file looks corrupted (mojibake)
 
 Symptoms: `Ã©` where `é` should be, `â€"` where `—` should be, `â"€` instead
