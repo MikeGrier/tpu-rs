@@ -322,7 +322,7 @@ pub const ALLOW_REPLACEMENT_CHAR_MARKER: &str = "encoding-check: allow-replaceme
 /// Callers that already tested [`allowed_by_marker`] and returned early do
 /// not need to call this separately, but it is safe to call unconditionally.
 pub fn has_replacement_char_allow_marker(text: &str) -> bool {
-    text.contains(ALLOW_REPLACEMENT_CHAR_MARKER)
+    text.contains(ALLOW_MARKER) || text.contains(ALLOW_REPLACEMENT_CHAR_MARKER)
 }
 
 /// A single occurrence of `U+FFFD` (the Unicode Replacement Character) within

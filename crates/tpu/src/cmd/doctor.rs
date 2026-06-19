@@ -620,13 +620,16 @@ fn annotate_replacement_char_matches(
     }
 
     out.into_iter()
-        .map(|o| {
+        .enumerate()
+        .map(|(idx, o)| {
+            // Preserve raw match data in the fallback so the report stays
+            // anchored to the right location even if the invariant is violated.
             o.unwrap_or(DoctorReplacementCharMatch {
-                byte_offset: 0,
+                byte_offset: raw[idx].byte_offset,
                 line: 0,
                 col: 0,
-                context: String::new(),
-                suggested: None,
+                context: raw[idx].context.clone(),
+                suggested: raw[idx].suggested,
             })
         })
         .collect()
@@ -1162,6 +1165,12 @@ mod tests {
         let f = &files[0];
         assert_eq!(f["valid_in_detected_encoding"], true);
         assert_eq!(f["mojibake_matches"][0]["pattern"], "latin1");
+        // Lock in the new field: empty array for a mojibake-only file.
+        assert_eq!(
+            f["replacement_char_matches"],
+            serde_json::json!([]),
+            "replacement_char_matches must be present and empty for mojibake-only file"
+        );
         assert!(report.total_issues() >= 1);
     }
 
