@@ -264,3 +264,68 @@ runtime), so no `// encoding-check: allow-mojibake` opt-out marker is
 needed in the four `cmd::{write,replace,edit,append}` modules, in
 `tpu-mcp::tools`, or in any of the four refactored integration tests
 (`write_guard`, `read_advisory`, `mojibake_detection`, `doctor`).
+
+---
+
+## Milestone 6 — U+FFFD residue detection (`tpu doctor --guess`)
+
+**Theme:** a second, categorically distinct diagnostic class for `tpu doctor`.
+While peelable mojibake is a *mechanical* encoding mismatch with a known
+algorithmic undo, a `U+FFFD` replacement character (`EF BF BD`) in otherwise
+valid UTF-8 is a *terminal loss* — the original codepoint is gone and no
+mechanical reversal exists.  Context inference is the only route to recovery,
+which means a human (or LLM with document context) must approve every fix.
+`tpu doctor` therefore *reports* these but never auto-repairs them.
+
+**Real-world motivation (firebird repo, June 2026):** 113 `U+FFFD` occurrences
+across 7 markdown docs were repaired by context inference.  The corruption was
+selective, not wholesale — surviving valid-UTF-8 em-dashes coexisted with
+`U+FFFD` residue in the same files, and the lost characters spanned multiple
+distinct source codepoints (`—` U+2014, `–` U+2013, `×` U+00D7).  Git history
+didn't help (already `U+FFFD` at first commit).  This confirmed that
+(a) `U+FFFD` recovery is inherently per-occurrence and context-dependent, and
+(b) `tpu doctor` must *report* but never auto-fix these.
+
+- [x] M6-1: `mojibake::scan_replacement_chars(text, guess) -> Vec<ReplacementCharMatch>`
+      scans for `U+FFFD` in otherwise-valid UTF-8; each match carries
+      `{ byte_offset, context }` (20-char window).  With `guess: true`,
+      calls the private `guess_replacement_char` heuristic:
+      space-flanked → em-dash `—` (U+2014); digit-flanked → en-dash `–`
+      (U+2013); otherwise `None`.
+- [x] M6-2: `mojibake::ALLOW_REPLACEMENT_CHAR_MARKER` / `has_replacement_char_allow_marker`
+      — new opt-out sentinel `encoding-check: allow-replacement-char` that
+      suppresses U+FFFD detection only (ordinary `allow-mojibake` suppresses
+      everything; the new marker suppresses only the replacement-char scan,
+      so a file can still be flagged for peelable mojibake).
+- [x] M6-3: `DoctorIssue` gains `replacement_char_matches: Vec<DoctorReplacementCharMatch>`
+      where each entry has `{ byte_offset, line, col, context, suggested: Option<char> }`.
+      `DoctorIssue::is_problem()` now also fires when this vec is non-empty.
+      `peel_suggested` is never set for replacement-char-only files.
+- [x] M6-4: `DoctorOptions` gains `pub guess: bool` (default `false`); the
+      CLI exposes it as `--guess`.  Matching `guess: false` default added to
+      the MCP `call_doctor` path in `tpu-mcp/src/tools.rs`.
+- [x] M6-5: Human output: replacement-char section shown when `rc_count > 0`,
+      format `"  LINE:COL: [lossy-replacement] (byte offset N)"` with optional
+      `"(suggest: U+XXXX 'CHAR')"` suffix when `--guess` is active.
+      JSON output: `"replacement_char_matches"` array with fields
+      `{ byte_offset, line, col, context, suggested, suggested_char }` (nulls
+      when no suggestion); MCP JSON output mirrors the same schema.
+
+**Integration tests (theme):** `tests/doctor.rs` — four new scenarios:
+
+1. `replacement_char_residue_detected_and_not_peelable` — file with two
+   `U+FFFD` chars is flagged; `mojibake_matches` is empty; `peel_suggested`
+   is `None`; `repaired` is false; human output contains `"lossy-replacement"`.
+2. `replacement_char_guess_suggests_em_dash_when_space_flanked` — `--guess`
+   mode annotates a space-flanked `U+FFFD` with `suggested = Some('—')`;
+   human output contains `"U+2014"`.
+3. `allow_replacement_char_marker_suppresses_fffd_only` — file with both
+   `U+FFFD` and peelable mojibake + the `allow-replacement-char` marker:
+   `replacement_char_matches` is empty, `mojibake_matches` is non-empty.
+4. `file_with_no_fffd_stays_clean` — clean UTF-8 file with real em-dashes
+   and accents is not flagged.
+
+**Status:** ✅ Complete.  All struct literals in external test files
+(`tests/doctor.rs`, `tests/end_to_end_corruption_loop.rs`) and
+`tpu-mcp/src/tools.rs` updated.  Full workspace: 2 959 tests, 0 failures
+(2 868 in `tpu`, 91 in `tpu-mcp`).

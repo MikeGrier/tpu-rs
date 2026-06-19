@@ -118,6 +118,7 @@ fn plain_run_flags_only_corrupt_files() {
             format: DoctorFormat::Human,
             fix: DoctorFix::None,
             quiet: true,
+            guess: false,
         },
     );
 
@@ -175,6 +176,7 @@ fn json_format_produces_documented_schema() {
             format: DoctorFormat::Json,
             fix: DoctorFix::None,
             quiet: false,
+            guess: false,
         },
     );
 
@@ -235,6 +237,7 @@ fn fix_peel_repairs_what_it_can_and_leaves_the_rest() {
             format: DoctorFormat::Human,
             fix: DoctorFix::Peel,
             quiet: true,
+            guess: false,
         },
     );
 
@@ -274,6 +277,7 @@ fn fix_peel_repairs_what_it_can_and_leaves_the_rest() {
             format: DoctorFormat::Human,
             fix: DoctorFix::None,
             quiet: true,
+            guess: false,
         },
     );
 
@@ -299,4 +303,175 @@ fn fix_peel_repairs_what_it_can_and_leaves_the_rest() {
         after < before,
         "peel must strictly reduce single_mojibake matches: before={before} after={after}"
     );
+}
+
+// ── Scenario 4: U+FFFD replacement-character residue detection ──────────────
+
+/// A file that is valid UTF-8 but contains literal U+FFFD bytes (EF BF BD)
+/// must be flagged with `replacement_char_matches` and NOT with
+/// `mojibake_matches`.  `peel_suggested` must be `None` (non-peelable).
+#[test]
+fn replacement_char_residue_detected_and_not_peelable() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    // Construct a file with two U+FFFD chars in em-dash context (space-flanked).
+    let content = "Milestone 1 \u{FFFD} Diagnose\noverwritten \u{FFFD} the very next\n";
+    let path = dir.path().join("with_fffd.txt");
+    fs::write(&path, content.as_bytes()).unwrap();
+
+    let path_str = path.to_string_lossy().to_string();
+    let mut buf: Vec<u8> = Vec::new();
+    let report = tpu::cmd::doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Human,
+            fix: DoctorFix::None,
+            quiet: false,
+            guess: false,
+        },
+        &mut buf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+
+    assert_eq!(report.total_issues(), 1, "should flag the file");
+    let issue = &report.issues[0];
+    assert!(issue.valid_in_detected_encoding);
+    assert!(
+        issue.mojibake_matches.is_empty(),
+        "must NOT raise mojibake matches for U+FFFD"
+    );
+    assert_eq!(
+        issue.replacement_char_matches.len(),
+        2,
+        "must detect both U+FFFD occurrences"
+    );
+    assert!(
+        issue.peel_suggested.is_none(),
+        "peel must NOT be suggested for U+FFFD residue"
+    );
+    assert!(!issue.repaired, "must not be auto-repaired");
+    let output = String::from_utf8(buf).unwrap();
+    assert!(
+        output.contains("lossy-replacement"),
+        "human output must mention 'lossy-replacement': {output}"
+    );
+}
+
+/// With `--guess` the replacement_char_matches should include a `suggested`
+/// char when the heuristic applies (space-flanked → em-dash).
+#[test]
+fn replacement_char_guess_suggests_em_dash_when_space_flanked() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let content = "foo \u{FFFD} bar\n";
+    let path = dir.path().join("guess.txt");
+    fs::write(&path, content.as_bytes()).unwrap();
+
+    let path_str = path.to_string_lossy().to_string();
+    let mut buf: Vec<u8> = Vec::new();
+    let report = tpu::cmd::doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Human,
+            fix: DoctorFix::None,
+            quiet: false,
+            guess: true,
+        },
+        &mut buf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+
+    assert_eq!(report.total_issues(), 1);
+    let m = &report.issues[0].replacement_char_matches[0];
+    assert_eq!(
+        m.suggested,
+        Some('\u{2014}'),
+        "space-flanked U+FFFD should suggest em-dash"
+    );
+    let output = String::from_utf8(buf).unwrap();
+    assert!(
+        output.contains("U+2014"),
+        "human output must show the suggestion: {output}"
+    );
+}
+
+/// `encoding-check: allow-replacement-char` must suppress U+FFFD detection
+/// while still allowing mojibake detection to run.
+#[test]
+fn allow_replacement_char_marker_suppresses_fffd_only() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    // File has both a U+FFFD AND a mojibake sequence; the marker opts out
+    // of U+FFFD detection only.
+    // Use test_fixtures::cafe() so no mojibake bytes appear in this source file.
+    let content = format!(
+        "// encoding-check: allow-replacement-char\nhas \u{FFFD} and {}\n",
+        cafe()
+    );
+    let path = dir.path().join("partial_opt_out.txt");
+    fs::write(&path, content.as_bytes()).unwrap();
+
+    let path_str = path.to_string_lossy().to_string();
+    let mut buf: Vec<u8> = Vec::new();
+    let report = tpu::cmd::doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Human,
+            fix: DoctorFix::None,
+            quiet: false,
+            guess: false,
+        },
+        &mut buf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+
+    // The file is still flagged (for mojibake), not clean.
+    assert_eq!(report.total_issues(), 1);
+    let issue = &report.issues[0];
+    assert!(
+        issue.replacement_char_matches.is_empty(),
+        "allow-replacement-char marker must suppress U+FFFD detection"
+    );
+    assert!(
+        !issue.mojibake_matches.is_empty(),
+        "mojibake should still be detected when only allow-replacement-char is present"
+    );
+}
+
+/// A clean file with no U+FFFD and no mojibake must not be flagged.
+#[test]
+fn file_with_no_fffd_stays_clean() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let content = "café — résumé\n"; // real chars, no replacement chars
+    let path = dir.path().join("clean.txt");
+    fs::write(&path, content.as_bytes()).unwrap();
+
+    let path_str = path.to_string_lossy().to_string();
+    let mut buf: Vec<u8> = Vec::new();
+    let report = tpu::cmd::doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Human,
+            fix: DoctorFix::None,
+            quiet: true,
+            guess: false,
+        },
+        &mut buf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+
+    assert_eq!(report.total_issues(), 0, "clean file must not be flagged");
 }
