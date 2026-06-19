@@ -310,7 +310,7 @@ impl IoWorkerHandle {
                         progress(&format!(
                             "io worker died ({reason}) on attempt {attempt}/{max_attempts} for '{name}'; running this call in-process"
                         ));
-                        return Ok(None) as Result<Option<crate::tools::ToolResult>, Box<dyn std::error::Error>>;
+                        return Ok(None);
                     }
                     let delay_ms = BACKOFFS_MS[(attempt - 1) as usize];
                     progress(&format!(
