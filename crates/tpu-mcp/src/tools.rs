@@ -2238,7 +2238,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn st
                         "byte_offset": m.byte_offset,
                         "line": m.line,
                         "col": m.col,
-                        "context": m.context,
+                        "context": m.context.as_str(),
                         "suggested": m.suggested.map(|c| format!("U+{:04X}", c as u32)),
                         "suggested_char": m.suggested.map(|c| c.to_string()),
                     })
