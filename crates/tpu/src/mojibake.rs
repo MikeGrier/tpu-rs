@@ -359,6 +359,12 @@ pub struct ReplacementCharMatch {
 /// This function does **not** consult [`ALLOW_MARKER`] or
 /// [`ALLOW_REPLACEMENT_CHAR_MARKER`]; callers must check those first.
 pub fn scan_replacement_chars(text: &str, guess: bool) -> Vec<ReplacementCharMatch> {
+    // Fast-path: avoid allocating the char vec for the common case of a
+    // clean file with no U+FFFD bytes at all.
+    if !text.contains('\u{FFFD}') {
+        return Vec::new();
+    }
+
     // Build a char-indexed view so context windows and neighbour lookups
     // can work in O(n) without multiple passes.
     let chars: Vec<char> = text.chars().collect();
