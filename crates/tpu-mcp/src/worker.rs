@@ -101,7 +101,7 @@ impl IoWorker {
         name: &str,
         args: &Value,
         config: &ServerConfig,
-    ) -> Result<String, WorkerCallError> {
+    ) -> Result<crate::tools::ToolResult, WorkerCallError> {
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
 
@@ -139,9 +139,10 @@ impl IoWorker {
             )));
         }
         if let Some(text) = resp.get("ok").and_then(|v| v.as_str()) {
-            Ok(text.to_string())
+            let is_error = resp.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
+            Ok(crate::tools::ToolResult { text: text.to_string(), is_error })
         } else if let Some(err) = resp.get("err").and_then(|v| v.as_str()) {
-            Err(WorkerCallError::Tool(err.to_string()))
+            Err(WorkerCallError::Protocol(format!("worker tool error: {err}")))
         } else {
             Err(WorkerCallError::Protocol(
                 "response had neither ok nor err".into(),
@@ -161,16 +162,13 @@ impl Drop for IoWorker {
 }
 
 /// Reasons a worker call can fail.  Distinguishes "the worker is gone" from
-/// "the worker ran the tool and it returned an error result".
+/// wire-protocol errors.
 enum WorkerCallError {
     /// Pipe error (broken pipe, EOF) — worker is unusable and must be
     /// respawned.
     PipeBroken(String),
     /// Wire-protocol error (malformed JSON, id mismatch) — also fatal.
     Protocol(String),
-    /// The tool itself returned an error — this is a normal result, not a
-    /// worker failure, and must not trigger respawn.
-    Tool(String),
 }
 
 impl WorkerCallError {
@@ -230,7 +228,7 @@ impl IoWorkerHandle {
         args: &Value,
         config: &ServerConfig,
         progress: &mut dyn FnMut(&str),
-    ) -> Result<Option<String>, String> {
+    ) -> Result<Option<crate::tools::ToolResult>, Box<dyn std::error::Error>> {
         if !self.enabled {
             return Ok(None);
         }
@@ -287,15 +285,14 @@ impl IoWorkerHandle {
             };
 
             match result {
-                Ok(text) => {
+                Ok(tr) => {
                     if attempt > 1 {
                         progress(&format!(
                             "io worker succeeded on attempt {attempt}/{max_attempts} for '{name}'"
                         ));
                     }
-                    return Ok(Some(text));
+                    return Ok(Some(tr));
                 }
-                Err(WorkerCallError::Tool(err)) => return Err(err),
                 Err(e) => {
                     debug_assert!(e.is_worker_dead());
                     // Drop the dead worker; the next loop iteration will
@@ -308,13 +305,12 @@ impl IoWorkerHandle {
                         WorkerCallError::PipeBroken(m) | WorkerCallError::Protocol(m) => {
                             m.as_str()
                         }
-                        WorkerCallError::Tool(_) => unreachable!(),
                     };
                     if attempt >= max_attempts {
                         progress(&format!(
                             "io worker died ({reason}) on attempt {attempt}/{max_attempts} for '{name}'; running this call in-process"
                         ));
-                        return Ok(None);
+                        return Ok(None) as Result<Option<crate::tools::ToolResult>, Box<dyn std::error::Error>>;
                     }
                     let delay_ms = BACKOFFS_MS[(attempt - 1) as usize];
                     progress(&format!(
@@ -386,9 +382,9 @@ pub fn run_worker() -> ! {
     std::process::exit(0);
 }
 
-fn write_response(out: &mut impl Write, id: u64, result: Result<String, String>) {
+fn write_response(out: &mut impl Write, id: u64, result: Result<crate::tools::ToolResult, String>) {
     let resp = match result {
-        Ok(text) => serde_json::json!({ "id": id, "ok": text }),
+        Ok(crate::tools::ToolResult { text, is_error }) => serde_json::json!({ "id": id, "ok": text, "is_error": is_error }),
         Err(err) => serde_json::json!({ "id": id, "err": err }),
     };
     if let Ok(mut s) = serde_json::to_string(&resp) {

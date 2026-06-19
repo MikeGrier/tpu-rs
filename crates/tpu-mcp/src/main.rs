@@ -226,18 +226,24 @@ fn dispatch(
                 let mut warn = |msg: &str| log_warn(out, msg.to_string());
                 io_worker.try_call(name, &args, config, &mut warn)
             };
-            let result = match outcome {
-                Ok(Some(text)) => Ok(text),
-                Err(e) => Err(e.into()),
+            let result: Result<tools::ToolResult, Box<dyn std::error::Error>> = match outcome {
+                Ok(Some(tr)) => Ok(tr),
+                Err(e) => Err(e),
                 Ok(None) => tools::call(name, &args, config),
             };
 
             match result {
-                Ok(text) => ResponseBody::Ok {
-                    result: serde_json::json!({
-                        "content": [{ "type": "text", "text": text }]
-                    }),
-                },
+                Ok(tools::ToolResult { text, is_error }) => {
+                    if is_error {
+                        log_warn(out, format!("tool '{name}' error (in NDJSON response)"));
+                    }
+                    ResponseBody::Ok {
+                        result: serde_json::json!({
+                            "content": [{ "type": "text", "text": text }],
+                            "isError": is_error
+                        }),
+                    }
+                }
                 Err(e) => {
                     // Surface a server-side log entry for tool failures so
                     // operators have a trail in the MCP output channel even

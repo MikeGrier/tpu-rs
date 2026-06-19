@@ -51,6 +51,18 @@ fn bin_path() -> PathBuf {
     p
 }
 
+/// Strip the JSON invocation header that tpu-mcp prepends to mixed-mode output.
+/// Read tools emit one JSON line as the first line, then the raw file content.
+fn strip_ndjson_header(s: &str) -> &str {
+    if let Some(pos) = s.find('\n') {
+        let first_line = s[..pos].trim();
+        if serde_json::from_str::<Value>(first_line).is_ok() {
+            return &s[pos + 1..];
+        }
+    }
+    s
+}
+
 /// All running children of `parent_pid` (i.e. the io-worker, if any).
 fn worker_pids_for(parent_pid: u32) -> Vec<u32> {
     let sys = System::new_all();
@@ -257,7 +269,7 @@ fn chaos_kill_between_writes_all_succeed() {
             .and_then(|c| c.get("text"))
             .and_then(|t| t.as_str())
             .unwrap_or_else(|| panic!("read {i} missing text: {read}"));
-        assert_eq!(text, content, "tpu_read_file content mismatch for file {i}");
+        assert_eq!(strip_ndjson_header(text), content, "tpu_read_file content mismatch for file {i}");
 
         let on_disk = std::fs::read_to_string(&path).expect("read back from disk");
         assert_eq!(on_disk, content, "on-disk content mismatch for file {i}");

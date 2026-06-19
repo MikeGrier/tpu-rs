@@ -35,6 +35,74 @@ use std::{path::Path, time::SystemTime};
 
 use serde_json::Value;
 
+// -- NDJSON tool result -------------------------------------------------------
+
+/// The result of a tool call: structured NDJSON text and an error flag.
+///
+/// Every tool response is a newline-delimited stream of JSON objects.
+/// The first line is always an `x-tpu-mcp-invocation` record that
+/// describes the effective call (tool name + sanitised arguments).
+/// For mutating and structured tools a `{"status":"success",...}` or
+/// `{"status":"error","message":"..."}` trailer follows the body.
+/// Read tools use mixed mode: the header is JSON, the body is the raw
+/// file content, and no trailer is emitted on success.
+///
+/// `is_error` mirrors `CallToolResult.isError` so MCP clients can detect
+/// failures without parsing the NDJSON trailer.
+pub struct ToolResult {
+    /// The full NDJSON response text.
+    pub text: String,
+    /// `true` when the underlying operation failed.
+    pub is_error: bool,
+}
+
+impl ToolResult {
+    /// Successful result with the given NDJSON text.
+    pub fn ok(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            is_error: false,
+        }
+    }
+
+    /// Error result: invocation header + `{"status":"error","message":"..."}`.
+    pub fn error(header: &str, msg: &str) -> Self {
+        let err_line = serde_json::json!({ "status": "error", "message": msg });
+        let err_str = serde_json::to_string(&err_line).unwrap_or_default();
+        Self {
+            text: format!("{header}\n{err_str}"),
+            is_error: true,
+        }
+    }
+}
+
+/// Build the first NDJSON line for any tool response.
+///
+/// Large text fields (`content`, `replacement`, `template`) are replaced by
+/// a `"<N bytes>"` placeholder so the header stays compact.  All other
+/// arguments pass through as-is.
+fn invocation_header(tool: &str, args: &Value) -> String {
+    const LARGE_FIELDS: &[&str] = &["content", "replacement", "template"];
+    let mut sanitized = args.clone();
+    for field in LARGE_FIELDS {
+        if let Some(obj) = sanitized.as_object_mut() {
+            if let Some(v) = obj.get(*field).and_then(|v| v.as_str()) {
+                let n = v.len();
+                obj.insert(
+                    (*field).to_string(),
+                    serde_json::Value::String(format!("<{n} bytes>")),
+                );
+            }
+        }
+    }
+    serde_json::to_string(&serde_json::json!({
+        "reason": "x-tpu-mcp-invocation",
+        "tool":   tool,
+        "args":   sanitized,
+    }))
+    .unwrap_or_else(|_| format!("{{\"reason\":\"x-tpu-mcp-invocation\",\"tool\":{tool:?}}}"))
+}
+
 // -- tool list -----------------------------------------------------------------
 
 /// Names of every tool exposed by [`list()`], in advertising order.
@@ -1201,182 +1269,213 @@ pub fn call(
     name: &str,
     args: &Value,
     config: &ServerConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> Result<ToolResult, Box<dyn std::error::Error>> {
     match name {
-        "tpu_read_file" => call_read_file(args),
-        "tpu_write_file" => call_write_file(args, config),
-        "tpu_replace_in_file" => call_replace_in_file(args, config),
-        "tpu_edit_file" => call_edit_file(args, config),
-        "tpu_read_file_binary" => call_read_file_binary(args),
-        "tpu_read_file_escaped" => call_read_file_escaped(args),
-        "tpu_validate_file" => call_validate_file(args),
-        "tpu_read_head" => call_read_head(args),
-        "tpu_read_tail" => call_read_tail(args),
-        "tpu_count_file" => call_count_file(args),
-        "tpu_append_file" => call_append_file(args, config),
-        "tpu_copy_file" => call_copy_file(args, config),
-        "tpu_render_file" => call_render_file(args, config),
-        "tpu_setup" => call_setup(args, config),
-        "tpu_find" => call_find(args, config),
-        "tpu_stat_file" => call_stat_file(args),
-        "tpu_doctor" => call_doctor(args, config),
+        "tpu_read_file" => Ok(call_read_file(args)),
+        "tpu_write_file" => Ok(call_write_file(args, config)),
+        "tpu_replace_in_file" => Ok(call_replace_in_file(args, config)),
+        "tpu_edit_file" => Ok(call_edit_file(args, config)),
+        "tpu_read_file_binary" => Ok(call_read_file_binary(args)),
+        "tpu_read_file_escaped" => Ok(call_read_file_escaped(args)),
+        "tpu_validate_file" => Ok(call_validate_file(args)),
+        "tpu_read_head" => Ok(call_read_head(args)),
+        "tpu_read_tail" => Ok(call_read_tail(args)),
+        "tpu_count_file" => Ok(call_count_file(args)),
+        "tpu_append_file" => Ok(call_append_file(args, config)),
+        "tpu_copy_file" => Ok(call_copy_file(args, config)),
+        "tpu_render_file" => Ok(call_render_file(args, config)),
+        "tpu_setup" => Ok(call_setup(args, config)),
+        "tpu_find" => Ok(call_find(args, config)),
+        "tpu_stat_file" => Ok(call_stat_file(args)),
+        "tpu_doctor" => Ok(call_doctor(args, config)),
         _ => Err(format!("unknown tool: {name}").into()),
     }
 }
 
 // -- individual tool implementations ------------------------------------------
 
-fn call_read_file(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let path = std::path::Path::new(&file);
+fn call_read_file(args: &Value) -> ToolResult {
+    let header = invocation_header("tpu_read_file", args);
+    let inner = || -> Result<String, Box<dyn std::error::Error>> {
+        let file = resolve_file_arg(args)?;
+        let path = std::path::Path::new(&file);
 
-    let lines_range = match args.get("lines").and_then(|v| v.as_str()) {
-        None => None,
-        Some(s) => Some(tpu::cmd::read::parse_lines_arg(s)?),
+        let lines_range = match args.get("lines").and_then(|v| v.as_str()) {
+            None => None,
+            Some(s) => Some(tpu::cmd::read::parse_lines_arg(s)?),
+        };
+        let numbers = args
+            .get("numbers")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let mut buf: Vec<u8> = Vec::new();
+        tpu::cmd::read::run(
+            path,
+            lines_range,
+            numbers,
+            tpu::encoding::OutputEncoding::Preserve,
+            tpu::encoding::BomPolicy::default(),
+            &mut buf,
+            tpu::IoMode::Buffered,
+            None,
+        )?;
+        String::from_utf8(buf).map_err(|e| format!("read: non-UTF-8 output: {e}").into())
     };
-    let numbers = args
-        .get("numbers")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
-    let mut buf: Vec<u8> = Vec::new();
-    tpu::cmd::read::run(
-        path,
-        lines_range,
-        numbers,
-        tpu::encoding::OutputEncoding::Preserve,
-        tpu::encoding::BomPolicy::default(),
-        &mut buf,
-        tpu::IoMode::Buffered,
-        None,
-    )?;
-    Ok(String::from_utf8(buf).map_err(|e| format!("read: non-UTF-8 output: {e}"))?)
+    match inner() {
+        Ok(content) => ToolResult::ok(format!("{header}\n{content}")),
+        Err(e) => ToolResult::error(&header, &e.to_string()),
+    }
 }
 
 fn call_write_file(
     args: &Value,
     config: &ServerConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let content_raw = require_str(args, "content")?;
-    let content = normalize_to_lf(content_raw);
-    let path = std::path::Path::new(&file);
+) -> ToolResult {
+    let header = invocation_header("tpu_write_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
+        let file = resolve_file_arg(args)?;
+        let content_raw = require_str(args, "content")?;
+        let content = normalize_to_lf(content_raw);
+        let path = std::path::Path::new(&file);
 
-    let le_override = match args.get("line_ending").and_then(|v| v.as_str()) {
-        None => None,
-        Some(s) => Some(tpu::encoding::parse_line_ending(s)?),
+        let le_override = match args.get("line_ending").and_then(|v| v.as_str()) {
+            None => None,
+            Some(s) => Some(tpu::encoding::parse_line_ending(s)?),
+        };
+
+        if let Some(validates) = args.get("validate").and_then(|v| v.as_array()) {
+            let pairs = flatten_validate_pairs(validates)?;
+            tpu::cmd::validate::run_all(&pairs, path, false, tpu::IoMode::Buffered)?;
+        }
+
+        let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut diff_buf: Vec<u8> = Vec::new();
+        let diff_out: Option<&mut dyn std::io::Write> = if diff { Some(&mut diff_buf) } else { None };
+
+        let policy = mojibake_policy_from_args(args);
+        tpu::cmd::write::run(
+            path,
+            &content,
+            tpu::encoding::OutputEncoding::Preserve,
+            tpu::encoding::BomPolicy::default(),
+            le_override,
+            diff_out,
+            tpu::IoMode::Buffered,
+            policy,
+        )?;
+        delete_bak_if_exists(&file);
+        let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
+        let status = serde_json::json!({
+            "status": "success",
+            "file": file,
+            "mtime_epoch_ms": stamp.mtime_epoch_ms,
+            "size": stamp.size,
+        });
+        let status_line = serde_json::to_string(&status)?;
+        if diff && !diff_buf.is_empty() {
+            let diff_text = String::from_utf8_lossy(&diff_buf);
+            Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")))
+        } else {
+            Ok(ToolResult::ok(format!("{header}\n{status_line}")))
+        }
     };
-
-    // Run validate guards before any write.
-    if let Some(validates) = args.get("validate").and_then(|v| v.as_array()) {
-        let pairs = flatten_validate_pairs(validates)?;
-        tpu::cmd::validate::run_all(&pairs, path, false, tpu::IoMode::Buffered)?;
-    }
-
-    let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut diff_buf: Vec<u8> = Vec::new();
-    let diff_out: Option<&mut dyn std::io::Write> = if diff { Some(&mut diff_buf) } else { None };
-
-    let policy = mojibake_policy_from_args(args);
-    tpu::cmd::write::run(
-        path,
-        &content,
-        tpu::encoding::OutputEncoding::Preserve,
-        tpu::encoding::BomPolicy::default(),
-        le_override,
-        diff_out,
-        tpu::IoMode::Buffered,
-        policy,
-    )?;
-    delete_bak_if_exists(&file);
-    let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
-    if diff && !diff_buf.is_empty() {
-        Ok(String::from_utf8_lossy(&diff_buf).into_owned())
-    } else {
-        Ok(format!(
-            "wrote '{}' [mtime={}, size={}]",
-            file, stamp.mtime_epoch_ms, stamp.size
-        ))
-    }
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
 fn call_replace_in_file(
     args: &Value,
     config: &ServerConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let pattern = require_str(args, "pattern")?;
-    let replacement_raw = require_str(args, "replacement")?;
-    let replacement_unescaped = unescape_replacement(replacement_raw);
-    let replacement = normalize_to_lf(&replacement_unescaped);
-    let path = std::path::Path::new(&file);
+) -> ToolResult {
+    let header = invocation_header("tpu_replace_in_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
+        let file = resolve_file_arg(args)?;
+        let pattern = require_str(args, "pattern")?;
+        let replacement_raw = require_str(args, "replacement")?;
+        let replacement_unescaped = unescape_replacement(replacement_raw);
+        let replacement = normalize_to_lf(&replacement_unescaped);
+        let path = std::path::Path::new(&file);
 
-    let multiline = args
-        .get("multiline")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let fixed_strings = args
-        .get("fixed_strings")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let le_override = match args.get("line_ending").and_then(|v| v.as_str()) {
-        None => None,
-        Some(s) => Some(tpu::encoding::parse_line_ending(s)?),
-    };
-    let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
-    let count = args.get("count").and_then(|v| v.as_bool()).unwrap_or(false);
-    let dry_run = args
-        .get("dry_run")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        let multiline = args
+            .get("multiline")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let fixed_strings = args
+            .get("fixed_strings")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let le_override = match args.get("line_ending").and_then(|v| v.as_str()) {
+            None => None,
+            Some(s) => Some(tpu::encoding::parse_line_ending(s)?),
+        };
+        let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
+        let count = args.get("count").and_then(|v| v.as_bool()).unwrap_or(false);
+        let dry_run = args
+            .get("dry_run")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-    let mut diff_buf: Vec<u8> = Vec::new();
-    let diff_out: Option<&mut dyn std::io::Write> = if diff || dry_run {
-        Some(&mut diff_buf)
-    } else {
-        None
-    };
+        let mut diff_buf: Vec<u8> = Vec::new();
+        let diff_out: Option<&mut dyn std::io::Write> = if diff || dry_run {
+            Some(&mut diff_buf)
+        } else {
+            None
+        };
 
-    let n = tpu::cmd::replace::run(
-        path,
-        pattern,
-        replacement.as_bytes(),
-        multiline,
-        fixed_strings,
-        le_override,
-        diff_out,
-        count,
-        dry_run,
-        tpu::IoMode::Buffered,
-        mojibake_policy_from_args(args),
-    )?;
+        let n = tpu::cmd::replace::run(
+            path,
+            pattern,
+            replacement.as_bytes(),
+            multiline,
+            fixed_strings,
+            le_override,
+            diff_out,
+            count,
+            dry_run,
+            tpu::IoMode::Buffered,
+            mojibake_policy_from_args(args),
+        )?;
 
-    if count {
-        return Ok(format!("count: {n}"));
-    }
-    if dry_run {
-        if !diff_buf.is_empty() {
-            return Ok(String::from_utf8_lossy(&diff_buf).into_owned());
+        if count {
+            let line = serde_json::to_string(&serde_json::json!({
+                "status": "success", "count": n,
+            }))?;
+            return Ok(ToolResult::ok(format!("{header}\n{line}")));
         }
-        return Ok(format!("no changes in '{file}'"));
-    }
-    // File was modified.
-    delete_bak_if_exists(&file);
-    let stamp = stamp_and_verify(Path::new(&file), config.verify_delay_ms)?;
-    if diff && !diff_buf.is_empty() {
-        Ok(String::from_utf8_lossy(&diff_buf).into_owned())
-    } else {
-        Ok(format!(
-            "replaced in '{}' [mtime={}, size={}]",
-            file, stamp.mtime_epoch_ms, stamp.size
-        ))
-    }
+        if dry_run {
+            let diff_text = String::from_utf8_lossy(&diff_buf);
+            let status_line = serde_json::to_string(&serde_json::json!({
+                "status": if diff_buf.is_empty() { "success" } else { "success" },
+                "changed": !diff_buf.is_empty(),
+            }))?;
+            return Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")));
+        }
+        // File was modified.
+        delete_bak_if_exists(&file);
+        let stamp = stamp_and_verify(Path::new(&file), config.verify_delay_ms)?;
+        let status = serde_json::json!({
+            "status": "success",
+            "file": file,
+            "mtime_epoch_ms": stamp.mtime_epoch_ms,
+            "size": stamp.size,
+        });
+        let status_line = serde_json::to_string(&status)?;
+        if diff && !diff_buf.is_empty() {
+            let diff_text = String::from_utf8_lossy(&diff_buf);
+            Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")))
+        } else {
+            Ok(ToolResult::ok(format!("{header}\n{status_line}")))
+        }
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
 fn call_edit_file(
     args: &Value,
     config: &ServerConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> ToolResult {
+    let header = invocation_header("tpu_edit_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let file = resolve_file_arg(args)?;
     let path = std::path::Path::new(&file);
     let binary = args
@@ -1516,17 +1615,26 @@ fn call_edit_file(
     )?;
     delete_bak_if_exists(&file);
     let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
+    let status = serde_json::json!({
+        "status": "success",
+        "file": file,
+        "mtime_epoch_ms": stamp.mtime_epoch_ms,
+        "size": stamp.size,
+    });
+    let status_line = serde_json::to_string(&status)?;
     if diff && !diff_buf.is_empty() {
-        Ok(String::from_utf8_lossy(&diff_buf).into_owned())
+        let diff_text = String::from_utf8_lossy(&diff_buf);
+        Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")))
     } else {
-        Ok(format!(
-            "edited '{}' [mtime={}, size={}]",
-            file, stamp.mtime_epoch_ms, stamp.size
-        ))
+        Ok(ToolResult::ok(format!("{header}\n{status_line}")))
     }
+};
+inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_read_file_binary(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_read_file_binary(args: &Value) -> ToolResult {
+    let header = invocation_header("tpu_read_file_binary", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let file = resolve_file_arg(args)?;
 
     let byte_range = match args.get("bytes").and_then(|v| v.as_str()) {
@@ -1577,20 +1685,26 @@ fn call_read_file_binary(args: &Value) -> Result<String, Box<dyn std::error::Err
             })
             .collect();
         let content = tpu::data_format::encode_base64(slice);
-        Ok(serde_json::to_string(&serde_json::json!({
-            "reason": "data",
-            "subcommand": "read",
+        let result_line = serde_json::to_string(&serde_json::json!({
+            "reason": "x-tpu-mcp-result",
             "encoding": "bytes-base64",
             "content": content,
             "hashes": hashes_json,
-        }))?)
+        }))?;
+        let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+        Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
     } else {
-        // Return 7-bit-clean escaped string.
-        Ok(tpu::escape::encode_bytes(slice))
+        // Return 7-bit-clean escaped string — mixed mode (header + content).
+        let content = tpu::escape::encode_bytes(slice);
+        Ok(ToolResult::ok(format!("{header}\n{content}")))
     }
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_read_file_escaped(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_read_file_escaped(args: &Value) -> ToolResult {
+    let header = invocation_header("tpu_read_file_escaped", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let file = resolve_file_arg(args)?;
     let path = std::path::Path::new(&file);
 
@@ -1614,10 +1728,15 @@ fn call_read_file_escaped(args: &Value) -> Result<String, Box<dyn std::error::Er
         tpu::IoMode::Buffered,
         None,
     )?;
-    Ok(String::from_utf8(buf).map_err(|e| format!("readex: non-UTF-8 output: {e}"))?)
+    let content = String::from_utf8(buf).map_err(|e| format!("readex: non-UTF-8 output: {e}"))?;
+    Ok(ToolResult::ok(format!("{header}\n{content}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_read_head(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_read_head(args: &Value) -> ToolResult {
+    let header = invocation_header("tpu_read_head", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let file = resolve_file_arg(args)?;
     let path = std::path::Path::new(&file);
 
@@ -1634,10 +1753,15 @@ fn call_read_head(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
 
     let mut buf: Vec<u8> = Vec::new();
     tpu::cmd::head::run(path, mode, &mut buf, tpu::IoMode::Buffered, None)?;
-    Ok(String::from_utf8(buf).map_err(|e| format!("head: non-UTF-8 output: {e}"))?)
+    let content = String::from_utf8(buf).map_err(|e| format!("head: non-UTF-8 output: {e}"))?;
+    Ok(ToolResult::ok(format!("{header}\n{content}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_read_tail(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_read_tail(args: &Value) -> ToolResult {
+    let header = invocation_header("tpu_read_tail", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let file = resolve_file_arg(args)?;
     let path = std::path::Path::new(&file);
 
@@ -1654,10 +1778,15 @@ fn call_read_tail(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
 
     let mut buf: Vec<u8> = Vec::new();
     tpu::cmd::tail::run(path, mode, &mut buf, tpu::IoMode::Buffered, None)?;
-    Ok(String::from_utf8(buf).map_err(|e| format!("tail: non-UTF-8 output: {e}"))?)
+    let content = String::from_utf8(buf).map_err(|e| format!("tail: non-UTF-8 output: {e}"))?;
+    Ok(ToolResult::ok(format!("{header}\n{content}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_count_file(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_count_file(args: &Value) -> ToolResult {
+    let header = invocation_header("tpu_count_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let file = resolve_file_arg(args)?;
     let path = std::path::Path::new(&file);
 
@@ -1700,13 +1829,19 @@ fn call_count_file(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     )?;
     drop(out);
     let data = buf.lock().unwrap().clone();
-    Ok(String::from_utf8(data).map_err(|e| format!("count: non-UTF-8 output: {e}"))?)
+    let content = String::from_utf8(data).map_err(|e| format!("count: non-UTF-8 output: {e}"))?;
+    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+    Ok(ToolResult::ok(format!("{header}\n{content}{status_line}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
 fn call_append_file(
     args: &Value,
     config: &ServerConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> ToolResult {
+    let header = invocation_header("tpu_append_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let file = resolve_file_arg(args)?;
     let content_raw = require_str(args, "content")?;
     let content = normalize_to_lf(content_raw);
@@ -1735,10 +1870,14 @@ fn call_append_file(
             mojibake_policy_from_args(args),
         )?;
         if !diff_buf.is_empty() {
-            // Skip stamp_and_verify in diff mode to avoid file mutation
-            return Ok(String::from_utf8_lossy(&diff_buf).into_owned());
+            let diff_text = String::from_utf8_lossy(&diff_buf);
+            let status = serde_json::json!({"status":"success","file":file,"changed":true});
+            let status_line = serde_json::to_string(&status)?;
+            return Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")));
         }
-        return Ok(format!("appended to '{file}' (no changes)"));
+        let status = serde_json::json!({"status":"success","file":file,"changed":false});
+        let status_line = serde_json::to_string(&status)?;
+        return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
     }
 
     tpu::cmd::append::run(
@@ -1751,13 +1890,21 @@ fn call_append_file(
     )?;
     delete_bak_if_exists(&file);
     let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
-    Ok(format!(
-        "appended to '{}' [mtime={}, size={}]",
-        file, stamp.mtime_epoch_ms, stamp.size
-    ))
+    let status = serde_json::json!({
+        "status": "success",
+        "file": file,
+        "mtime_epoch_ms": stamp.mtime_epoch_ms,
+        "size": stamp.size,
+    });
+    let status_line = serde_json::to_string(&status)?;
+    Ok(ToolResult::ok(format!("{header}\n{status_line}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std::error::Error>> {
+fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
+    let header = invocation_header("tpu_find", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     // Collect patterns: primary "pattern" + optional "patterns" array.
     let mut all_patterns: Vec<String> = Vec::new();
     if let Some(p) = args.get("pattern").and_then(|v| v.as_str()) {
@@ -1869,54 +2016,55 @@ fn call_find(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std:
 
     match result {
         Ok(_) => {
-            let mut text =
+            let mut content =
                 String::from_utf8(buf).map_err(|e| format!("find: non-UTF-8 output: {e}"))?;
-            // Surface walk warnings so Copilot sees a structured note about
-            // skipped paths, not silent loss. In summary mode we collapse
-            // the per-entry detail into a single tail line.
-            if !walk_warnings.is_empty() {
-                if !text.is_empty() && !text.ends_with('\n') {
-                    text.push('\n');
-                }
-                match config.progress_detail {
-                    ProgressDetail::EachFile => {
-                        for w in &walk_warnings {
-                            text.push_str("warning: ");
-                            text.push_str(w);
-                            text.push('\n');
-                        }
-                    }
-                    ProgressDetail::Summary => {
-                        let n = walk_warnings.len();
-                        // Free the strings immediately — in summary mode only
-                        // the count is needed, not the individual messages.
-                        walk_warnings.clear();
-                        walk_warnings.shrink_to_fit();
-                        text.push_str(&format!(
-                            "warning: {n} path(s) skipped (use progressDetail=each-file to list)\n",
-                        ));
-                    }
-                }
+            // Ensure content ends with newline so the status trailer is on its own line.
+            if !content.is_empty() && !content.ends_with('\n') {
+                content.push('\n');
             }
-            Ok(text)
+            // Build status with optional warnings array.
+            let warnings_json: Vec<serde_json::Value> = match config.progress_detail {
+                ProgressDetail::EachFile => walk_warnings
+                    .iter()
+                    .map(|w| serde_json::Value::String(w.clone()))
+                    .collect(),
+                ProgressDetail::Summary => {
+                    let n = walk_warnings.len();
+                    if n > 0 {
+                        vec![serde_json::Value::String(format!(
+                            "{n} path(s) skipped (use progressDetail=each-file to list)"
+                        ))]
+                    } else {
+                        vec![]
+                    }
+                }
+            };
+            let mut status = serde_json::json!({ "status": "success" });
+            if !warnings_json.is_empty() {
+                status["warnings"] = serde_json::Value::Array(warnings_json);
+            }
+            let status_line = serde_json::to_string(&status)?;
+            Ok(ToolResult::ok(format!("{header}\n{content}{status_line}")))
         }
         Err(e) => {
-            // Surface per-path diagnostics collected before the failure so
-            // MCP clients can see which paths triggered the error.
-            if walk_warnings.is_empty() {
-                Err(e)
+            let msg = if walk_warnings.is_empty() {
+                e.to_string()
             } else {
-                let context = walk_warnings.join("\n");
-                Err(format!("{context}\n{e}").into())
-            }
+                format!("{}\n{e}", walk_warnings.join("\n"))
+            };
+            Err(msg.into())
         }
     }
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
 fn call_copy_file(
     args: &Value,
     config: &ServerConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> ToolResult {
+    let header = invocation_header("tpu_copy_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let source = normalize_file_path(require_str(args, "source")?);
     let dest = normalize_file_path(require_str(args, "dest")?);
     let recursive = args
@@ -1978,31 +2126,38 @@ fn call_copy_file(
     // Human-mode warn() emits "warning: {message}\n"; strip the prefix to get
     // a clean string array that MCP clients can read directly.
     let raw = String::from_utf8_lossy(&warn_buf.lock().unwrap()).into_owned();
-    let warn_lines: Vec<&str> = raw
+    let warn_lines: Vec<String> = raw
         .lines()
-        .map(|l| l.strip_prefix("warning: ").unwrap_or(l))
+        .map(|l| l.strip_prefix("warning: ").unwrap_or(l).to_string())
         .filter(|l| !l.is_empty())
         .collect();
-    let mut result = serde_json::json!({
+    let mut result_obj = serde_json::json!({
+        "reason":   "x-tpu-mcp-result",
         "copied":   report.copied,
         "skipped":  report.skipped,
         "warnings": report.warnings,
     });
     if matches!(config.progress_detail, ProgressDetail::EachFile) {
-        result["log"] = serde_json::Value::Array(
+        result_obj["log"] = serde_json::Value::Array(
             warn_lines
                 .iter()
-                .map(|s| serde_json::Value::String((*s).to_string()))
+                .map(|s| serde_json::Value::String(s.clone()))
                 .collect(),
         );
     }
-    Ok(serde_json::to_string(&result)?)
+    let result_line = serde_json::to_string(&result_obj)?;
+    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
 fn call_render_file(
     args: &Value,
     config: &ServerConfig,
-) -> Result<String, Box<dyn std::error::Error>> {
+) -> ToolResult {
+    let header = invocation_header("tpu_render_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     use std::collections::BTreeMap;
     let output = normalize_file_path(require_str(args, "output")?);
     // Normalize CRLF → LF at the MCP boundary, consistent with other write tools.
@@ -2083,16 +2238,24 @@ fn call_render_file(
     )?;
     delete_bak_if_exists(&output);
     let stamp = stamp_and_verify(std::path::Path::new(&output), config.verify_delay_ms)?;
-    Ok(serde_json::to_string(&serde_json::json!({
+    let result_obj = serde_json::json!({
+        "reason": "x-tpu-mcp-result",
         "output": output,
         "substitutions": report.substitutions,
         "missing": report.missing,
         "mtime_epoch_ms": stamp.mtime_epoch_ms,
         "size": stamp.size,
-    }))?)
+    });
+    let result_line = serde_json::to_string(&result_obj)?;
+    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_setup(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std::error::Error>> {
+fn call_setup(args: &Value, config: &ServerConfig) -> ToolResult {
+    let header = invocation_header("tpu_setup", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let target = match args.get("target") {
         None => None,
         Some(v) => match v.as_str() {
@@ -2103,11 +2266,16 @@ fn call_setup(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std
         },
     };
     match target {
-        None => Ok(tpu::cmd::setup::full_block()),
+        None => {
+            // Mixed mode: header line + raw markdown block content.
+            let block = tpu::cmd::setup::full_block();
+            Ok(ToolResult::ok(format!("{header}\n{block}")))
+        }
         Some(path) => {
             let (updated, replaced) =
                 tpu::cmd::setup::inject(std::path::Path::new(&path), tpu::IoMode::Buffered)?;
-            let mut result = serde_json::json!({
+            let mut result_obj = serde_json::json!({
+                "reason": "x-tpu-mcp-result",
                 "target": path,
                 "updated": updated,
                 "replaced": replaced,
@@ -2115,35 +2283,21 @@ fn call_setup(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std
             if updated {
                 delete_bak_if_exists(&path);
                 let stamp = stamp_and_verify(std::path::Path::new(&path), config.verify_delay_ms)?;
-                result["mtime_epoch_ms"] = serde_json::Value::Number(stamp.mtime_epoch_ms.into());
-                result["size"] = serde_json::Value::Number(stamp.size.into());
+                result_obj["mtime_epoch_ms"] = serde_json::Value::Number(stamp.mtime_epoch_ms.into());
+                result_obj["size"] = serde_json::Value::Number(stamp.size.into());
             }
-            Ok(serde_json::to_string(&result)?)
+            let result_line = serde_json::to_string(&result_obj)?;
+            let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+            Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
         }
     }
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_stat_file(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let meta = std::fs::metadata(&file)?;
-    let mtime_epoch_ms = mtime_as_epoch_ms(&meta);
-    let created_epoch_ms = meta
-        .created()
-        .ok()
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let readonly = meta.permissions().readonly();
-    let size = meta.len();
-    Ok(serde_json::to_string(&serde_json::json!({
-        "size": size,
-        "mtime_epoch_ms": mtime_epoch_ms,
-        "created_epoch_ms": created_epoch_ms,
-        "readonly": readonly,
-    }))?)
-}
-
-fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn std::error::Error>> {
+fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
+    let header = invocation_header("tpu_doctor", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     let mut all_paths: Vec<String> = Vec::new();
     if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
         all_paths.push(normalize_file_path(p));
@@ -2257,16 +2411,51 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> Result<String, Box<dyn st
         .collect();
 
     let doc = serde_json::json!({
+        "reason": "x-tpu-mcp-result",
         "files": files,
         "total_files_scanned": report.total_files_scanned,
         "total_issues": report.total_issues(),
         "total_repaired": report.total_repaired,
         "walk_warnings": walk_warnings,
     });
-    Ok(serde_json::to_string(&doc)?)
+    let result_line = serde_json::to_string(&doc)?;
+    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_validate_file(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+fn call_stat_file(args: &Value) -> ToolResult {
+    let header = invocation_header("tpu_stat_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
+    let file = resolve_file_arg(args)?;
+    let meta = std::fs::metadata(&file)?;
+    let mtime_epoch_ms = mtime_as_epoch_ms(&meta);
+    let created_epoch_ms = meta
+        .created()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let readonly = meta.permissions().readonly();
+    let size = meta.len();
+    let result_obj = serde_json::json!({
+        "reason": "x-tpu-mcp-result",
+        "size": size,
+        "mtime_epoch_ms": mtime_epoch_ms,
+        "created_epoch_ms": created_epoch_ms,
+        "readonly": readonly,
+    });
+    let result_line = serde_json::to_string(&result_obj)?;
+    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
+}
+
+fn call_validate_file(args: &Value) -> ToolResult {
+    let header = invocation_header("tpu_validate_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
     // `tpu` has no standalone `validate` subcommand; --validate is a pre-write
     // flag on `tpu write`.  This tool calls the library directly to avoid an
     // unnecessary write operation.
@@ -2281,7 +2470,10 @@ fn call_validate_file(args: &Value) -> Result<String, Box<dyn std::error::Error>
 
     let pairs = vec![selector.to_string(), value.to_string()];
     tpu::cmd::validate::run_all(&pairs, Path::new(&file), is_binary, tpu::IoMode::Buffered)?;
-    Ok("validation passed".into())
+    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+    Ok(ToolResult::ok(format!("{header}\n{status_line}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
 // -- helpers -------------------------------------------------------------------
@@ -3129,10 +3321,42 @@ mod integration_tests {
 
     use super::*;
 
+    /// Parse the last JSON object line from NDJSON output (the status/result trailer).
+    fn last_json_line(output: &str) -> serde_json::Value {
+        output
+            .trim()
+            .lines()
+            .rev()
+            .find_map(|l| {
+                let l = l.trim();
+                if l.is_empty() {
+                    return None;
+                }
+                serde_json::from_str::<serde_json::Value>(l).ok()
+            })
+            .unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Find the `{"reason":"x-tpu-mcp-result",...}` line in NDJSON output.
+    fn ndjson_result_line(output: &str) -> serde_json::Value {
+        for line in output.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                if v.get("reason").and_then(|r| r.as_str()) == Some("x-tpu-mcp-result") {
+                    return v;
+                }
+            }
+        }
+        serde_json::Value::Null
+    }
+
     /// Zero-delay wrapper so existing tests call the real `call()` without
     /// needing to supply a `ServerConfig` argument explicitly.
     fn call(name: &str, args: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
-        super::call(
+        let tr = super::call(
             name,
             args,
             &ServerConfig {
@@ -3142,7 +3366,11 @@ mod integration_tests {
                 progress_detail: ProgressDetail::EachFile,
                 io_worker_enabled: false,
             },
-        )
+        )?;
+        if tr.is_error {
+            return Err(tr.text.into());
+        }
+        Ok(tr.text)
     }
 
     /// SF-IT-14: `tpu_find` MCP tool integration.
@@ -3165,30 +3393,40 @@ mod integration_tests {
         let result =
             call("tpu_find", &args).expect("tpu_find must succeed (exit 0 = matches found)");
 
-        // tpu find emits matching lines, one per LF-terminated line.
-        let lines: Vec<&str> = result.lines().collect();
-        assert_eq!(lines.len(), 2, "expected 2 matching lines; got: {result:?}");
+        // tpu find emits matching lines as plain text with JSON header/trailer.
+        // Filter out JSON lines to get only content lines.
+        let content_lines: Vec<&str> = result
+            .lines()
+            .filter(|l| serde_json::from_str::<serde_json::Value>(l.trim()).is_err())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert_eq!(content_lines.len(), 2, "expected 2 matching lines; got: {result:?}");
         assert!(
-            lines[0].contains("alpha fox here"),
+            content_lines[0].contains("alpha fox here"),
             "line 0 must contain 'alpha fox here'; got: {:?}",
-            lines[0]
+            content_lines[0]
         );
         assert!(
-            lines[1].contains("gamma fox again"),
+            content_lines[1].contains("gamma fox again"),
             "line 1 must contain 'gamma fox again'; got: {:?}",
-            lines[1]
+            content_lines[1]
         );
 
-        // tpu_find with no matches must return Ok("") -- not an error.
+        // tpu_find with no matches must return Ok (not Err) and have no content lines.
         let args_no_match = serde_json::json!({
             "pattern": "zzz_no_match_zzz",
             "path": f.to_str().expect("temp path must be valid UTF-8"),
         });
         let no_match =
             call("tpu_find", &args_no_match).expect("tpu_find with no matches must be Ok, not Err");
+        let content_no_match: Vec<&str> = no_match
+            .lines()
+            .filter(|l| serde_json::from_str::<serde_json::Value>(l.trim()).is_err())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
         assert!(
-            no_match.trim().is_empty(),
-            "no-match result must be empty; got: {no_match:?}"
+            content_no_match.is_empty(),
+            "no-match result must have no content lines; got: {no_match:?}"
         );
 
         drop(dir);
@@ -3597,18 +3835,16 @@ mod integration_tests {
         });
 
         let result = call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+        let v = last_json_line(&result);
         assert!(
-            result.contains("mtime="),
-            "response must contain mtime=; got: {result:?}"
+            v["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+            "response must contain mtime_epoch_ms; got: {result:?}"
         );
         assert!(
-            result.contains("size="),
-            "response must contain size=; got: {result:?}"
+            v.get("size").is_some(),
+            "response must contain size; got: {result:?}"
         );
-        assert!(
-            result.contains("size=12"),
-            "size must be 12; got: {result:?}"
-        );
+        assert_eq!(v["size"], 12, "size must be 12; got: {result:?}");
 
         drop(dir);
     }
@@ -3628,11 +3864,12 @@ mod integration_tests {
         });
 
         let result = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+        let v = last_json_line(&result);
         assert!(
-            result.contains("mtime="),
-            "response must contain mtime=; got: {result:?}"
+            v["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+            "response must contain mtime_epoch_ms; got: {result:?}"
         );
-        assert!(result.contains("size=4"), "size must be 4; got: {result:?}");
+        assert_eq!(v["size"], 4, "size must be 4; got: {result:?}");
 
         drop(dir);
     }
@@ -3650,14 +3887,12 @@ mod integration_tests {
         });
 
         let result = call("tpu_append_file", &args).expect("tpu_append_file must succeed");
+        let v = last_json_line(&result);
         assert!(
-            result.contains("mtime="),
-            "response must contain mtime=; got: {result:?}"
+            v["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+            "response must contain mtime_epoch_ms; got: {result:?}"
         );
-        assert!(
-            result.contains("size=12"),
-            "size must be 12; got: {result:?}"
-        );
+        assert_eq!(v["size"], 12, "size must be 12; got: {result:?}");
 
         drop(dir);
     }
@@ -3675,14 +3910,12 @@ mod integration_tests {
         });
 
         let result = call("tpu_edit_file", &args).expect("tpu_edit_file must succeed");
+        let v = last_json_line(&result);
         assert!(
-            result.contains("mtime="),
-            "response must contain mtime=; got: {result:?}"
+            v["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+            "response must contain mtime_epoch_ms; got: {result:?}"
         );
-        assert!(
-            result.contains("size=4"),
-            "size must be 4 after delete; got: {result:?}"
-        );
+        assert_eq!(v["size"], 4, "size must be 4 after delete; got: {result:?}");
 
         drop(dir);
     }
@@ -3697,8 +3930,7 @@ mod integration_tests {
         let args = serde_json::json!({ "file": f.to_str().unwrap() });
         let result = call("tpu_stat_file", &args).expect("tpu_stat_file must succeed");
 
-        let v: serde_json::Value =
-            serde_json::from_str(&result).expect("tpu_stat_file must return valid JSON");
+        let v = ndjson_result_line(&result);
         assert_eq!(v["size"], 10, "size must be 10; full: {result:?}");
         assert!(
             v["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
@@ -3728,17 +3960,15 @@ mod integration_tests {
         let write_result =
             call("tpu_write_file", &write_args).expect("tpu_write_file must succeed");
 
-        // Extract the mtime value from "mtime=NNN" in the response string.
-        let mtime_write: u64 = write_result
-            .split("mtime=")
-            .nth(1)
-            .and_then(|s| s.split([',', ']', ' ']).next())
-            .and_then(|s| s.parse().ok())
-            .expect("write result must contain parseable mtime=N");
+        // Extract mtime_epoch_ms from the last JSON line of the NDJSON response.
+        let write_v = last_json_line(&write_result);
+        let mtime_write: u64 = write_v["mtime_epoch_ms"]
+            .as_u64()
+            .expect("write result must contain mtime_epoch_ms");
 
         let stat_args = serde_json::json!({ "file": &path_str });
         let stat_result = call("tpu_stat_file", &stat_args).expect("tpu_stat_file must succeed");
-        let stat: serde_json::Value = serde_json::from_str(&stat_result).unwrap();
+        let stat = ndjson_result_line(&stat_result);
         let mtime_stat = stat["mtime_epoch_ms"].as_u64().unwrap();
 
         // With verify_delay_ms=0 the stamp is not set explicitly; both values
