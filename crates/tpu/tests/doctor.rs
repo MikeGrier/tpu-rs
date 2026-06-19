@@ -454,7 +454,8 @@ fn file_with_no_fffd_stays_clean() {
     use tempfile::TempDir;
 
     let dir = TempDir::new().unwrap();
-    let content = "café — résumé\n"; // real chars, no replacement chars
+    let content = "caf\u{00E9} \u{2014} r\u{00E9}sum\u{00E9}
+"; // real chars, no replacement chars
     let path = dir.path().join("clean.txt");
     fs::write(&path, content.as_bytes()).unwrap();
 
