@@ -1813,7 +1813,7 @@ fn call_count_file(args: &Value) -> ToolResult {
 
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let writer = SharedBufWriter(buf.clone());
-    let mut out = tpu::output::human_output_to(Box::new(writer));
+    let mut out = tpu::output::json_output_to(Box::new(writer));
 
     tpu::cmd::count::run(
         path,
@@ -1828,10 +1828,34 @@ fn call_count_file(args: &Value) -> ToolResult {
         tpu::IoMode::Buffered,
     )?;
     drop(out);
-    let data = buf.lock().unwrap().clone();
-    let content = String::from_utf8(data).map_err(|e| format!("count: non-UTF-8 output: {e}"))?;
+    let raw = buf.lock().unwrap().clone();
+    let ndjson =
+        String::from_utf8(raw).map_err(|e| format!("count: non-UTF-8 output: {e}"))?;
+
+    // Fold each {"reason":"data","metric":M,...} line into a single result
+    // object.  Standard metrics use a "count" field; encoding/bom/line_ending
+    // use a "value" field.
+    let mut result_obj = serde_json::json!({"reason": "x-tpu-mcp-result"});
+    for line in ndjson.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let parsed: Value = serde_json::from_str(line)
+            .map_err(|e| format!("count: malformed JSON line {line:?}: {e}"))?;
+        let metric = match parsed.get("metric").and_then(|v| v.as_str()) {
+            Some(m) => m.to_owned(),
+            None => continue,
+        };
+        if let Some(count) = parsed.get("count") {
+            result_obj[metric] = count.clone();
+        } else if let Some(value) = parsed.get("value") {
+            result_obj[metric] = value.clone();
+        }
+    }
+
+    let result_line = serde_json::to_string(&result_obj)?;
     let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
-    Ok(ToolResult::ok(format!("{header}\n{content}{status_line}")))
+    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
