@@ -352,6 +352,15 @@ pub fn json_output() -> Box<dyn Output> {
     })
 }
 
+/// Returns a [`JsonOutput`] backed by an arbitrary [`Write`] sink.
+///
+/// Library callers (such as `tpu-mcp`) use this to capture NDJSON output into
+/// a `Vec<u8>` buffer rather than writing to stdout.
+#[allow(dead_code)] // Used by tpu-mcp (library consumer), not by the tpu binary.
+pub fn json_output_to(writer: Box<dyn Write + Send>) -> Box<dyn Output> {
+    Box::new(JsonOutput { out: writer })
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
