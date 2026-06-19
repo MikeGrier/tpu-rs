@@ -64,22 +64,14 @@
                 "category": "tpu-mcp"
             }
         ],
-        "configuration": [
-            {
-                "title": "tpu-mcp",
-                "order": 1,
-                "properties": {
-                    "tpu-mcp.gettingStarted": {
-                        "type": "null",
-                        "markdownDescription": "[Open Copilot setup chat](command:tpu-mcp.openSetupChat) — asks Copilot to run the `tpu_setup` MCP tool, which (re)writes the managed `tpu-mcp` guidance block into your repository's `.github/copilot-instructions.md` so Copilot prefers the encoding-safe `tpu_*` tools over `Get-Content` / `Set-Content` / shell redirection in every future session in this workspace."
-                    }
-                }
-            },
-            {
-                "title": "tpu-mcp",
-                "order": 2,
-                "properties": {
-                    "tpu-mcp.verifyDelayMs": {
+        "configuration": {
+            "title": "tpu-mcp",
+            "properties": {
+                "tpu-mcp.gettingStarted": {
+                    "type": "null",
+                    "markdownDescription": "[Open Copilot setup chat](command:tpu-mcp.openSetupChat) — asks Copilot to run the `tpu_setup` MCP tool, which (re)writes the managed `tpu-mcp` guidance block into your repository's `.github/copilot-instructions.md` so Copilot prefers the encoding-safe `tpu_*` tools over `Get-Content` / `Set-Content` / shell redirection in every future session in this workspace."
+                },
+                "tpu-mcp.verifyDelayMs": {
                         "type": "integer",
                         "default": 100,
                         "minimum": 0,
@@ -126,8 +118,7 @@
                         "markdownDescription": "How much walk-error detail tree-walking tools include in their results. `each-file` (default) includes a `log` array of warning strings in `tpu_copy_file` results and individual warning lines in `tpu_find` output — each entry represents an inaccessible path or walk error. `summary` suppresses those per-entry details and collapses all walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
                     }
                 }
-            }
-        ]
+        }
     },
     "scripts": {
         "clean": "rimraf out",
