@@ -177,6 +177,50 @@ fn assert_lacks(label: &str, haystack: &str, needle: &str) {
     );
 }
 
+/// Find the `{"reason":"x-tpu-mcp-result",...}` line in NDJSON output.
+fn ndjson_result_line(output: &str) -> serde_json::Value {
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if v.get("reason").and_then(|r| r.as_str()) == Some("x-tpu-mcp-result") {
+                return v;
+            }
+        }
+    }
+    // Fallback: last JSON line (for status-only results).
+    output
+        .trim()
+        .lines()
+        .rev()
+        .find_map(|l| {
+            let l = l.trim();
+            if l.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<serde_json::Value>(l).ok()
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
+/// Get the last JSON line from NDJSON output (the status/stamp trailer).
+fn last_json_line(output: &str) -> serde_json::Value {
+    output
+        .trim()
+        .lines()
+        .rev()
+        .find_map(|l| {
+            let l = l.trim();
+            if l.is_empty() {
+                return None;
+            }
+            serde_json::from_str::<serde_json::Value>(l).ok()
+        })
+        .unwrap_or(serde_json::Value::Null)
+}
+
 // --- tests -------------------------------------------------------------------
 
 /// MCP-IT-1: initialize handshake succeeds; tools/list includes all required tools.
@@ -237,8 +281,15 @@ fn mcp_it_2_write_then_read() {
             "content": "hello world\nline two\nline three\n",
         }),
     );
-    assert_has("write stamp mtime", &out, "[mtime=");
-    assert_has("write stamp size", &out, "size=");
+    let stamp = last_json_line(&out);
+    assert!(
+        stamp["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+        "write response must contain mtime_epoch_ms; got: {out:?}"
+    );
+    assert!(
+        stamp.get("size").is_some(),
+        "write response must contain size; got: {out:?}"
+    );
 
     let content = s.call_tool("tpu_read_file", json!({ "file": path }));
     assert_has("read line 1", &content, "hello world");
@@ -265,7 +316,11 @@ fn mcp_it_3_replace_basic() {
             "fixed_strings": true,
         }),
     );
-    assert_has("replace stamp", &out, "[mtime=");
+    let stamp = last_json_line(&out);
+    assert!(
+        stamp["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+        "replace response must contain mtime_epoch_ms; got: {out:?}"
+    );
 
     let content = std::fs::read_to_string(&f).unwrap();
     assert_has("word replaced", &content, "earth");
@@ -333,7 +388,11 @@ fn mcp_it_5_append_and_count() {
             "content": "appended line\n",
         }),
     );
-    assert_has("append stamp", &out, "[mtime=");
+    let stamp = last_json_line(&out);
+    assert!(
+        stamp["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+        "append response must contain mtime_epoch_ms; got: {out:?}"
+    );
 
     let content = std::fs::read_to_string(&f).unwrap();
     assert_has("appended text on disk", &content, "appended line");
@@ -361,17 +420,14 @@ fn mcp_it_6_stat_file_and_stamp_consistency() {
         }),
     );
 
-    // Parse mtime from "... [mtime=NNN, size=NNN]".
-    let mtime_write: u64 = write_out
-        .split("mtime=")
-        .nth(1)
-        .and_then(|s| s.split([',', ']', ' ']).next())
-        .and_then(|s| s.parse().ok())
-        .expect("write response must contain parseable mtime=N");
+    // Parse mtime from the NDJSON status trailer: {"status":"success","mtime_epoch_ms":NNN,...}.
+    let write_stamp = last_json_line(&write_out);
+    let mtime_write: u64 = write_stamp["mtime_epoch_ms"]
+        .as_u64()
+        .expect("write response must contain mtime_epoch_ms");
 
     let stat_out = s.call_tool("tpu_stat_file", json!({ "file": path }));
-    let stat: Value = serde_json::from_str(&stat_out)
-        .unwrap_or_else(|_| panic!("tpu_stat_file must return valid JSON; got: {stat_out:?}"));
+    let stat = ndjson_result_line(&stat_out);
 
     let mtime_stat = stat["mtime_epoch_ms"]
         .as_u64()
@@ -415,9 +471,15 @@ fn mcp_it_7_find_matches_and_no_match() {
             "path": f.to_str().unwrap(),
         }),
     );
+    // In NDJSON mixed mode: header + (no content lines) + status line.
+    let content_lines: Vec<&str> = no_match
+        .lines()
+        .filter(|l| serde_json::from_str::<serde_json::Value>(l.trim()).is_err())
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     assert!(
-        no_match.trim().is_empty(),
-        "no-match result must be empty; got: {no_match:?}"
+        content_lines.is_empty(),
+        "no-match result must have no content lines; got: {no_match:?}"
     );
 }
 
@@ -442,8 +504,7 @@ fn mcp_it_8_copy_file_basic_and_overwrite() {
             "overwrite": false,
         }),
     );
-    let v: serde_json::Value = serde_json::from_str(&out)
-        .unwrap_or_else(|e| panic!("tpu_copy_file result must be JSON; got {out:?}: {e}"));
+    let v = ndjson_result_line(&out);
     assert_eq!(v["copied"], 1, "copied count must be 1; result: {v}");
     assert_eq!(v["skipped"], 0, "skipped count must be 0; result: {v}");
     assert_eq!(
@@ -462,9 +523,7 @@ fn mcp_it_8_copy_file_basic_and_overwrite() {
             "overwrite": true,
         }),
     );
-    let v2: serde_json::Value = serde_json::from_str(&out2).unwrap_or_else(|e| {
-        panic!("tpu_copy_file overwrite result must be JSON; got {out2:?}: {e}")
-    });
+    let v2 = ndjson_result_line(&out2);
     assert_eq!(
         v2["copied"], 1,
         "overwrite copied count must be 1; result: {v2}"
@@ -484,8 +543,7 @@ fn mcp_it_8_copy_file_basic_and_overwrite() {
             "overwrite": false,
         }),
     );
-    let v3: serde_json::Value = serde_json::from_str(&out3)
-        .unwrap_or_else(|e| panic!("tpu_copy_file skip result must be JSON; got {out3:?}: {e}"));
+    let v3 = ndjson_result_line(&out3);
     assert_eq!(v3["skipped"], 1, "skip count must be 1; result: {v3}");
     assert_eq!(
         v3["copied"], 0,
@@ -512,8 +570,7 @@ fn mcp_it_9_render_file_substitution_and_empty_key_rejected() {
             "vars": { "NAME": "Alice", "AGE": "30" },
         }),
     );
-    let v: serde_json::Value = serde_json::from_str(&result)
-        .unwrap_or_else(|e| panic!("tpu_render_file result must be JSON; got {result:?}: {e}"));
+    let v = ndjson_result_line(&result);
     assert_eq!(
         v["substitutions"], 2,
         "substitution count must be 2; result: {v}"
@@ -560,10 +617,12 @@ fn mcp_it_10_setup_returns_markdown_block() {
     assert_has("setup begin marker", &out, "tpu-mcp:setup:begin");
     assert_has("setup end marker", &out, "tpu-mcp:setup:end");
     assert_has("tpu_read_file row", &out, "tpu_read_file");
-    // Plain text — must NOT look like a top-level JSON object.
+    // In NDJSON mixed mode: first line is JSON header, rest is plain Markdown.
+    // Skip the header line and check the rest is not a JSON object.
+    let body_after_header = out.splitn(2, '\n').nth(1).unwrap_or(&out);
     assert!(
-        !out.trim_start().starts_with('{'),
-        "tpu_setup without target must return plain Markdown, not JSON; got: {out:?}"
+        !body_after_header.trim_start().starts_with('{'),
+        "tpu_setup body (after header) must be plain Markdown, not JSON; got: {out:?}"
     );
 }
 
@@ -583,8 +642,7 @@ fn mcp_it_11_setup_inject_and_replace() {
 
     // First call — inject: block is not yet present, so replaced must be false.
     let out1 = s.call_tool("tpu_setup", json!({ "target": target.to_str().unwrap() }));
-    let v1: serde_json::Value = serde_json::from_str(&out1)
-        .unwrap_or_else(|e| panic!("tpu_setup inject result must be JSON; got {out1:?}: {e}"));
+    let v1 = ndjson_result_line(&out1);
     assert_eq!(
         v1["updated"], true,
         "first inject must report updated=true; result: {v1}"
@@ -607,8 +665,7 @@ fn mcp_it_11_setup_inject_and_replace() {
 
     // Second call — replace: block already exists, so replaced must be true.
     let out2 = s.call_tool("tpu_setup", json!({ "target": target.to_str().unwrap() }));
-    let v2: serde_json::Value = serde_json::from_str(&out2)
-        .unwrap_or_else(|e| panic!("tpu_setup replace result must be JSON; got {out2:?}: {e}"));
+    let v2 = ndjson_result_line(&out2);
     // updated may be false if the block content was already identical; the key
     // observable is that `replaced` is true (the block was found and processed).
     assert_eq!(
@@ -648,8 +705,7 @@ fn mcp_it_12_doctor_scan_and_peel() {
         "tpu_doctor",
         json!({ "paths": [clean.to_str().unwrap(), dirty.to_str().unwrap()] }),
     );
-    let v: serde_json::Value = serde_json::from_str(&scan)
-        .unwrap_or_else(|e| panic!("tpu_doctor scan must return JSON; got {scan:?}: {e}"));
+    let v = ndjson_result_line(&scan);
     assert_eq!(v["total_files_scanned"].as_u64().unwrap(), 2);
     assert_eq!(v["total_issues"].as_u64().unwrap(), 1);
     assert_eq!(v["total_repaired"].as_u64().unwrap(), 0);
@@ -668,8 +724,7 @@ fn mcp_it_12_doctor_scan_and_peel() {
         "tpu_doctor",
         json!({ "path": dirty.to_str().unwrap(), "fix": "peel" }),
     );
-    let vp: serde_json::Value = serde_json::from_str(&peel)
-        .unwrap_or_else(|e| panic!("tpu_doctor peel must return JSON; got {peel:?}: {e}"));
+    let vp = ndjson_result_line(&peel);
     assert_eq!(vp["total_repaired"].as_u64().unwrap(), 1, "peel result: {vp}");
 
     // Post-repair, the file's bytes must be the UTF-8 for "cafe<U+00E9>\n"
@@ -683,8 +738,7 @@ fn mcp_it_12_doctor_scan_and_peel() {
 
     // Re-scan must now show zero issues.
     let rescan = s.call_tool("tpu_doctor", json!({ "path": dirty.to_str().unwrap() }));
-    let vr: serde_json::Value = serde_json::from_str(&rescan)
-        .unwrap_or_else(|e| panic!("rescan JSON: {rescan:?}: {e}"));
+    let vr = ndjson_result_line(&rescan);
     assert_eq!(
         vr["total_issues"].as_u64().unwrap(),
         0,
