@@ -4089,4 +4089,95 @@ mod integration_tests {
 
         drop(dir);
     }
+
+    // -- call_count_file -------------------------------------------------------
+
+    /// CF-IT-1: `tpu_count_file` with no metric flags must return all four
+    /// standard metrics (`lines`, `words`, `chars`, `bytes`) at the top level
+    /// of the `x-tpu-mcp-result` object.
+    ///
+    /// Regression for: when all flags defaulted to `false`, `standard_metric_names`
+    /// was empty so every metric emitted by `count::run` fell through the routing
+    /// guard and was silently dropped, producing an empty result object.
+    #[test]
+    fn cf_it_1_count_file_no_flags_returns_all_four_metrics() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_default.txt");
+        // 2 lines, 3 words, known byte/char content.
+        fs::write(&f, "hello world\nline two\n").unwrap();
+
+        let args = serde_json::json!({ "file": f.to_str().unwrap() });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+
+        let result = ndjson_result_line(&out);
+        assert_eq!(result["reason"], "x-tpu-mcp-result", "result line must be present; full output: {out:?}");
+
+        for metric in ["lines", "words", "chars", "bytes"] {
+            assert!(
+                result.get(metric).and_then(|v| v.as_u64()).is_some(),
+                "result must contain numeric '{metric}'; got: {result:?}"
+            );
+        }
+        assert_eq!(result["lines"].as_u64().unwrap(), 2, "lines count mismatch");
+
+        drop(dir);
+    }
+
+    /// CF-IT-2: `tpu_count_file` with only `lines: true` returns just `lines`
+    /// at the top level; `words`, `chars`, `bytes` are absent.
+    #[test]
+    fn cf_it_2_count_file_explicit_lines_flag_only() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_lines.txt");
+        fs::write(&f, "one\ntwo\nthree\n").unwrap();
+
+        let args = serde_json::json!({ "file": f.to_str().unwrap(), "lines": true });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+
+        let result = ndjson_result_line(&out);
+        assert_eq!(result["lines"].as_u64().unwrap(), 3, "explicit lines count");
+        for absent in ["words", "chars", "bytes"] {
+            assert!(
+                result.get(absent).is_none(),
+                "'{absent}' must be absent when not requested; got: {result:?}"
+            );
+        }
+
+        drop(dir);
+    }
+
+    /// CF-IT-3: when a pattern is given a label that collides with a standard
+    /// metric name (e.g. `"lines"`), the standard metric must survive at the
+    /// top level and the pattern result must go into `result["patterns"]["lines"]`.
+    /// Regression for: the previous routing used `pattern_label_set.contains(metric)`
+    /// which would route the real `lines` count into `patterns` on a collision.
+    #[test]
+    fn cf_it_3_count_file_pattern_label_collision_with_standard_metric() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_collision.txt");
+        fs::write(&f, "one\ntwo\nthree\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "lines": true,
+            "patterns": [{ "pattern": "two", "label": "lines" }],
+        });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+
+        let result = ndjson_result_line(&out);
+        // Standard lines count must be at the top level and correct.
+        assert_eq!(
+            result["lines"].as_u64().unwrap(),
+            3,
+            "standard lines count must survive label collision; got: {result:?}"
+        );
+        // The colliding pattern result must land in result["patterns"]["lines"].
+        assert_eq!(
+            result["patterns"]["lines"].as_u64().unwrap(),
+            1,
+            "pattern matching 'two' with label 'lines' must be in patterns sub-object; got: {result:?}"
+        );
+
+        drop(dir);
+    }
 }
