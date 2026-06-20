@@ -1375,7 +1375,8 @@ fn call_write_file(
         let status_line = serde_json::to_string(&status)?;
         if diff && !diff_buf.is_empty() {
             let diff_text = String::from_utf8_lossy(&diff_buf);
-            Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")))
+            let sep = diff_separator(&diff_text);
+            Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")))
         } else {
             Ok(ToolResult::ok(format!("{header}\n{status_line}")))
         }
@@ -1444,11 +1445,12 @@ fn call_replace_in_file(
         }
         if dry_run {
             let diff_text = String::from_utf8_lossy(&diff_buf);
+            let sep = diff_separator(&diff_text);
             let status_line = serde_json::to_string(&serde_json::json!({
                 "status": if diff_buf.is_empty() { "success" } else { "success" },
                 "changed": !diff_buf.is_empty(),
             }))?;
-            return Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")));
+            return Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")));
         }
         // File was modified.
         delete_bak_if_exists(&file);
@@ -1462,7 +1464,8 @@ fn call_replace_in_file(
         let status_line = serde_json::to_string(&status)?;
         if diff && !diff_buf.is_empty() {
             let diff_text = String::from_utf8_lossy(&diff_buf);
-            Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")))
+            let sep = diff_separator(&diff_text);
+            Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")))
         } else {
             Ok(ToolResult::ok(format!("{header}\n{status_line}")))
         }
@@ -1624,7 +1627,8 @@ fn call_edit_file(
     let status_line = serde_json::to_string(&status)?;
     if diff && !diff_buf.is_empty() {
         let diff_text = String::from_utf8_lossy(&diff_buf);
-        Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")))
+        let sep = diff_separator(&diff_text);
+        Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")))
     } else {
         Ok(ToolResult::ok(format!("{header}\n{status_line}")))
     }
@@ -1895,9 +1899,10 @@ fn call_append_file(
         )?;
         if !diff_buf.is_empty() {
             let diff_text = String::from_utf8_lossy(&diff_buf);
+            let sep = diff_separator(&diff_text);
             let status = serde_json::json!({"status":"success","file":file,"changed":true});
             let status_line = serde_json::to_string(&status)?;
-            return Ok(ToolResult::ok(format!("{header}\n{diff_text}{status_line}")));
+            return Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")));
         }
         let status = serde_json::json!({"status":"success","file":file,"changed":false});
         let status_line = serde_json::to_string(&status)?;
@@ -2863,6 +2868,15 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, Box<dyn std::e
 /// Recognises the `allow_mojibake` boolean (default `false`); when `true`,
 /// the write-time mojibake guard is disabled for that call.  Mirrors the
 /// CLI's `--allow-mojibake` flag.
+/// Returns `"\n"` when `s` does not end with a newline, otherwise `""`.
+///
+/// Diff output originates from an external writer and is not guaranteed to end
+/// with a newline. Calling this before concatenating a JSON status line ensures
+/// the result is valid NDJSON (one JSON object per line).
+fn diff_separator(s: &str) -> &'static str {
+    if s.ends_with('\n') { "" } else { "\n" }
+}
+
 fn mojibake_policy_from_args(args: &Value) -> tpu::mojibake::WritePolicy {
     let allow = args
         .get("allow_mojibake")
