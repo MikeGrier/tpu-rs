@@ -310,6 +310,7 @@ MCP `content[0].text` field:
 | Body (mutating tools — `count:true`) | `{"status":"success","count":N}` (replace only; no file written) |
 | Body (mutating tools — `append diff:true`) | Diff lines when changed, then `{"status":"success","file":"...","changed":true\|false}` |
 | Body (structured tools) | `{"reason":"x-tpu-mcp-result",...}` then `{"status":"success"}` |
-| Body (read tools) | Raw file content (no JSON trailer on success) |
+| Body (read tools) | Raw file content (no JSON trailer on success) — **exception**: `tpu_read_file_binary` with a `hash` arg acts like a structured tool (see next row) |
+| Body (`tpu_read_file_binary` + `hash`) | `{"reason":"x-tpu-mcp-result","encoding":"bytes-base64","content":"<base64>","hashes":[...]}` then `{"status":"success"}` |
 | Body (`tpu_find`) | Matching lines as plain text, then `{"status":"success","warnings":[...]}` trailer |
 | On error | `{"status":"error","message":"..."}` as the final line; `isError: true` in the MCP wrapper |
