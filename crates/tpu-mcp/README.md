@@ -299,8 +299,10 @@ which is correct MCP behaviour.
 
 ### Tool output format
 
-Tool call results are returned as **NDJSON** (one JSON object per line) inside the
-MCP `content[0].text` field:
+Tool call results use a **mixed format** inside the MCP `content[0].text` field.
+The first line is always a JSON invocation header; subsequent lines depend on
+the tool type (see table below).  Not every line is JSON — read tools and
+`tpu_find` emit raw content between the header and trailer.
 
 | Line | Content |
 |---|---|

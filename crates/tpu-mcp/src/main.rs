@@ -227,9 +227,8 @@ fn dispatch(
                 io_worker.try_call(name, &args, config, &mut warn)
             };
             let result: Result<tools::ToolResult, Box<dyn std::error::Error>> = match outcome {
-                Ok(Some(tr)) => Ok(tr),
-                Err(e) => Err(e),
-                Ok(None) => tools::call(name, &args, config),
+                Some(tr) => Ok(tr),
+                None => tools::call(name, &args, config),
             };
 
             match result {
