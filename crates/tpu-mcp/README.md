@@ -305,7 +305,10 @@ MCP `content[0].text` field:
 | Line | Content |
 |---|---|
 | First | `{"reason":"x-tpu-mcp-invocation","tool":"tpu_NAME","args":{...}}` — invocation echo; large text fields replaced with `"<N bytes>"` |
-| Body (mutating tools) | Optional unified diff lines, then `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N}` |
+| Body (mutating tools — normal write) | Optional unified diff lines, then `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N}` |
+| Body (mutating tools — `dry_run:true`) | Optional diff lines, then `{"status":"success","changed":true\|false}` (replace only; no file written) |
+| Body (mutating tools — `count:true`) | `{"status":"success","count":N}` (replace only; no file written) |
+| Body (mutating tools — `append diff:true`) | Diff lines when changed, then `{"status":"success","file":"...","changed":true\|false}` |
 | Body (structured tools) | `{"reason":"x-tpu-mcp-result",...}` then `{"status":"success"}` |
 | Body (read/find tools) | Raw file content or matching lines (no JSON trailer on success) |
 | On error | `{"status":"error","message":"..."}` as the final line; `isError: true` in the MCP wrapper |

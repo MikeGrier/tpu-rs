@@ -111,8 +111,13 @@ Every tool response is **NDJSON** (one JSON object per line):
 - **Line 1** — invocation header:
   `{"reason":"x-tpu-mcp-invocation","tool":"tpu_NAME","args":{...}}`
   Large `content`/`replacement`/`template` fields appear as `"<N bytes>"` placeholders.
-- **Mutating tools** (write, replace, edit, append) — status trailer:
+- **Mutating tools** (write, replace, edit, append) — normal write:
   `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N}`
+  Preview modes do not stamp the file and return a reduced trailer:
+  `diff:true` adds unified diff lines before the status (full stamp still present for write/replace/edit).
+  `dry_run:true` (replace only): optional diff lines, then `{"status":"success","changed":true|false}`.
+  `count:true` (replace only): `{"status":"success","count":N}`.
+  `append diff:true`: diff lines when changed, then `{"status":"success","file":"...","changed":true|false}`.
 - **Structured tools** (count_file, stat_file, copy_file, render_file,
   setup+target, doctor) — result line
   `{"reason":"x-tpu-mcp-result",...}` followed by `{"status":"success"}`.
