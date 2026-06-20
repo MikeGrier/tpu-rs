@@ -1263,8 +1263,14 @@ pub fn list() -> Value {
 
 /// Call a named tool with the given JSON arguments.
 ///
-/// On success returns the UTF-8 text for the MCP `content` array entry.
-/// On failure returns an error that becomes an `isError: true` tool result.
+/// Always returns `Ok(ToolResult)`. Tool-level failures — including unknown
+/// tool names — are represented as `ToolResult { is_error: true, .. }` rather
+/// than `Err`. This ensures that the I/O worker sends `{"ok":...,"is_error":true}`
+/// over the wire instead of `{"err":...}`, so the worker manager surfaces the
+/// error without treating it as a protocol failure or triggering a respawn.
+///
+/// The `Err` path is kept in the signature for forward-compatibility but is
+/// unreachable in current code.
 pub fn call(
     name: &str,
     args: &Value,
@@ -1288,7 +1294,10 @@ pub fn call(
         "tpu_find" => Ok(call_find(args, config)),
         "tpu_stat_file" => Ok(call_stat_file(args)),
         "tpu_doctor" => Ok(call_doctor(args, config)),
-        _ => Err(format!("unknown tool: {name}").into()),
+        _ => Ok(ToolResult::error(
+            &invocation_header(name, args),
+            &format!("unknown tool: {name}"),
+        )),
     }
 }
 
