@@ -1820,12 +1820,21 @@ fn call_count_file(args: &Value) -> ToolResult {
                 .get("pattern")
                 .and_then(|v| v.as_str())
                 .ok_or("patterns entry missing 'pattern' field")?;
+            // Always push a label for every pattern to keep vec positions
+            // aligned with `patterns`; default to the pattern string itself
+            // (matching count::run's own fallback behaviour).
+            let label = entry.get("label").and_then(|v| v.as_str()).unwrap_or(pattern);
             patterns.push(pattern.to_owned());
-            if let Some(label) = entry.get("label").and_then(|v| v.as_str()) {
-                labels.push(label.to_owned());
-            }
+            labels.push(label.to_owned());
         }
     }
+    // Track which metric names come from user-supplied pattern labels so the
+    // fold step can route them to a "patterns" sub-object instead of placing
+    // them directly on result_obj.  This prevents user-controlled labels from
+    // silently clobbering standard metric keys ("lines", "bytes", …) or the
+    // top-level "reason" key.
+    let pattern_label_set: std::collections::HashSet<String> =
+        labels.iter().cloned().collect();
 
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let writer = SharedBufWriter(buf.clone());
@@ -1850,8 +1859,12 @@ fn call_count_file(args: &Value) -> ToolResult {
 
     // Fold each {"reason":"data","metric":M,...} line into a single result
     // object.  Standard metrics use a "count" field; encoding/bom/line_ending
-    // use a "value" field.
+    // use a "value" field.  Pattern-label metrics are kept under "patterns"
+    // so they never collide with standard keys.
     let mut result_obj = serde_json::json!({"reason": "x-tpu-mcp-result"});
+    if !pattern_label_set.is_empty() {
+        result_obj["patterns"] = serde_json::json!({});
+    }
     for line in ndjson.lines() {
         if line.is_empty() {
             continue;
@@ -1862,10 +1875,17 @@ fn call_count_file(args: &Value) -> ToolResult {
             Some(m) => m.to_owned(),
             None => continue,
         };
-        if let Some(count) = parsed.get("count") {
-            result_obj[metric] = count.clone();
+        let val = if let Some(count) = parsed.get("count") {
+            count.clone()
         } else if let Some(value) = parsed.get("value") {
-            result_obj[metric] = value.clone();
+            value.clone()
+        } else {
+            continue;
+        };
+        if pattern_label_set.contains(&metric) {
+            result_obj["patterns"][&metric] = val;
+        } else {
+            result_obj[metric] = val;
         }
     }
 
