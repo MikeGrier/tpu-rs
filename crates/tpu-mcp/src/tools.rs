@@ -1444,12 +1444,15 @@ fn call_replace_in_file(
             return Ok(ToolResult::ok(format!("{header}\n{line}")));
         }
         if dry_run {
-            let diff_text = String::from_utf8_lossy(&diff_buf);
-            let sep = diff_separator(&diff_text);
             let status_line = serde_json::to_string(&serde_json::json!({
                 "status": if diff_buf.is_empty() { "success" } else { "success" },
                 "changed": !diff_buf.is_empty(),
             }))?;
+            if diff_buf.is_empty() {
+                return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
+            }
+            let diff_text = String::from_utf8_lossy(&diff_buf);
+            let sep = diff_separator(&diff_text);
             return Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")));
         }
         // File was modified.
