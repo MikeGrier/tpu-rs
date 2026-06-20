@@ -220,13 +220,13 @@ impl IoWorkerHandle {
     ///   outcome (`tr.is_error == false`) or a tool-level failure
     ///   (`tr.is_error == true`); both are propagated verbatim to the MCP
     ///   client.  Transparent retries may have occurred.
-    /// - `Ok(None)` — every retry was exhausted (or the worker subsystem is
-    ///   disabled); the caller should run `tools::call` in-process and use
-    ///   that result instead.
-    /// - `Err(e)` — a protocol-level or I/O failure occurred that prevented
-    ///   the worker from completing the call at all (e.g. the process died
-    ///   and could not be revived).  The caller should fall back to
-    ///   in-process execution or propagate the error.
+    /// - `Ok(None)` — all attempts were exhausted (spawn failure, pipe
+    ///   broken, or protocol error) or the worker subsystem is disabled.
+    ///   The caller should run `tools::call` in-process and use that result.
+    ///
+    /// This function never returns `Err`: every worker failure is handled
+    /// internally by retrying up to `max_attempts` times and then
+    /// falling back to `Ok(None)`.
     pub fn try_call(
         &self,
         name: &str,
