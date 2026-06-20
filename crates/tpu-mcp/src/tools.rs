@@ -732,11 +732,11 @@ pub fn list() -> Value {
                  counting (same rules as tpu_read_file). \n\n\
                  When none of lines/words/chars/bytes is set, all four standard metrics are \
                  reported. Pattern matches are always reported when patterns are supplied. \n\n\
-                 Set stats=true to include file metadata (encoding name, BOM presence, \
-                 line-ending style) before the metric counts. Stats are always included in \
-                 JSON output. \n\n\
-                 Returns a JSON object with the requested counts and, for each named \
-                 pattern, a 'patterns' array entry with the match count.",
+                 File metadata (encoding name, BOM presence, line-ending style) is always \
+                 included in the result under 'encoding', 'bom', and 'line_ending'. \n\n\
+                 Returns a JSON object with the requested counts. When patterns are \
+                 supplied their results appear in a 'patterns' sub-object keyed by label \
+                 (e.g. {\"patterns\": {\"my-label\": 3}}).",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -788,11 +788,10 @@ pub fn list() -> Value {
                     "stats": {
                         "type": "boolean",
                         "description":
-                            "Emit file metadata (encoding name, BOM presence, line-ending \
-                             style) before the metric counts. When used without other metric \
-                             flags the default set (lines, words, chars, bytes) is still \
-                             reported. Stats are always present in JSON output regardless \
-                             of this flag."
+                            "Accepted for compatibility; has no effect. File metadata \
+                             (encoding name, BOM presence, line-ending style) is always \
+                             present in the result under the 'encoding', 'bom', and \
+                             'line_ending' keys."
                     },
                     "message_format": {
                         "type": "string",
@@ -1814,7 +1813,9 @@ fn call_count_file(args: &Value) -> ToolResult {
     let words = args.get("words").and_then(|v| v.as_bool()).unwrap_or(false);
     let chars = args.get("chars").and_then(|v| v.as_bool()).unwrap_or(false);
     let bytes = args.get("bytes").and_then(|v| v.as_bool()).unwrap_or(false);
-    let stats = args.get("stats").and_then(|v| v.as_bool()).unwrap_or(false);
+    // Stats (encoding/bom/line_ending) are always emitted by the MCP tool
+    // regardless of the caller-supplied flag, matching the advertised contract.
+    let stats = true;
 
     let mut patterns: Vec<String> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
@@ -1858,7 +1859,8 @@ fn call_count_file(args: &Value) -> ToolResult {
         if emit_words { s.insert("words"); }
         if emit_chars { s.insert("chars"); }
         if emit_bytes { s.insert("bytes"); }
-        if stats  { s.insert("encoding"); s.insert("bom"); s.insert("line_ending"); }
+        // stats is always true for the MCP tool; stats metrics are always expected.
+        s.insert("encoding"); s.insert("bom"); s.insert("line_ending");
         s
     };
 
@@ -4094,7 +4096,8 @@ mod integration_tests {
 
     /// CF-IT-1: `tpu_count_file` with no metric flags must return all four
     /// standard metrics (`lines`, `words`, `chars`, `bytes`) at the top level
-    /// of the `x-tpu-mcp-result` object.
+    /// of the `x-tpu-mcp-result` object, plus the always-on stats fields
+    /// (`encoding`, `bom`, `line_ending`).
     ///
     /// Regression for: when all flags defaulted to `false`, `standard_metric_names`
     /// was empty so every metric emitted by `count::run` fell through the routing
@@ -4119,6 +4122,14 @@ mod integration_tests {
             );
         }
         assert_eq!(result["lines"].as_u64().unwrap(), 2, "lines count mismatch");
+
+        // Stats are always present regardless of the stats flag.
+        for stats_key in ["encoding", "bom", "line_ending"] {
+            assert!(
+                result.get(stats_key).is_some(),
+                "stats field '{stats_key}' must always be present; got: {result:?}"
+            );
+        }
 
         drop(dir);
     }
@@ -4177,6 +4188,44 @@ mod integration_tests {
             1,
             "pattern matching 'two' with label 'lines' must be in patterns sub-object; got: {result:?}"
         );
+
+        drop(dir);
+    }
+
+    /// CF-IT-4: the `stats` argument is a no-op — `encoding`, `bom`, and
+    /// `line_ending` must be present whether `stats` is true, false, or absent.
+    #[test]
+    fn cf_it_4_count_file_stats_always_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_stats.txt");
+        fs::write(&f, "hello\n").unwrap();
+
+        for stats_flag in [
+            serde_json::json!(true),
+            serde_json::json!(false),
+        ] {
+            let args = serde_json::json!({ "file": f.to_str().unwrap(), "stats": stats_flag });
+            let out = call("tpu_count_file", &args)
+                .unwrap_or_else(|e| panic!("tpu_count_file must succeed (stats={stats_flag}): {e}"));
+            let result = ndjson_result_line(&out);
+            for key in ["encoding", "bom", "line_ending"] {
+                assert!(
+                    result.get(key).is_some(),
+                    "'{key}' must be present when stats={stats_flag}; got: {result:?}"
+                );
+            }
+        }
+
+        // Also test with no stats arg at all.
+        let args = serde_json::json!({ "file": f.to_str().unwrap() });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed (no stats arg)");
+        let result = ndjson_result_line(&out);
+        for key in ["encoding", "bom", "line_ending"] {
+            assert!(
+                result.get(key).is_some(),
+                "'{key}' must be present with no stats arg; got: {result:?}"
+            );
+        }
 
         drop(dir);
     }
