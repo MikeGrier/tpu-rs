@@ -1836,6 +1836,22 @@ fn call_count_file(args: &Value) -> ToolResult {
     let pattern_label_set: std::collections::HashSet<String> =
         labels.iter().cloned().collect();
 
+    // Determine the expected standard metric names from the enabled flags.
+    // count::run always emits standard metrics *before* pattern metrics, so
+    // the first occurrence of each standard-metric name is authoritative for
+    // the top-level result object.  Any subsequent occurrence of the same name
+    // (i.e. a pattern label that collides with a standard metric) is routed
+    // to the "patterns" sub-object, preserving the real metric value.
+    let standard_metric_names: std::collections::HashSet<&str> = {
+        let mut s = std::collections::HashSet::new();
+        if lines  { s.insert("lines"); }
+        if words  { s.insert("words"); }
+        if chars  { s.insert("chars"); }
+        if bytes  { s.insert("bytes"); }
+        if stats  { s.insert("encoding"); s.insert("bom"); s.insert("line_ending"); }
+        s
+    };
+
     let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
     let writer = SharedBufWriter(buf.clone());
     let mut out = tpu::output::json_output_to(Box::new(writer));
@@ -1859,12 +1875,19 @@ fn call_count_file(args: &Value) -> ToolResult {
 
     // Fold each {"reason":"data","metric":M,...} line into a single result
     // object.  Standard metrics use a "count" field; encoding/bom/line_ending
-    // use a "value" field.  Pattern-label metrics are kept under "patterns"
-    // so they never collide with standard keys.
+    // use a "value" field.
+    //
+    // Routing rules:
+    //  - A metric in standard_metric_names whose name hasn't been placed yet →
+    //    top-level key (authoritative standard value).
+    //  - Any other metric (pattern label, or a second occurrence of a name that
+    //    matches a standard metric) → "patterns" sub-object.
     let mut result_obj = serde_json::json!({"reason": "x-tpu-mcp-result"});
     if !pattern_label_set.is_empty() {
         result_obj["patterns"] = serde_json::json!({});
     }
+    let mut standard_metrics_placed: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
     for line in ndjson.lines() {
         if line.is_empty() {
             continue;
@@ -1882,10 +1905,16 @@ fn call_count_file(args: &Value) -> ToolResult {
         } else {
             continue;
         };
-        if pattern_label_set.contains(&metric) {
-            result_obj["patterns"][&metric] = val;
-        } else {
+        // Route the metric to the top-level only when it is a known standard
+        // metric and hasn't been placed yet.  All other metrics (pattern
+        // labels, or a label that duplicates a standard metric name) go to
+        // the "patterns" sub-object.
+        if standard_metric_names.contains(metric.as_str())
+            && standard_metrics_placed.insert(metric.clone())
+        {
             result_obj[metric] = val;
+        } else if result_obj.get("patterns").is_some() {
+            result_obj["patterns"][&metric] = val;
         }
     }
 
