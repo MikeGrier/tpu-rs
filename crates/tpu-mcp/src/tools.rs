@@ -39,13 +39,17 @@ use serde_json::Value;
 
 /// The result of a tool call: structured NDJSON text and an error flag.
 ///
-/// Every tool response is a newline-delimited stream of JSON objects.
-/// The first line is always an `x-tpu-mcp-invocation` record that
-/// describes the effective call (tool name + sanitised arguments).
-/// For mutating and structured tools a `{"status":"success",...}` or
-/// `{"status":"error","message":"..."}` trailer follows the body.
-/// Read tools use mixed mode: the header is JSON, the body is the raw
-/// file content, and no trailer is emitted on success.
+/// Tool responses use a mixed format.  The first line is always a JSON
+/// `x-tpu-mcp-invocation` record describing the effective call (tool name
+/// + sanitised arguments).  What follows depends on the tool type:
+///
+/// - **Mutating / structured tools** — a JSON body (zero or more
+///   `{"reason":...}` data lines) then a `{"status":"success",...}` or
+///   `{"status":"error","message":"..."}` trailer.
+/// - **Read tools** — raw file content (not JSON); no trailer on success.
+///
+/// Not all output is therefore valid NDJSON; callers must be aware of the
+/// mixed-mode contract and not attempt to parse every line as JSON.
 ///
 /// `is_error` mirrors `CallToolResult.isError` so MCP clients can detect
 /// failures without parsing the NDJSON trailer.
@@ -1828,11 +1832,10 @@ fn call_count_file(args: &Value) -> ToolResult {
             labels.push(label.to_owned());
         }
     }
-    // Track which metric names come from user-supplied pattern labels so the
-    // fold step can route them to a "patterns" sub-object instead of placing
-    // them directly on result_obj.  This prevents user-controlled labels from
-    // silently clobbering standard metric keys ("lines", "bytes", …) or the
-    // top-level "reason" key.
+    // Collect all user-supplied pattern labels into a set.  This is used
+    // only to decide whether to initialise a "patterns" sub-object on
+    // result_obj (see below); the actual per-metric routing is driven by
+    // standard_metric_names and standard_metrics_placed, not by this set.
     let pattern_label_set: std::collections::HashSet<String> =
         labels.iter().cloned().collect();
 
@@ -1842,12 +1845,19 @@ fn call_count_file(args: &Value) -> ToolResult {
     // the top-level result object.  Any subsequent occurrence of the same name
     // (i.e. a pattern label that collides with a standard metric) is routed
     // to the "patterns" sub-object, preserving the real metric value.
+    // Mirror count::run's "emit all four when none are explicitly requested"
+    // rule so the fold step knows which metric names to expect at the top level.
+    let any_standard = lines || words || chars || bytes;
+    let emit_lines = lines || !any_standard;
+    let emit_words = words || !any_standard;
+    let emit_chars = chars || !any_standard;
+    let emit_bytes = bytes || !any_standard;
     let standard_metric_names: std::collections::HashSet<&str> = {
         let mut s = std::collections::HashSet::new();
-        if lines  { s.insert("lines"); }
-        if words  { s.insert("words"); }
-        if chars  { s.insert("chars"); }
-        if bytes  { s.insert("bytes"); }
+        if emit_lines { s.insert("lines"); }
+        if emit_words { s.insert("words"); }
+        if emit_chars { s.insert("chars"); }
+        if emit_bytes { s.insert("bytes"); }
         if stats  { s.insert("encoding"); s.insert("bom"); s.insert("line_ending"); }
         s
     };
