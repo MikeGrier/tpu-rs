@@ -310,5 +310,6 @@ MCP `content[0].text` field:
 | Body (mutating tools — `count:true`) | `{"status":"success","count":N}` (replace only; no file written) |
 | Body (mutating tools — `append diff:true`) | Diff lines when changed, then `{"status":"success","file":"...","changed":true\|false}` |
 | Body (structured tools) | `{"reason":"x-tpu-mcp-result",...}` then `{"status":"success"}` |
-| Body (read/find tools) | Raw file content or matching lines (no JSON trailer on success) |
+| Body (read tools) | Raw file content (no JSON trailer on success) |
+| Body (`tpu_find`) | Matching lines as plain text, then `{"status":"success","warnings":[...]}` trailer |
 | On error | `{"status":"error","message":"..."}` as the final line; `isError: true` in the MCP wrapper |

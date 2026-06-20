@@ -121,7 +121,8 @@ Every tool response is **NDJSON** (one JSON object per line):
 - **Structured tools** (count_file, stat_file, copy_file, render_file,
   setup+target, doctor) — result line
   `{"reason":"x-tpu-mcp-result",...}` followed by `{"status":"success"}`.
-- **Read / find tools** — header then raw file content (no JSON trailer on success).
+- **Read tools** (read_file, read_head, read_tail, read_file_binary, read_file_escaped) — header then raw content; no JSON trailer on success.
+- **Find tool** (find) — header, then matching lines as plain text, then `{"status":"success","warnings":[...]}` trailer.
 - **Errors** — `{"status":"error","message":"..."}` as the final line;
   `isError: true` in the MCP wrapper.
 
