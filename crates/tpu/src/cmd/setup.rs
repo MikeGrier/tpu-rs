@@ -106,7 +106,10 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 
 ### Tool output format
 
-Every tool response is **NDJSON** (one JSON object per line):
+Every tool response uses a **mixed format**: a JSON invocation header,
+a content-type-dependent body, and (for most tools) a JSON status trailer.
+Not every line is JSON — read tools and `find` return raw content
+between the header and trailer.
 
 - **Line 1** — invocation header:
   `{"reason":"x-tpu-mcp-invocation","tool":"tpu_NAME","args":{...}}`

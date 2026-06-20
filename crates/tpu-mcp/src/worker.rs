@@ -233,9 +233,9 @@ impl IoWorkerHandle {
         args: &Value,
         config: &ServerConfig,
         progress: &mut dyn FnMut(&str),
-    ) -> Result<Option<crate::tools::ToolResult>, Box<dyn std::error::Error>> {
+    ) -> Option<crate::tools::ToolResult> {
         if !self.enabled {
-            return Ok(None);
+            return None;
         }
 
         // attempt counter is 1-based for human-readable progress messages.
@@ -272,7 +272,7 @@ impl IoWorkerHandle {
                     progress(&format!(
                         "io worker unavailable after {max_attempts} attempts; running '{name}' in-process"
                     ));
-                    return Ok(None);
+                    return None;
                 }
                 let delay_ms = BACKOFFS_MS[(attempt - 1) as usize];
                 std::thread::sleep(Duration::from_millis(delay_ms));
@@ -296,7 +296,7 @@ impl IoWorkerHandle {
                             "io worker succeeded on attempt {attempt}/{max_attempts} for '{name}'"
                         ));
                     }
-                    return Ok(Some(tr));
+                    return Some(tr);
                 }
                 Err(e) => {
                     debug_assert!(e.is_worker_dead());
@@ -315,7 +315,7 @@ impl IoWorkerHandle {
                         progress(&format!(
                             "io worker died ({reason}) on attempt {attempt}/{max_attempts} for '{name}'; running this call in-process"
                         ));
-                        return Ok(None);
+                        return None;
                     }
                     let delay_ms = BACKOFFS_MS[(attempt - 1) as usize];
                     progress(&format!(
