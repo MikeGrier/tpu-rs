@@ -215,13 +215,18 @@ impl IoWorkerHandle {
     /// turbulence in their chat UI instead of having to look at stderr.
     ///
     /// Returns:
-    /// - `Ok(Some(text))` — the worker returned a success result (possibly
-    ///   after one or more transparent retries).
-    /// - `Err(text)` — the worker ran the tool and it returned an error
-    ///   (propagate verbatim to the MCP client as the tool's error result).
+    /// - `Ok(Some(tr))` — the worker executed the tool and returned a
+    ///   [`ToolResult`].  The result may represent either a successful
+    ///   outcome (`tr.is_error == false`) or a tool-level failure
+    ///   (`tr.is_error == true`); both are propagated verbatim to the MCP
+    ///   client.  Transparent retries may have occurred.
     /// - `Ok(None)` — every retry was exhausted (or the worker subsystem is
     ///   disabled); the caller should run `tools::call` in-process and use
     ///   that result instead.
+    /// - `Err(e)` — a protocol-level or I/O failure occurred that prevented
+    ///   the worker from completing the call at all (e.g. the process died
+    ///   and could not be revived).  The caller should fall back to
+    ///   in-process execution or propagate the error.
     pub fn try_call(
         &self,
         name: &str,
