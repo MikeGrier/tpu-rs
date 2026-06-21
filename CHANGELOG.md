@@ -1,5 +1,32 @@
 # Changelog
 
+## [0.4.0](https://github.com/MikeGrier/tpu-rs/compare/v0.3.1...v0.4.0) (2026-06-21)
+
+
+### Features
+
+* **doctor:** detect U+FFFD replacement-character residue ([e5f20c8](https://github.com/MikeGrier/tpu-rs/commit/e5f20c8ade5d03982e61b5c927dc67b06f4a47d0))
+* **tpu-mcp:** switch tool output to NDJSON ([50b496c](https://github.com/MikeGrier/tpu-rs/commit/50b496c653cb7a1b13b1456202c0aa2a3f80604e))
+
+
+### Bug Fixes
+
+* address Copilot PR review comments ([f5f5d61](https://github.com/MikeGrier/tpu-rs/commit/f5f5d611fb90ed3dc8fcf8069eb6c893ffb4e057))
+* collapse multi-line string literal to explicit \\n escape ([e870b9f](https://github.com/MikeGrier/tpu-rs/commit/e870b9f3afb34e70f68687731a64fad8e22a205f))
+* **count:** default-flag fold mirrors count::run all-four fallback ([6a76151](https://github.com/MikeGrier/tpu-rs/commit/6a76151777a059d0fdde7f5fc0ea54bf0829fe45))
+* **count:** force stats=true and fix patterns schema description ([02b4bce](https://github.com/MikeGrier/tpu-rs/commit/02b4bceaadfb3d49f0cddb78ba01891c43ffa981))
+* **extension:** collapse configuration array to single object so gettingStarted link renders ([5db2033](https://github.com/MikeGrier/tpu-rs/commit/5db2033e8b235b0f9fc16732b1b666e5c84ded29))
+* fast-path FFFD scan; use Unicode escapes in test ([1052fb4](https://github.com/MikeGrier/tpu-rs/commit/1052fb43d6e7c00659dff93fb2dae7973db73871))
+* tpu replace CLI supports --literal-replacement; clarify escaping note ([2342f71](https://github.com/MikeGrier/tpu-rs/commit/2342f71228764b74d1a0a554e766cbbfd91d4e23))
+* **tpu-mcp:** fix label alignment and pattern metric isolation in call_count_file ([971db63](https://github.com/MikeGrier/tpu-rs/commit/971db6328e3e84dcce1859fb6a9c595a2d174209))
+* **tpu-mcp:** guarantee NDJSON validity after diff output; clarify preview-mode trailers in docs ([9880a6a](https://github.com/MikeGrier/tpu-rs/commit/9880a6aaa8197287f0de86cda2e6fe89f9a87b88))
+* **tpu-mcp:** make tpu_count_file emit x-tpu-mcp-result structured JSON ([9da8241](https://github.com/MikeGrier/tpu-rs/commit/9da824128d514324f5dcd57968edddfacb6b34d5))
+* **tpu-mcp:** prevent standard-metric / pattern-label collisions in call_count_file ([140f7f9](https://github.com/MikeGrier/tpu-rs/commit/140f7f9840827f120a720ac1da494aa7fe53b148))
+* **tpu-mcp:** return Ok(ToolResult) for unknown tools; update call() doc ([4c02b7b](https://github.com/MikeGrier/tpu-rs/commit/4c02b7b578c480cf2dff12cbc5fe8d1301fa79ce))
+* **tpu-mcp:** skip blank line in dry_run with no diff; split read vs find in output docs ([6423125](https://github.com/MikeGrier/tpu-rs/commit/6423125a9b731fb3f41965b55949db3a0e230146))
+* use .as_str() for context field in json! calls ([54acc1e](https://github.com/MikeGrier/tpu-rs/commit/54acc1e968820168dc71d632a933490d35ff4fcf))
+* **worker:** remove redundant type cast on Ok(None) return ([9e211ce](https://github.com/MikeGrier/tpu-rs/commit/9e211ce275e3e40dc6e8b31806bd0791eed9fa91))
+
 ## [0.3.1](https://github.com/MikeGrier/tpu-rs/compare/v0.3.0...v0.3.1) (2026-06-12)
 
 
