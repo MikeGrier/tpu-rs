@@ -80,14 +80,14 @@ jobs:
         run: cargo test --workspace --locked --no-fail-fast
 
   msrv:
-    name: MSRV check (1.93)
+    name: MSRV check (1.95)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       # Pin to the exact MSRV declared in [workspace.package].rust-version
       # so a stray use of a newer-stable feature fails CI rather than
       # silently raising the floor for downstream consumers.
-      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: dtolnay/rust-toolchain@1.95.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo check (MSRV)
         run: cargo check --workspace --all-targets --locked
