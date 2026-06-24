@@ -1398,11 +1398,16 @@ pub fn call(
 // -- individual tool implementations ------------------------------------------
 
 /// Extract the optional per-call `git_root` argument as a path.
+///
+/// Like every other path-typed argument, `git_root` is run through
+/// [`normalize_file_path`] so clients may pass it as a `file://` URI (with
+/// percent-encoding) — common in VS Code integrations — and have it resolve to
+/// the same on-disk path that plain filesystem paths do.
 fn git_root_arg(args: &Value) -> Option<std::path::PathBuf> {
     args.get("git_root")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(std::path::PathBuf::from)
+        .map(|s| std::path::PathBuf::from(normalize_file_path(s)))
 }
 
 thread_local! {
@@ -3390,6 +3395,35 @@ mod tests {
     #[test]
     fn uri_no_scheme_unchanged() {
         assert_eq!(np("/absolute/unix/path.txt"), "/absolute/unix/path.txt");
+    }
+
+    // -- git_root argument normalization --
+
+    #[test]
+    fn git_root_arg_accepts_file_uri() {
+        // VS Code integrations often pass `git_root` as a `file://` URI with
+        // percent-encoding; it must resolve to the same path as a plain
+        // filesystem path (regression for PR #41 review r3470390782).
+        let args = serde_json::json!({ "git_root": "file:///z%3A/src4/repo" });
+        assert_eq!(
+            git_root_arg(&args),
+            Some(std::path::PathBuf::from("z:/src4/repo"))
+        );
+    }
+
+    #[test]
+    fn git_root_arg_accepts_plain_path() {
+        let args = serde_json::json!({ "git_root": "/home/user/repo" });
+        assert_eq!(
+            git_root_arg(&args),
+            Some(std::path::PathBuf::from("/home/user/repo"))
+        );
+    }
+
+    #[test]
+    fn git_root_arg_absent_or_empty_is_none() {
+        assert_eq!(git_root_arg(&serde_json::json!({})), None);
+        assert_eq!(git_root_arg(&serde_json::json!({ "git_root": "" })), None);
     }
 
     // -- percent-decoding --
