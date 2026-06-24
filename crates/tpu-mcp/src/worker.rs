@@ -139,10 +139,18 @@ impl IoWorker {
             )));
         }
         if let Some(text) = resp.get("ok").and_then(|v| v.as_str()) {
-            let is_error = resp.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-            Ok(crate::tools::ToolResult { text: text.to_string(), is_error })
+            let is_error = resp
+                .get("is_error")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Ok(crate::tools::ToolResult {
+                text: text.to_string(),
+                is_error,
+            })
         } else if let Some(err) = resp.get("err").and_then(|v| v.as_str()) {
-            Err(WorkerCallError::Protocol(format!("worker tool error: {err}")))
+            Err(WorkerCallError::Protocol(format!(
+                "worker tool error: {err}"
+            )))
         } else {
             Err(WorkerCallError::Protocol(
                 "response had neither ok nor err".into(),
@@ -307,9 +315,7 @@ impl IoWorkerHandle {
                         *guard = None;
                     }
                     let reason = match &e {
-                        WorkerCallError::PipeBroken(m) | WorkerCallError::Protocol(m) => {
-                            m.as_str()
-                        }
+                        WorkerCallError::PipeBroken(m) | WorkerCallError::Protocol(m) => m.as_str(),
                     };
                     if attempt >= max_attempts {
                         progress(&format!(
@@ -389,7 +395,9 @@ pub fn run_worker() -> ! {
 
 fn write_response(out: &mut impl Write, id: u64, result: Result<crate::tools::ToolResult, String>) {
     let resp = match result {
-        Ok(crate::tools::ToolResult { text, is_error }) => serde_json::json!({ "id": id, "ok": text, "is_error": is_error }),
+        Ok(crate::tools::ToolResult { text, is_error }) => {
+            serde_json::json!({ "id": id, "ok": text, "is_error": is_error })
+        }
         Err(err) => serde_json::json!({ "id": id, "err": err }),
     };
     if let Ok(mut s) = serde_json::to_string(&resp) {

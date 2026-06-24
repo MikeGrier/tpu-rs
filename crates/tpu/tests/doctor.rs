@@ -475,3 +475,104 @@ fn file_with_no_fffd_stays_clean() {
 
     assert_eq!(report.total_issues(), 0, "clean file must not be flagged");
 }
+
+// ── Scenario 5: UTF-8 preference guard (encoding-misdetection incident) ─────
+
+/// Build a large, *valid UTF-8* file that is dense with the exact characters
+/// implicated in the corruption incident: box-drawing (`─` U+2500, `│` U+2502,
+/// `┌` U+250C), em-dash (`—` U+2014), and right-arrow (`→` U+2192).  On large
+/// files like this, harrier's statistical sniffer historically tipped into
+/// Windows-1252, decoding every valid 3-byte sequence as three phantom CP1252
+/// chars and manufacturing thousands of false mojibake matches.
+fn box_drawing_heavy_utf8(lines: usize) -> String {
+    let mut s = String::new();
+    for i in 0..lines {
+        // A doc-comment-style rule line, exactly the shape of the source
+        // that triggered the incident.
+        s.push_str(&format!(
+            "//! ┌────────── rule {i} ──────────┐ value → result │ note — end\n"
+        ));
+    }
+    s
+}
+
+/// A valid-UTF-8 file packed with box-drawing / em-dash / arrow characters
+/// must be reported **clean** and as **UTF-8** — never misclassified as a
+/// legacy single-byte code page that would manufacture phantom mojibake.
+#[test]
+fn valid_utf8_box_drawing_file_is_clean_not_misdetected() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let content = box_drawing_heavy_utf8(2000);
+    // Sanity: the fixture really is valid UTF-8.
+    assert!(std::str::from_utf8(content.as_bytes()).is_ok());
+    let path = dir.path().join("lower.rs");
+    fs::write(&path, content.as_bytes()).unwrap();
+
+    let path_str = path.to_string_lossy().to_string();
+    let mut buf: Vec<u8> = Vec::new();
+    let report = tpu::cmd::doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Human,
+            fix: DoctorFix::None,
+            quiet: true,
+            guess: false,
+        },
+        &mut buf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+
+    assert_eq!(
+        report.total_issues(),
+        0,
+        "valid UTF-8 box-drawing file must not be flagged (got {} issues)",
+        report.total_issues()
+    );
+}
+
+/// `--fix=peel` must be a no-op on a valid-UTF-8 box-drawing file: it must not
+/// rewrite the file, and the bytes on disk must be byte-for-byte identical
+/// afterwards (no lossy re-encode, no `U+FFFD` substitution).
+#[test]
+fn fix_peel_does_not_corrupt_valid_utf8_box_drawing_file() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let dir = TempDir::new().unwrap();
+    let content = box_drawing_heavy_utf8(2000);
+    let path = dir.path().join("lower.rs");
+    fs::write(&path, content.as_bytes()).unwrap();
+    let original = fs::read(&path).unwrap();
+
+    let path_str = path.to_string_lossy().to_string();
+    let mut buf: Vec<u8> = Vec::new();
+    let report = tpu::cmd::doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Human,
+            fix: DoctorFix::Peel,
+            quiet: true,
+            guess: false,
+        },
+        &mut buf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+
+    assert_eq!(report.total_repaired, 0, "nothing should be repaired");
+    let after = fs::read(&path).unwrap();
+    assert_eq!(
+        after, original,
+        "valid UTF-8 file must be byte-for-byte unchanged after --fix=peel"
+    );
+    // Belt-and-suspenders: no replacement chars were introduced.
+    let after_text = String::from_utf8(after).expect("file remains valid UTF-8");
+    assert!(
+        !after_text.contains('\u{FFFD}'),
+        "peel must never introduce U+FFFD into a clean file"
+    );
+}

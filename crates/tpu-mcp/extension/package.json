@@ -116,6 +116,11 @@
                     ],
                     "default": "each-file",
                     "markdownDescription": "How much walk-error detail tree-walking tools include in their results. `each-file` (default) includes a `log` array of warning strings in `tpu_copy_file` results and individual warning lines in `tpu_find` output — each entry represents an inaccessible path or walk error. `summary` suppresses those per-entry details and collapses all walk warnings into a single count line. Forwarded to the server via the `TPU_PROGRESS_DETAIL` environment variable."
+                },
+                "tpu-mcp.normalizeLineEndings": {
+                    "type": "boolean",
+                    "default": false,
+                    "markdownDescription": "When enabled, mutating tools (`tpu_write_file`, `tpu_replace_in_file`, `tpu_edit_file`, `tpu_append_file`) given a `git_root` argument denormalise line endings to git's expected convention for the target path (per `.gitattributes` / `core.autocrlf` / `core.eol`) unless an explicit `line_ending` is supplied. **Off by default** so writes never silently rewrite line endings without opt-in. Detection on reads and `tpu_doctor` reporting/repair are always available via the per-call `git_root` argument and are not affected by this setting. Forwarded to the server via the `TPU_EOL_NORMALIZE` environment variable."
                 }
             }
         }

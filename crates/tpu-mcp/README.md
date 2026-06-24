@@ -284,6 +284,35 @@ represent non-printable characters.
 
 ---
 
+## Git-aware line endings (opt-in)
+
+`tpu-mcp` can detect when a file's on-disk line endings differ from what git
+would materialise in the working tree for that path (per `.gitattributes`
+`text`/`eol` attributes and `core.autocrlf` / `core.eol`). This is a distinct
+condition from mojibake — the bytes are valid, but the endings produce noisy
+diffs and "whole file changed" churn.
+
+Detection is **opt-in per call** via a `git_root` argument (an absolute path to
+the repository root; there is no upward auto-discovery):
+
+- **Read** — pass `git_root` to `tpu_read_file`, `tpu_read_head`, or
+  `tpu_read_tail`. When the file's endings differ from git's expectation, the
+  response is prefixed with a single `note:` line; the unchanged content
+  follows.
+- **Report / repair** — call `tpu_doctor` with `git_root` to list mismatched
+  files (each flagged with an `eol_mismatch` object). Pass `fix: "eol"` to
+  normalise line endings only, or `fix: "all"` to also peel mojibake. `eol` and
+  `all` require `git_root`; the rewrite is atomic with a `<file>.bak` backup,
+  and UTF-16 files are skipped.
+- **Normalise on write (off by default)** — when the server is started with the
+  `tpu-mcp.normalizeLineEndings` setting enabled (forwarded as the
+  `TPU_EOL_NORMALIZE` environment variable; the CLI flag is `--eol-normalize`),
+  mutating tools given a `git_root` denormalise to git's expected convention
+  unless an explicit `line_ending` is supplied. This is **off by default** so
+  writes never silently rewrite endings without opt-in.
+
+---
+
 ## Protocol
 
 `tpu-mcp` implements [MCP 2024-11-05](https://spec.modelcontextprotocol.io/) over

@@ -19,7 +19,24 @@ use shell::Shell;
 use tpu::IoMode;
 // Re-export library functions so that cmd modules (which are compiled in both
 // the lib and bin crate contexts) can use `crate::open_as_branch` etc.
+pub use tpu::git;
 pub use tpu::{open_as_branch, read_raw_bytes, recover_stranded_backup, retry_io};
+
+/// Resolve the line-ending override for a mutating write
+/// (`write`/`replace`/`edit`/`append`).
+///
+/// Thin wrapper over [`tpu::git::resolve_write_override`] (shared with
+/// `tpu-mcp`): an explicit `--line-ending` always wins; otherwise, when
+/// git-EOL normalisation is enabled (`--eol-normalize` + `--git-root`), the
+/// override is git's expected convention for `file`.
+fn resolve_write_line_ending(
+    explicit: Option<&str>,
+    file: &std::path::Path,
+    git_root: Option<&std::path::Path>,
+    eol_normalize: bool,
+) -> Result<Option<harrier::encoding::LineEnding>, Box<dyn std::error::Error>> {
+    git::resolve_write_override(explicit, file, git_root, eol_normalize)
+}
 
 /// Text Processing Utility — encoding-aware file tools for command-line and
 /// agent (Copilot) use.
@@ -80,6 +97,32 @@ struct Cli {
         value_parser = ["warn", "fail"]
     )]
     on_error: String,
+
+    /// Opt in to git-aware line-ending checks against the repository rooted
+    /// at this directory (no upward discovery is performed).
+    ///
+    /// When set, read-side commands (`read`/`readex`/`head`/`tail`) emit a
+    /// `note: <path>: line endings (...) differ from git's expected ...`
+    /// advisory whenever a file's on-disk line endings disagree with what
+    /// git would materialise for that path (per `.gitattributes` and
+    /// `core.autocrlf` / `core.eol`).  `tpu doctor --git-root <DIR>` reports
+    /// and (with `--fix`) repairs such mismatches.  This is entirely opt-in:
+    /// without this flag, no git state is consulted.
+    #[arg(long, global = true, value_name = "DIR")]
+    git_root: Option<PathBuf>,
+
+    /// Normalise line endings to git's expected convention on mutating
+    /// writes (`write`/`replace`/`edit`/`append`).
+    ///
+    /// Off by default.  Only takes effect when `--git-root <DIR>` is also
+    /// supplied and the caller did not pass an explicit `--line-ending`.
+    /// When enabled, the target file's line endings are denormalised to
+    /// whatever git would materialise for that path (per `.gitattributes`
+    /// and `core.autocrlf` / `core.eol`).  Can also be enabled via the
+    /// `TPU_EOL_NORMALIZE` environment variable (forwarded by the VS Code
+    /// extension's `tpu.normalizeLineEndings` setting).
+    #[arg(long, global = true)]
+    eol_normalize: bool,
 
     #[command(subcommand)]
     command: Commands,
@@ -813,11 +856,19 @@ enum Commands {
 
         /// Repair mode.
         ///
-        ///   peel — for each flagged file, apply
+        ///   peel — for each mojibake-flagged file, apply
         ///          `mojibake::looks_like_one_layer_peel` and rewrite
         ///          the file in place when the result is strictly
-        ///          better.  Without this flag no file is modified.
-        #[arg(long, value_name = "MODE", value_parser = ["peel"])]
+        ///          better.
+        ///
+        ///   eol  — normalise the line endings of any git-EOL-mismatched
+        ///          file to git's expected convention.  Requires
+        ///          `--git-root <DIR>`.
+        ///
+        ///   all  — apply both `peel` and `eol`.
+        ///
+        /// Without this flag no file is modified.
+        #[arg(long, value_name = "MODE", value_parser = ["peel", "eol", "all"])]
         fix: Option<String>,
 
         /// Suppress per-file lines in human mode; the summary is still
@@ -981,6 +1032,19 @@ fn run(
     let mojibake_advisory_enabled = !cli.no_mojibake_warning
         && std::env::var_os("TPU_NO_MOJIBAKE_WARNING").is_none()
         && !json_mode;
+    // Opt-in git line-ending advisory root.  Silenced in JSON mode (stderr is
+    // quiet there and the note would otherwise be lost).  `None` disables all
+    // git-aware read-side checks.
+    let eol_advisory_root: Option<PathBuf> = if json_mode {
+        None
+    } else {
+        cli.git_root.clone()
+    };
+    // Write-time line-ending normalisation (default off).  Enabled by the
+    // `--eol-normalize` flag or the `TPU_EOL_NORMALIZE` environment variable
+    // (the VS Code extension forwards its `tpu.normalizeLineEndings` setting
+    // this way).  Only takes effect when `--git-root` is also supplied.
+    let eol_normalize = cli.eol_normalize || std::env::var_os("TPU_EOL_NORMALIZE").is_some();
     let on_error_mode = match cli.on_error.as_str() {
         "fail" => cmd::copy::OnError::Fail,
         _ => cmd::copy::OnError::Warn,
@@ -1069,6 +1133,9 @@ fn run(
                     IoMode::Mmap,
                     notes,
                 )?;
+                if let Some(ref root) = eol_advisory_root {
+                    let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                }
                 if !notes_buf.is_empty() {
                     let _ = shell.err().write_all(&notes_buf);
                 }
@@ -1156,17 +1223,12 @@ fn run(
                     OutputEncoding::Preserve
                 };
                 let bom_policy = bom.unwrap_or_default();
-                let le_override =
-                    match line_ending.as_deref() {
-                        None => None,
-                        Some("lf") => Some(harrier::encoding::LineEnding::Lf),
-                        Some("crlf") => Some(harrier::encoding::LineEnding::CrLf),
-                        Some("cr") => Some(harrier::encoding::LineEnding::Cr),
-                        Some(other) => return Err(format!(
-                            "--line-ending: unrecognised value {other:?}; expected lf, crlf, or cr"
-                        )
-                        .into()),
-                    };
+                let le_override = resolve_write_line_ending(
+                    line_ending.as_deref(),
+                    &file,
+                    cli.git_root.as_deref(),
+                    eol_normalize,
+                )?;
                 cmd::write::run(
                     &file,
                     &text,
@@ -1219,18 +1281,12 @@ fn run(
             } else {
                 None
             };
-            let le_override = match line_ending.as_deref() {
-                None => None,
-                Some("lf") => Some(harrier::encoding::LineEnding::Lf),
-                Some("crlf") => Some(harrier::encoding::LineEnding::CrLf),
-                Some("cr") => Some(harrier::encoding::LineEnding::Cr),
-                Some(other) => {
-                    return Err(format!(
-                        "--line-ending: unrecognised value {other:?}; expected lf, crlf, or cr"
-                    )
-                    .into());
-                }
-            };
+            let le_override = resolve_write_line_ending(
+                line_ending.as_deref(),
+                &file,
+                cli.git_root.as_deref(),
+                eol_normalize,
+            )?;
             // Decode backslash escapes in the replacement string unless the
             // caller asked for raw/literal handling.  This is the default
             // because users typically write `\n` expecting a real newline.
@@ -1326,18 +1382,12 @@ fn run(
             line_ending,
             allow_mojibake,
         } => {
-            let line_ending_override = match line_ending.as_deref() {
-                None => None,
-                Some("lf") => Some(harrier::encoding::LineEnding::Lf),
-                Some("crlf") => Some(harrier::encoding::LineEnding::CrLf),
-                Some("cr") => Some(harrier::encoding::LineEnding::Cr),
-                Some(other) => {
-                    return Err(format!(
-                        "--line-ending: unrecognised value {other:?}; expected lf, crlf, or cr"
-                    )
-                    .into());
-                }
-            };
+            let line_ending_override = resolve_write_line_ending(
+                line_ending.as_deref(),
+                &file,
+                cli.git_root.as_deref(),
+                eol_normalize,
+            )?;
             cmd::validate::run_all(&validate, &file, binary, IoMode::Mmap)?;
 
             // Parse all ops before any I/O so bad-syntax errors are caught
@@ -1461,6 +1511,9 @@ fn run(
                         None
                     };
                     cmd::tail::run(&file, mode, &mut buf, IoMode::Mmap, notes)?;
+                    if let Some(ref root) = eol_advisory_root {
+                        let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                    }
                     if !notes_buf.is_empty() {
                         let _ = shell.err().write_all(&notes_buf);
                     }
@@ -1503,6 +1556,9 @@ fn run(
                         None
                     };
                     cmd::head::run(&file, mode, &mut buf, IoMode::Mmap, notes)?;
+                    if let Some(ref root) = eol_advisory_root {
+                        let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                    }
                     if !notes_buf.is_empty() {
                         let _ = shell.err().write_all(&notes_buf);
                     }
@@ -1580,6 +1636,9 @@ fn run(
                     IoMode::Mmap,
                     notes,
                 )?;
+                if let Some(ref root) = eol_advisory_root {
+                    let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                }
                 if !notes_buf.is_empty() {
                     let _ = shell.err().write_all(&notes_buf);
                 }
@@ -1654,18 +1713,12 @@ fn run(
             line_ending,
             allow_mojibake,
         } => {
-            let le_override = match line_ending.as_deref() {
-                None => None,
-                Some("lf") => Some(harrier::encoding::LineEnding::Lf),
-                Some("crlf") => Some(harrier::encoding::LineEnding::CrLf),
-                Some("cr") => Some(harrier::encoding::LineEnding::Cr),
-                Some(other) => {
-                    return Err(format!(
-                        "--line-ending: unrecognised value {other:?}; expected lf, crlf, or cr"
-                    )
-                    .into());
-                }
-            };
+            let le_override = resolve_write_line_ending(
+                line_ending.as_deref(),
+                &file,
+                cli.git_root.as_deref(),
+                eol_normalize,
+            )?;
 
             // Collect the text to append: from --data or from stdin.
             let new_text: String = match data {
@@ -1858,12 +1911,25 @@ fn run(
                     cmd::doctor::DoctorFormat::Human
                 },
                 fix: match fix.as_deref() {
-                    Some("peel") => cmd::doctor::DoctorFix::Peel,
+                    Some("peel") | Some("all") => cmd::doctor::DoctorFix::Peel,
                     _ => cmd::doctor::DoctorFix::None,
                 },
                 quiet,
                 guess,
             };
+            let fix_eol = matches!(fix.as_deref(), Some("eol") | Some("all"));
+
+            // `--fix=eol`/`--fix=all` can only normalise line endings against a
+            // repository's expected convention, which requires `--git-root`.
+            // Without it the eol portion would silently do nothing, so reject
+            // the combination up front (mirrors the tpu-mcp `tpu_doctor` guard).
+            if fix_eol && cli.git_root.is_none() {
+                return Err(format!(
+                    "doctor: --fix={} normalises line endings and requires --git-root <DIR>",
+                    fix.as_deref().unwrap_or("eol")
+                )
+                .into());
+            }
 
             // Buffer the doctor output and route it through the standard
             // `Output` channel so JSON / human modes both work uniformly.
@@ -1876,6 +1942,8 @@ fn run(
                 IoMode::Mmap,
                 on_error_mode,
                 &mut walk_warnings,
+                cli.git_root.as_deref(),
+                fix_eol,
             );
             if !opts.quiet {
                 for w in &walk_warnings {

@@ -4,6 +4,7 @@ pub mod cmd;
 pub mod data_format;
 pub mod encoding;
 pub mod escape;
+pub mod git;
 pub mod message;
 pub mod mojibake;
 pub mod output;
@@ -11,7 +12,13 @@ pub mod rsp;
 pub mod shell;
 pub mod test_fixtures;
 
-use std::{error::Error, fs, io, path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{
+    error::Error,
+    fs, io,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use memmap2::MmapOptions;
 use redwing::Branch;
