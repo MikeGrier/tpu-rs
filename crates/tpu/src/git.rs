@@ -333,33 +333,43 @@ fn detect_with_digest(
         return None;
     }
 
-    let actual = dominant_line_ending(&stats)?;
+    // A mismatch exists only when the buffer contains a line ending git would
+    // *not* materialise, and `actual` names the dominant *non-conforming*
+    // ending rather than the overall dominant ending.  This keeps the report
+    // honest for mixed-ending files — a mostly-CRLF file with a few bare LFs
+    // is still flagged, and `actual` reports the offending `LF` instead of
+    // `CRLF` (which would equal `expected` and read as a contradiction).  It
+    // also means lone `CR`s are treated as non-conforming when git expects
+    // either `CRLF` or `LF`.
+    let actual = match expected {
+        // git wants CRLF: bare LFs and lone CRs are both wrong.
+        Mode::CrLf => dominant_of(&[
+            (LineEnding::Lf, stats.lone_lf as u64),
+            (LineEnding::Cr, stats.lone_cr as u64),
+        ]),
+        // git wants LF: CRLFs and lone CRs are both wrong.
+        Mode::Lf => dominant_of(&[
+            (LineEnding::CrLf, stats.crlf as u64),
+            (LineEnding::Cr, stats.lone_cr as u64),
+        ]),
+    }?;
 
-    let conflict = match expected {
-        // git wants CRLF but the file still contains bare LFs.
-        Mode::CrLf => stats.lone_lf > 0,
-        // git wants LF but the file contains CRLFs (or lone CRs).
-        Mode::Lf => stats.crlf > 0 || stats.lone_cr > 0,
-    };
-
-    conflict.then_some(EolMismatch {
+    Some(EolMismatch {
         expected: mode_to_line_ending(expected),
         actual,
     })
 }
 
-/// The dominant line ending present in a buffer, or `None` if it has none.
-fn dominant_line_ending(stats: &Stats) -> Option<LineEnding> {
-    if stats.crlf == 0 && stats.lone_lf == 0 && stats.lone_cr == 0 {
-        return None;
-    }
-    if stats.crlf >= stats.lone_lf && stats.crlf >= stats.lone_cr {
-        Some(LineEnding::CrLf)
-    } else if stats.lone_lf >= stats.lone_cr {
-        Some(LineEnding::Lf)
-    } else {
-        Some(LineEnding::Cr)
-    }
+/// The candidate line ending with the largest non-zero count, or `None` when
+/// every candidate count is zero.  Used to pick the dominant *non-conforming*
+/// ending so a reported `actual` is always meaningful.
+fn dominant_of(candidates: &[(LineEnding, u64)]) -> Option<LineEnding> {
+    candidates
+        .iter()
+        .copied()
+        .filter(|(_, n)| *n > 0)
+        .max_by_key(|(_, n)| *n)
+        .map(|(le, _)| le)
 }
 
 /// Translate a git [`Mode`] into the crate's [`LineEnding`] vocabulary.
@@ -535,11 +545,45 @@ mod tests {
 
     #[test]
     fn dominant_line_ending_prefers_majority() {
-        let stats = Stats::from_bytes(b"a\r\nb\r\nc\n");
-        assert_eq!(dominant_line_ending(&stats), Some(LineEnding::CrLf));
-        let stats = Stats::from_bytes(b"a\nb\nc\r\n");
-        assert_eq!(dominant_line_ending(&stats), Some(LineEnding::Lf));
-        let stats = Stats::from_bytes(b"abc");
-        assert_eq!(dominant_line_ending(&stats), None);
+        // Mixed file where git wants LF: the lone non-conforming ending is a
+        // single CRLF amid many LFs, so the mismatch must report `actual =
+        // CRLF` (the offender) and never `actual == expected`.
+        let dir = init_repo(Some("*.txt text eol=lf\n"), "");
+        let git = GitEol::open(dir.path()).unwrap().unwrap();
+        let bytes = b"a\nb\nc\nd\r\n";
+        let file = write_file(dir.path(), "a.txt", bytes);
+        let m = git.detect(&file, bytes).unwrap().expect("mismatch");
+        assert_eq!(m.expected, LineEnding::Lf);
+        assert_eq!(m.actual, LineEnding::CrLf);
+        assert_ne!(m.actual, m.expected);
+    }
+
+    #[test]
+    fn mostly_crlf_with_stray_lf_reports_lf_not_crlf() {
+        // git wants CRLF; the file is predominantly CRLF but has a stray bare
+        // LF.  The old code reported `actual = CRLF` (the dominant ending),
+        // which equals `expected` and reads as a contradiction.  We must
+        // report the offending `LF` instead.
+        let dir = init_repo(Some("*.txt text eol=crlf\n"), "");
+        let git = GitEol::open(dir.path()).unwrap().unwrap();
+        let bytes = b"a\r\nb\r\nc\r\nd\n";
+        let file = write_file(dir.path(), "a.txt", bytes);
+        let m = git.detect(&file, bytes).unwrap().expect("mismatch");
+        assert_eq!(m.expected, LineEnding::CrLf);
+        assert_eq!(m.actual, LineEnding::Lf);
+    }
+
+    #[test]
+    fn lone_cr_conflicts_when_crlf_expected() {
+        // git wants CRLF; a classic-Mac CR-only file must be flagged.  The
+        // previous logic only checked for bare LFs and silently accepted lone
+        // CRs.
+        let dir = init_repo(Some("*.txt text eol=crlf\n"), "");
+        let git = GitEol::open(dir.path()).unwrap().unwrap();
+        let bytes = b"a\rb\rc\r";
+        let file = write_file(dir.path(), "a.txt", bytes);
+        let m = git.detect(&file, bytes).unwrap().expect("mismatch");
+        assert_eq!(m.expected, LineEnding::CrLf);
+        assert_eq!(m.actual, LineEnding::Cr);
     }
 }
