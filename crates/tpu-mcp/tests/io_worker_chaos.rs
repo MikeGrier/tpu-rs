@@ -146,7 +146,9 @@ impl ChaosSession {
         let req = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let mut line = serde_json::to_string(&req).expect("encode request");
         line.push('\n');
-        self.stdin.write_all(line.as_bytes()).expect("write request");
+        self.stdin
+            .write_all(line.as_bytes())
+            .expect("write request");
         self.stdin.flush().expect("flush request");
 
         loop {
@@ -269,7 +271,11 @@ fn chaos_kill_between_writes_all_succeed() {
             .and_then(|c| c.get("text"))
             .and_then(|t| t.as_str())
             .unwrap_or_else(|| panic!("read {i} missing text: {read}"));
-        assert_eq!(strip_ndjson_header(text), content, "tpu_read_file content mismatch for file {i}");
+        assert_eq!(
+            strip_ndjson_header(text),
+            content,
+            "tpu_read_file content mismatch for file {i}"
+        );
 
         let on_disk = std::fs::read_to_string(&path).expect("read back from disk");
         assert_eq!(on_disk, content, "on-disk content mismatch for file {i}");
@@ -486,10 +492,7 @@ fn stranded_backup_is_auto_recovered_on_read() {
     std::fs::write(&bak, b"original content\n").expect("seed .bak");
     assert!(!target.exists(), "precondition: target must be missing");
 
-    let resp = s.assert_tool_success(
-        "tpu_read_file",
-        json!({"file": target.to_string_lossy()}),
-    );
+    let resp = s.assert_tool_success("tpu_read_file", json!({"file": target.to_string_lossy()}));
     let text = resp
         .pointer("/result/content/0/text")
         .and_then(|v| v.as_str())
@@ -498,8 +501,14 @@ fn stranded_backup_is_auto_recovered_on_read() {
         text.contains("original content"),
         "recovered read should yield original content; got: {text:?}",
     );
-    assert!(target.exists(), "post: target file should have been recreated");
-    assert!(!bak.exists(), "post: .bak should be consumed by the recovery");
+    assert!(
+        target.exists(),
+        "post: target file should have been recreated"
+    );
+    assert!(
+        !bak.exists(),
+        "post: .bak should be consumed by the recovery"
+    );
 }
 
 /// Same as above but the first touch is a mutating call (`tpu_append_file`).

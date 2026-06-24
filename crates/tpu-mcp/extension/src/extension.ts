@@ -80,18 +80,23 @@ function buildArgs(): string[] {
  * Forwards `tpu-mcp.errorMode` and `tpu-mcp.progressDetail` so the server's
  * tools default to the user's preferred walk-error policy and progress
  * verbosity without the agent needing to thread those arguments through every
- * call.
+ * call. Also forwards `tpu-mcp.normalizeLineEndings` (default off) which gates
+ * write-time line-ending normalisation.
  */
 function buildEnv(): Record<string, string> {
     const config = vscode.workspace.getConfiguration("tpu-mcp");
     const mode = (config.get<string>("errorMode", "continue") ?? "continue").trim();
     const detail = (config.get<string>("progressDetail", "each-file") ?? "each-file").trim();
+    const normalizeLineEndings = config.get<boolean>("normalizeLineEndings", false);
     const env: Record<string, string> = {};
     if (mode === "continue" || mode === "strict") {
         env["TPU_DEFAULT_ERROR_MODE"] = mode;
     }
     if (detail === "each-file" || detail === "summary") {
         env["TPU_PROGRESS_DETAIL"] = detail;
+    }
+    if (normalizeLineEndings) {
+        env["TPU_EOL_NORMALIZE"] = "1";
     }
     return env;
 }

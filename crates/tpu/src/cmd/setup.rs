@@ -169,6 +169,33 @@ The write-time guard in `tpu_write_file` / `tpu_append_file` /
 mojibake (pre-existing damage passes through). If you genuinely intend to
 write curated mojibake fixtures, pass `allow_mojibake: true`.
 
+### When line endings disagree with git (CRLF / LF)
+
+A separate, git-aware condition: a file's on-disk line endings can differ
+from what git would materialise in the working tree for that path (per
+`.gitattributes` `text`/`eol` attributes and `core.autocrlf` / `core.eol`).
+This is *not* mojibake — the bytes are valid — but it produces noisy diffs
+and "whole file changed" churn.
+
+Detection is **opt-in per call** via a `git_root` argument (an absolute path
+to the repository root; there is no upward auto-discovery):
+
+1. **Detect on read**: pass `git_root` to `tpu_read_file`, `tpu_read_head`,
+   or `tpu_read_tail`. When the file's endings differ from git's expectation
+   the response is prefixed with a single `note:` line and the unchanged
+   content follows.
+2. **Report / repair with doctor**: call `tpu_doctor` with `git_root` to
+   list mismatched files (each flagged with an `eol_mismatch` object). Pass
+   `fix: "eol"` to normalise line endings only, or `fix: "all"` to also peel
+   mojibake. `eol`/`all` require `git_root`; the rewrite is atomic with a
+   `<file>.bak` backup and UTF-16 files are skipped.
+3. **Normalise on write (off by default)**: when the server is started with
+   line-ending normalisation enabled (the `tpu.normalizeLineEndings` VS Code
+   setting, the `--eol-normalize` flag, or the `TPU_EOL_NORMALIZE` env var),
+   mutating tools given a `git_root` denormalise to git's expected
+   convention unless an explicit `line_ending` is supplied. This is **off by
+   default** so writes never silently rewrite endings without opt-in.
+
 ### File encoding
 
 When you must fall back to PowerShell, never round-trip non-ASCII files

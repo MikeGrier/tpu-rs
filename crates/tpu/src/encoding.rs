@@ -8,6 +8,13 @@
 
 use std::str::FromStr;
 
+/// Re-export so consumers can name the line-ending type as
+/// `tpu::encoding::LineEnding` (the canonical type used throughout `tpu`'s
+/// public API for `--line-ending` overrides and git-EOL normalisation).
+#[allow(unused_imports)]
+// Re-exported for tpu-mcp (library consumer); unused inside the tpu binary.
+pub use harrier::encoding::LineEnding;
+
 /// Whether a subcommand should re-encode output as UTF-8.
 ///
 /// The default is [`OutputEncoding::Preserve`]: the file's native encoding is

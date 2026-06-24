@@ -161,7 +161,12 @@ pub fn list() -> Value {
                  Note: if the decoded text appears to contain mojibake (the canonical \
                  Latin-1, punctuation, box-drawing, NBSP, or double-encoded fingerprints), \
                  the read still succeeds; run `tpu doctor` (or call this tool from a \
-                 CLI shell) to diagnose and optionally repair the file.",
+                 CLI shell) to diagnose and optionally repair the file. \
+                 Line-ending awareness: pass `git_root` to additionally detect when the \
+                 file's on-disk line endings differ from what git would materialise for \
+                 that path (per .gitattributes / core.autocrlf / core.eol); when they do, \
+                 the response is prefixed with a single `note:` line and the unchanged \
+                 content follows. Run `tpu_doctor` with `fix: \"eol\"` to normalise.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -180,6 +185,15 @@ pub fn list() -> Value {
                         "description":
                             "If true, prefix each output line with its 1-based line number \
                              (right-aligned, 6 digits, followed by two spaces)."
+                    },
+                    "git_root": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to a git repository root (no upward \
+                             discovery). When set, the response is prefixed with a `note:` \
+                             line if the file's on-disk line endings differ from git's \
+                             expected convention for that path (per .gitattributes / \
+                             core.autocrlf / core.eol). Opt-in; omit to skip all git checks."
                     }
                 },
                 "required": ["file"]
@@ -222,6 +236,18 @@ pub fn list() -> Value {
                         "description":
                             "Override the output line ending. Omit to preserve the file's \
                              existing convention. Cannot be used with binary content."
+                    },
+                    "git_root": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to a git repository root. When the \
+                             server has line-ending normalisation enabled \
+                             (tpu.normalizeLineEndings setting / --eol-normalize / \
+                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
+                             write denormalises to git's expected convention for this path \
+                             (per .gitattributes / core.autocrlf / core.eol). Off by \
+                             default — without the server setting this argument has no \
+                             effect on writes."
                     },
                     "diff": {
                         "type": "boolean",
@@ -330,6 +356,16 @@ pub fn list() -> Value {
                         "description":
                             "Override the output line ending for the replacement output. \
                              Omit to preserve the file's existing convention."
+                    },
+                    "git_root": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to a git repository root. When the \
+                             server has line-ending normalisation enabled \
+                             (tpu.normalizeLineEndings setting / --eol-normalize / \
+                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
+                             write denormalises to git's expected convention for this path. \
+                             Off by default."
                     },
                     "diff": {
                         "type": "boolean",
@@ -483,6 +519,16 @@ pub fn list() -> Value {
                         "description":
                             "Override the output line ending in text mode. Omit to preserve \
                              the file's existing convention. Conflicts with binary: true."
+                    },
+                    "git_root": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to a git repository root. When the \
+                             server has line-ending normalisation enabled \
+                             (tpu.normalizeLineEndings setting / --eol-normalize / \
+                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
+                             write denormalises to git's expected convention for this path. \
+                             Off by default."
                     },
                     "allow_mojibake": {
                         "type": "boolean",
@@ -665,6 +711,15 @@ pub fn list() -> Value {
                             "Prefix each output line with its 1-based line number followed \n\
                              by a tab. Output always uses LF line endings when enabled. \n\
                              Mutually exclusive with 'bytes' and 'binary'."
+                    },
+                    "git_root": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to a git repository root. When set (and \
+                             not in byte mode), the response is prefixed with a `note:` line \
+                             if the file's on-disk line endings differ from git's expected \
+                             convention for that path (per .gitattributes / core.autocrlf / \
+                             core.eol). Opt-in."
                     }
                 },
                 "required": ["file"]
@@ -715,6 +770,15 @@ pub fn list() -> Value {
                             "Prefix each output line with its absolute 1-based line number \n\
                              followed by a tab. Output always uses LF line endings when \n\
                              enabled. Mutually exclusive with 'bytes' and 'binary'."
+                    },
+                    "git_root": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to a git repository root. When set (and \
+                             not in byte mode), the response is prefixed with a `note:` line \
+                             if the file's on-disk line endings differ from git's expected \
+                             convention for that path (per .gitattributes / core.autocrlf / \
+                             core.eol). Opt-in."
                     }
                 },
                 "required": ["file"]
@@ -842,6 +906,16 @@ pub fn list() -> Value {
                         "description":
                             "Override the output line ending for the combined file. Omit to \
                              preserve the file's existing convention."
+                    },
+                    "git_root": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to a git repository root. When the \
+                             server has line-ending normalisation enabled \
+                             (tpu.normalizeLineEndings setting / --eol-normalize / \
+                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
+                             write denormalises to git's expected convention for this path. \
+                             Off by default."
                     },
                     "diff": {
                         "type": "boolean",
@@ -1213,6 +1287,12 @@ pub fn list() -> Value {
                  Files containing the literal sentinel `encoding-check: allow-mojibake` \
                  are treated as legitimate (test fixtures, regex sources, docs about \
                  mojibake) and reported as clean. \n\n\
+                 LINE ENDINGS: pass `git_root` to additionally detect files whose on-disk \
+                 line endings differ from git's expected convention for their path (per \
+                 .gitattributes / core.autocrlf / core.eol); such files are flagged with \
+                 an `eol_mismatch` object in the report. Call with `fix: \"eol\"` (line \
+                 endings only) or `fix: \"all\"` (peel + line endings) together with \
+                 `git_root` to normalise them atomically with a `.bak` backup. \n\n\
                  When a teammate or another tool (e.g. PowerShell `Get-Content` / \
                  `Set-Content`, a misconfigured generator) appears to have introduced \
                  corruption, `git log -p -- <file>` will identify the introducing commit \
@@ -1235,12 +1315,23 @@ pub fn list() -> Value {
                     },
                     "fix": {
                         "type": "string",
-                        "enum": ["none", "peel"],
+                        "enum": ["none", "peel", "eol", "all"],
                         "description":
                             "Repair mode. `none` (default) reports only; `peel` applies a \
                              single-layer mojibake undo to any file whose peel produces \
                              strictly fewer matches than the original, rewriting it \
-                             atomically with a `.bak` backup."
+                             atomically with a `.bak` backup. `eol` normalises only line \
+                             endings to git's expected convention; `all` does both peel \
+                             and eol. `eol` and `all` require the `git_root` argument."
+                    },
+                    "git_root": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to a git repository root (no upward \
+                             discovery). When set, doctor additionally reports files whose \
+                             on-disk line endings differ from git's expected convention \
+                             (per .gitattributes / core.autocrlf / core.eol) via an \
+                             `eol_mismatch` field. Required when `fix` is `eol` or `all`."
                     },
                     "on_error": {
                         "type": "string",
@@ -1306,6 +1397,88 @@ pub fn call(
 
 // -- individual tool implementations ------------------------------------------
 
+/// Extract the optional per-call `git_root` argument as a path.
+fn git_root_arg(args: &Value) -> Option<std::path::PathBuf> {
+    args.get("git_root")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from)
+}
+
+thread_local! {
+    /// Per-worker cache of opened [`tpu::git::GitEol`] handles, keyed by the
+    /// canonicalised `git_root`.  An agent session issues many reads against
+    /// the same repository; opening the repo (and loading its index) on every
+    /// call is wasteful, so we open once and reuse.
+    ///
+    /// The worker loop is single-threaded, so a `thread_local` `RefCell` needs
+    /// no locking and `GitEol` need not be `Sync`.  Entries live for the
+    /// process lifetime; a `.gitattributes`/config change mid-session is not
+    /// observed — acceptable for a best-effort advisory and for opt-in
+    /// normalisation within a single session.
+    static EOL_REPO_CACHE: std::cell::RefCell<
+        std::collections::HashMap<std::path::PathBuf, Option<std::rc::Rc<tpu::git::GitEol>>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Open (or reuse a cached) [`tpu::git::GitEol`] for `root`.  Returns `None`
+/// when the repository cannot be opened or has no working tree.
+fn cached_git_eol(root: &std::path::Path) -> Option<std::rc::Rc<tpu::git::GitEol>> {
+    let key = std::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    EOL_REPO_CACHE.with(|cache| {
+        if let Some(hit) = cache.borrow().get(&key) {
+            return hit.clone();
+        }
+        let opened = tpu::git::GitEol::open(root)
+            .ok()
+            .flatten()
+            .map(std::rc::Rc::new);
+        cache.borrow_mut().insert(key, opened.clone());
+        opened
+    })
+}
+
+/// When a `git_root` is supplied and the file's on-disk line endings differ
+/// from git's expected convention, prepend a single `note:` line (identical to
+/// the one `tpu read --git-root` emits) ahead of the returned content.  The
+/// note line is part of the response *preamble*, like the invocation header,
+/// and is omitted entirely when there is no mismatch.
+fn prepend_eol_note(args: &Value, file: &str, content: String) -> String {
+    let Some(root) = git_root_arg(args) else {
+        return content;
+    };
+    let Some(git) = cached_git_eol(&root) else {
+        return content;
+    };
+    match git.advisory_note(std::path::Path::new(file)) {
+        Some(note) => format!("{note}\n{content}"),
+        None => content,
+    }
+}
+
+/// Resolve the write-time line-ending override for a mutating MCP tool.
+///
+/// Thin wrapper over the shared [`tpu::git::resolve_write_override`] (also used
+/// by the `tpu` CLI): an explicit `line_ending` argument always wins;
+/// otherwise, when the server has line-ending normalisation enabled
+/// (`config.eol_normalize`) and the call supplies a `git_root`, the override is
+/// git's expected convention for the file.  Returns `Ok(None)` when neither
+/// applies.
+fn eol_write_override(
+    args: &Value,
+    file: &str,
+    config: &ServerConfig,
+) -> Result<Option<tpu::encoding::LineEnding>, Box<dyn std::error::Error>> {
+    let explicit = args.get("line_ending").and_then(|v| v.as_str());
+    let git_root = git_root_arg(args);
+    let git_root = if config.eol_normalize {
+        git_root.as_deref()
+    } else {
+        None
+    };
+    tpu::git::resolve_write_override(explicit, std::path::Path::new(file), git_root, true)
+}
+
 fn call_read_file(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_file", args);
     let inner = || -> Result<String, Box<dyn std::error::Error>> {
@@ -1332,7 +1505,8 @@ fn call_read_file(args: &Value) -> ToolResult {
             tpu::IoMode::Buffered,
             None,
         )?;
-        String::from_utf8(buf).map_err(|e| format!("read: non-UTF-8 output: {e}").into())
+        let content = String::from_utf8(buf).map_err(|e| format!("read: non-UTF-8 output: {e}"))?;
+        Ok(prepend_eol_note(args, &file, content))
     };
     match inner() {
         Ok(content) => ToolResult::ok(format!("{header}\n{content}")),
@@ -1340,10 +1514,7 @@ fn call_read_file(args: &Value) -> ToolResult {
     }
 }
 
-fn call_write_file(
-    args: &Value,
-    config: &ServerConfig,
-) -> ToolResult {
+fn call_write_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_write_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
@@ -1351,10 +1522,7 @@ fn call_write_file(
         let content = normalize_to_lf(content_raw);
         let path = std::path::Path::new(&file);
 
-        let le_override = match args.get("line_ending").and_then(|v| v.as_str()) {
-            None => None,
-            Some(s) => Some(tpu::encoding::parse_line_ending(s)?),
-        };
+        let le_override = eol_write_override(args, &file, config)?;
 
         if let Some(validates) = args.get("validate").and_then(|v| v.as_array()) {
             let pairs = flatten_validate_pairs(validates)?;
@@ -1363,7 +1531,8 @@ fn call_write_file(
 
         let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
         let mut diff_buf: Vec<u8> = Vec::new();
-        let diff_out: Option<&mut dyn std::io::Write> = if diff { Some(&mut diff_buf) } else { None };
+        let diff_out: Option<&mut dyn std::io::Write> =
+            if diff { Some(&mut diff_buf) } else { None };
 
         let policy = mojibake_policy_from_args(args);
         tpu::cmd::write::run(
@@ -1388,7 +1557,9 @@ fn call_write_file(
         if diff && !diff_buf.is_empty() {
             let diff_text = String::from_utf8_lossy(&diff_buf);
             let sep = diff_separator(&diff_text);
-            Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")))
+            Ok(ToolResult::ok(format!(
+                "{header}\n{diff_text}{sep}{status_line}"
+            )))
         } else {
             Ok(ToolResult::ok(format!("{header}\n{status_line}")))
         }
@@ -1396,10 +1567,7 @@ fn call_write_file(
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_replace_in_file(
-    args: &Value,
-    config: &ServerConfig,
-) -> ToolResult {
+fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_replace_in_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
@@ -1417,10 +1585,7 @@ fn call_replace_in_file(
             .get("fixed_strings")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let le_override = match args.get("line_ending").and_then(|v| v.as_str()) {
-            None => None,
-            Some(s) => Some(tpu::encoding::parse_line_ending(s)?),
-        };
+        let le_override = eol_write_override(args, &file, config)?;
         let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
         let count = args.get("count").and_then(|v| v.as_bool()).unwrap_or(false);
         let dry_run = args
@@ -1465,7 +1630,9 @@ fn call_replace_in_file(
             }
             let diff_text = String::from_utf8_lossy(&diff_buf);
             let sep = diff_separator(&diff_text);
-            return Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")));
+            return Ok(ToolResult::ok(format!(
+                "{header}\n{diff_text}{sep}{status_line}"
+            )));
         }
         // File was modified.
         delete_bak_if_exists(&file);
@@ -1480,7 +1647,9 @@ fn call_replace_in_file(
         if diff && !diff_buf.is_empty() {
             let diff_text = String::from_utf8_lossy(&diff_buf);
             let sep = diff_separator(&diff_text);
-            Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")))
+            Ok(ToolResult::ok(format!(
+                "{header}\n{diff_text}{sep}{status_line}"
+            )))
         } else {
             Ok(ToolResult::ok(format!("{header}\n{status_line}")))
         }
@@ -1488,235 +1657,233 @@ fn call_replace_in_file(
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_edit_file(
-    args: &Value,
-    config: &ServerConfig,
-) -> ToolResult {
+fn call_edit_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_edit_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let path = std::path::Path::new(&file);
-    let binary = args
-        .get("binary")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        let file = resolve_file_arg(args)?;
+        let path = std::path::Path::new(&file);
+        let binary = args
+            .get("binary")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-    let le_override = match args.get("line_ending").and_then(|v| v.as_str()) {
-        None => None,
-        Some(s) => Some(tpu::encoding::parse_line_ending(s)?),
-    };
+        let le_override = eol_write_override(args, &file, config)?;
 
-    // Collect --data-format from the first op that specifies one.
-    let data_format: Option<tpu::data_format::DataFormat> =
+        // Collect --data-format from the first op that specifies one.
+        let data_format: Option<tpu::data_format::DataFormat> =
+            if let Some(ops_arr) = args.get("ops").and_then(|v| v.as_array()) {
+                ops_arr
+                    .iter()
+                    .find_map(|op| op.get("data_format").and_then(|v| v.as_str()))
+                    .map(parse_data_format)
+                    .transpose()?
+            } else {
+                None
+            };
+
+        // Run validate guards before any edit.
+        if let Some(validates) = args.get("validate").and_then(|v| v.as_array()) {
+            let pairs = flatten_validate_pairs(validates)?;
+            tpu::cmd::validate::run_all(&pairs, path, binary, tpu::IoMode::Buffered)?;
+        }
+
+        // Parse ops into EditOp values.
+        let mut ops: Vec<tpu::cmd::edit::EditOp> = Vec::new();
         if let Some(ops_arr) = args.get("ops").and_then(|v| v.as_array()) {
-            ops_arr
-                .iter()
-                .find_map(|op| op.get("data_format").and_then(|v| v.as_str()))
-                .map(parse_data_format)
-                .transpose()?
+            for op in ops_arr {
+                let op_name = op
+                    .get("op")
+                    .and_then(|v| v.as_str())
+                    .ok_or("op entry missing 'op' field")?;
+                match op_name {
+                    "delete" => {
+                        let range_s = op
+                            .get("range")
+                            .and_then(|v| v.as_str())
+                            .ok_or("delete op missing 'range'")?;
+                        let (start, end) = if binary {
+                            tpu::cmd::edit::parse_byte_range(range_s)
+                                .map_err(|e| format!("delete: {e}"))?
+                        } else {
+                            tpu::cmd::edit::parse_line_range(range_s)
+                                .map_err(|e| format!("delete: {e}"))?
+                        };
+                        ops.push(tpu::cmd::edit::EditOp::Delete { start, end });
+                    }
+                    "insert" => {
+                        let offset_s = op
+                            .get("offset")
+                            .and_then(|v| v.as_str())
+                            .ok_or("insert op missing 'offset'")?;
+                        let data_s = op
+                            .get("data")
+                            .and_then(|v| v.as_str())
+                            .ok_or("insert op missing 'data'")?;
+                        let offset = if binary {
+                            tpu::cmd::edit::parse_byte_pos(offset_s)
+                                .map_err(|e| format!("insert offset: {e}"))?
+                        } else {
+                            tpu::cmd::edit::parse_line_num(offset_s)
+                                .map_err(|e| format!("insert offset: {e}"))?
+                        };
+                        let data = if let Some(ref fmt) = data_format {
+                            tpu::data_format::decode(fmt, data_s)
+                                .map_err(|e| format!("insert data decode: {e}"))?
+                        } else {
+                            data_s.as_bytes().to_vec()
+                        };
+                        // Normalize line endings to LF in text mode; binary data
+                        // must not be altered.
+                        let data = if binary {
+                            data
+                        } else {
+                            normalize_bytes_to_lf(data)
+                        };
+                        ops.push(tpu::cmd::edit::EditOp::Insert { offset, data });
+                    }
+                    "splice" => {
+                        let range_s = op
+                            .get("range")
+                            .and_then(|v| v.as_str())
+                            .ok_or("splice op missing 'range'")?;
+                        let data_s = op
+                            .get("data")
+                            .and_then(|v| v.as_str())
+                            .ok_or("splice op missing 'data'")?;
+                        let (start, end) = if binary {
+                            tpu::cmd::edit::parse_byte_range(range_s)
+                                .map_err(|e| format!("splice: {e}"))?
+                        } else {
+                            tpu::cmd::edit::parse_line_range(range_s)
+                                .map_err(|e| format!("splice: {e}"))?
+                        };
+                        let data = if let Some(ref fmt) = data_format {
+                            tpu::data_format::decode(fmt, data_s)
+                                .map_err(|e| format!("splice data decode: {e}"))?
+                        } else {
+                            data_s.as_bytes().to_vec()
+                        };
+                        // Normalize line endings to LF in text mode; binary data
+                        // must not be altered.
+                        let data = if binary {
+                            data
+                        } else {
+                            normalize_bytes_to_lf(data)
+                        };
+                        ops.push(tpu::cmd::edit::EditOp::Splice { start, end, data });
+                    }
+                    other => return Err(format!("unknown op: {other:?}").into()),
+                }
+            }
+        }
+
+        let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut diff_buf: Vec<u8> = Vec::new();
+        let diff_out: Option<&mut dyn std::io::Write> = if diff && !binary {
+            Some(&mut diff_buf)
         } else {
             None
         };
 
-    // Run validate guards before any edit.
-    if let Some(validates) = args.get("validate").and_then(|v| v.as_array()) {
-        let pairs = flatten_validate_pairs(validates)?;
-        tpu::cmd::validate::run_all(&pairs, path, binary, tpu::IoMode::Buffered)?;
-    }
-
-    // Parse ops into EditOp values.
-    let mut ops: Vec<tpu::cmd::edit::EditOp> = Vec::new();
-    if let Some(ops_arr) = args.get("ops").and_then(|v| v.as_array()) {
-        for op in ops_arr {
-            let op_name = op
-                .get("op")
-                .and_then(|v| v.as_str())
-                .ok_or("op entry missing 'op' field")?;
-            match op_name {
-                "delete" => {
-                    let range_s = op
-                        .get("range")
-                        .and_then(|v| v.as_str())
-                        .ok_or("delete op missing 'range'")?;
-                    let (start, end) = if binary {
-                        tpu::cmd::edit::parse_byte_range(range_s)
-                            .map_err(|e| format!("delete: {e}"))?
-                    } else {
-                        tpu::cmd::edit::parse_line_range(range_s)
-                            .map_err(|e| format!("delete: {e}"))?
-                    };
-                    ops.push(tpu::cmd::edit::EditOp::Delete { start, end });
-                }
-                "insert" => {
-                    let offset_s = op
-                        .get("offset")
-                        .and_then(|v| v.as_str())
-                        .ok_or("insert op missing 'offset'")?;
-                    let data_s = op
-                        .get("data")
-                        .and_then(|v| v.as_str())
-                        .ok_or("insert op missing 'data'")?;
-                    let offset = if binary {
-                        tpu::cmd::edit::parse_byte_pos(offset_s)
-                            .map_err(|e| format!("insert offset: {e}"))?
-                    } else {
-                        tpu::cmd::edit::parse_line_num(offset_s)
-                            .map_err(|e| format!("insert offset: {e}"))?
-                    };
-                    let data = if let Some(ref fmt) = data_format {
-                        tpu::data_format::decode(fmt, data_s)
-                            .map_err(|e| format!("insert data decode: {e}"))?
-                    } else {
-                        data_s.as_bytes().to_vec()
-                    };
-                    // Normalize line endings to LF in text mode; binary data
-                    // must not be altered.
-                    let data = if binary {
-                        data
-                    } else {
-                        normalize_bytes_to_lf(data)
-                    };
-                    ops.push(tpu::cmd::edit::EditOp::Insert { offset, data });
-                }
-                "splice" => {
-                    let range_s = op
-                        .get("range")
-                        .and_then(|v| v.as_str())
-                        .ok_or("splice op missing 'range'")?;
-                    let data_s = op
-                        .get("data")
-                        .and_then(|v| v.as_str())
-                        .ok_or("splice op missing 'data'")?;
-                    let (start, end) = if binary {
-                        tpu::cmd::edit::parse_byte_range(range_s)
-                            .map_err(|e| format!("splice: {e}"))?
-                    } else {
-                        tpu::cmd::edit::parse_line_range(range_s)
-                            .map_err(|e| format!("splice: {e}"))?
-                    };
-                    let data = if let Some(ref fmt) = data_format {
-                        tpu::data_format::decode(fmt, data_s)
-                            .map_err(|e| format!("splice data decode: {e}"))?
-                    } else {
-                        data_s.as_bytes().to_vec()
-                    };
-                    // Normalize line endings to LF in text mode; binary data
-                    // must not be altered.
-                    let data = if binary {
-                        data
-                    } else {
-                        normalize_bytes_to_lf(data)
-                    };
-                    ops.push(tpu::cmd::edit::EditOp::Splice { start, end, data });
-                }
-                other => return Err(format!("unknown op: {other:?}").into()),
-            }
+        tpu::cmd::edit::run(
+            path,
+            ops,
+            binary,
+            le_override,
+            diff_out,
+            tpu::IoMode::Buffered,
+            mojibake_policy_from_args(args),
+        )?;
+        delete_bak_if_exists(&file);
+        let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
+        let status = serde_json::json!({
+            "status": "success",
+            "file": file,
+            "mtime_epoch_ms": stamp.mtime_epoch_ms,
+            "size": stamp.size,
+        });
+        let status_line = serde_json::to_string(&status)?;
+        if diff && !diff_buf.is_empty() {
+            let diff_text = String::from_utf8_lossy(&diff_buf);
+            let sep = diff_separator(&diff_text);
+            Ok(ToolResult::ok(format!(
+                "{header}\n{diff_text}{sep}{status_line}"
+            )))
+        } else {
+            Ok(ToolResult::ok(format!("{header}\n{status_line}")))
         }
-    }
-
-    let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
-    let mut diff_buf: Vec<u8> = Vec::new();
-    let diff_out: Option<&mut dyn std::io::Write> = if diff && !binary {
-        Some(&mut diff_buf)
-    } else {
-        None
     };
-
-    tpu::cmd::edit::run(
-        path,
-        ops,
-        binary,
-        le_override,
-        diff_out,
-        tpu::IoMode::Buffered,
-        mojibake_policy_from_args(args),
-    )?;
-    delete_bak_if_exists(&file);
-    let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
-    let status = serde_json::json!({
-        "status": "success",
-        "file": file,
-        "mtime_epoch_ms": stamp.mtime_epoch_ms,
-        "size": stamp.size,
-    });
-    let status_line = serde_json::to_string(&status)?;
-    if diff && !diff_buf.is_empty() {
-        let diff_text = String::from_utf8_lossy(&diff_buf);
-        let sep = diff_separator(&diff_text);
-        Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")))
-    } else {
-        Ok(ToolResult::ok(format!("{header}\n{status_line}")))
-    }
-};
-inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
 fn call_read_file_binary(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_file_binary", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
+        let file = resolve_file_arg(args)?;
 
-    let byte_range = match args.get("bytes").and_then(|v| v.as_str()) {
-        None => None,
-        Some(s) => Some(tpu::cmd::read::parse_bytes_arg(s)?),
-    };
+        let byte_range = match args.get("bytes").and_then(|v| v.as_str()) {
+            None => None,
+            Some(s) => Some(tpu::cmd::read::parse_bytes_arg(s)?),
+        };
 
-    let hashes: Vec<String> = args
-        .get("hash")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(str::to_owned))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let hash_specs: Vec<tpu::cmd::read::HashSpec> = hashes
-        .iter()
-        .map(|s| tpu::cmd::read::parse_hash_arg(s))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let all_bytes = std::fs::read(&file)?;
-    let computed_hashes = tpu::cmd::read::compute_hashes(&all_bytes, &hash_specs)?;
-
-    let slice: &[u8] = match byte_range {
-        None => &all_bytes[..],
-        Some((lo, hi)) => {
-            let lo = (lo.saturating_sub(1) as usize).min(all_bytes.len());
-            let hi = (hi as usize).min(all_bytes.len());
-            &all_bytes[lo..hi]
-        }
-    };
-
-    if !hash_specs.is_empty() {
-        // Return JSON with base64 content and hashes array.
-        let hashes_json: Vec<serde_json::Value> = computed_hashes
-            .iter()
-            .map(|h| {
-                serde_json::json!({
-                    "algo": match h.algo {
-                        tpu::cmd::read::HashAlgo::Crc32 => "crc32",
-                        tpu::cmd::read::HashAlgo::Md5 => "md5",
-                    },
-                    "range": format!("{}-{}", h.start, h.resolved_end),
-                    "value": h.hex_value,
-                })
+        let hashes: Vec<String> = args
+            .get("hash")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect()
             })
-            .collect();
-        let content = tpu::data_format::encode_base64(slice);
-        let result_line = serde_json::to_string(&serde_json::json!({
-            "reason": "x-tpu-mcp-result",
-            "encoding": "bytes-base64",
-            "content": content,
-            "hashes": hashes_json,
-        }))?;
-        let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
-        Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
-    } else {
-        // Return 7-bit-clean escaped string — mixed mode (header + content).
-        let content = tpu::escape::encode_bytes(slice);
-        Ok(ToolResult::ok(format!("{header}\n{content}")))
-    }
+            .unwrap_or_default();
+
+        let hash_specs: Vec<tpu::cmd::read::HashSpec> = hashes
+            .iter()
+            .map(|s| tpu::cmd::read::parse_hash_arg(s))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let all_bytes = std::fs::read(&file)?;
+        let computed_hashes = tpu::cmd::read::compute_hashes(&all_bytes, &hash_specs)?;
+
+        let slice: &[u8] = match byte_range {
+            None => &all_bytes[..],
+            Some((lo, hi)) => {
+                let lo = (lo.saturating_sub(1) as usize).min(all_bytes.len());
+                let hi = (hi as usize).min(all_bytes.len());
+                &all_bytes[lo..hi]
+            }
+        };
+
+        if !hash_specs.is_empty() {
+            // Return JSON with base64 content and hashes array.
+            let hashes_json: Vec<serde_json::Value> = computed_hashes
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "algo": match h.algo {
+                            tpu::cmd::read::HashAlgo::Crc32 => "crc32",
+                            tpu::cmd::read::HashAlgo::Md5 => "md5",
+                        },
+                        "range": format!("{}-{}", h.start, h.resolved_end),
+                        "value": h.hex_value,
+                    })
+                })
+                .collect();
+            let content = tpu::data_format::encode_base64(slice);
+            let result_line = serde_json::to_string(&serde_json::json!({
+                "reason": "x-tpu-mcp-result",
+                "encoding": "bytes-base64",
+                "content": content,
+                "hashes": hashes_json,
+            }))?;
+            let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+            Ok(ToolResult::ok(format!(
+                "{header}\n{result_line}\n{status_line}"
+            )))
+        } else {
+            // Return 7-bit-clean escaped string — mixed mode (header + content).
+            let content = tpu::escape::encode_bytes(slice);
+            Ok(ToolResult::ok(format!("{header}\n{content}")))
+        }
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -1724,31 +1891,32 @@ fn call_read_file_binary(args: &Value) -> ToolResult {
 fn call_read_file_escaped(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_file_escaped", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let path = std::path::Path::new(&file);
+        let file = resolve_file_arg(args)?;
+        let path = std::path::Path::new(&file);
 
-    let lines_range = match args.get("lines").and_then(|v| v.as_str()) {
-        None => None,
-        Some(s) => Some(tpu::cmd::read::parse_lines_arg(s)?),
-    };
-    let numbers = args
-        .get("numbers")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+        let lines_range = match args.get("lines").and_then(|v| v.as_str()) {
+            None => None,
+            Some(s) => Some(tpu::cmd::read::parse_lines_arg(s)?),
+        };
+        let numbers = args
+            .get("numbers")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
-    let mut buf: Vec<u8> = Vec::new();
-    tpu::cmd::readex::run(
-        path,
-        lines_range,
-        numbers,
-        tpu::encoding::OutputEncoding::Preserve,
-        tpu::encoding::BomPolicy::default(),
-        &mut buf,
-        tpu::IoMode::Buffered,
-        None,
-    )?;
-    let content = String::from_utf8(buf).map_err(|e| format!("readex: non-UTF-8 output: {e}"))?;
-    Ok(ToolResult::ok(format!("{header}\n{content}")))
+        let mut buf: Vec<u8> = Vec::new();
+        tpu::cmd::readex::run(
+            path,
+            lines_range,
+            numbers,
+            tpu::encoding::OutputEncoding::Preserve,
+            tpu::encoding::BomPolicy::default(),
+            &mut buf,
+            tpu::IoMode::Buffered,
+            None,
+        )?;
+        let content =
+            String::from_utf8(buf).map_err(|e| format!("readex: non-UTF-8 output: {e}"))?;
+        Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -1756,24 +1924,25 @@ fn call_read_file_escaped(args: &Value) -> ToolResult {
 fn call_read_head(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_head", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let path = std::path::Path::new(&file);
+        let file = resolve_file_arg(args)?;
+        let path = std::path::Path::new(&file);
 
-    let mode = if let Some(n) = args.get("bytes").and_then(|v| v.as_u64()) {
-        tpu::cmd::head::HeadMode::Bytes { n }
-    } else {
-        let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-        let numbers = args
-            .get("numbers")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        tpu::cmd::head::HeadMode::Lines { n, numbers }
-    };
+        let mode = if let Some(n) = args.get("bytes").and_then(|v| v.as_u64()) {
+            tpu::cmd::head::HeadMode::Bytes { n }
+        } else {
+            let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let numbers = args
+                .get("numbers")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            tpu::cmd::head::HeadMode::Lines { n, numbers }
+        };
 
-    let mut buf: Vec<u8> = Vec::new();
-    tpu::cmd::head::run(path, mode, &mut buf, tpu::IoMode::Buffered, None)?;
-    let content = String::from_utf8(buf).map_err(|e| format!("head: non-UTF-8 output: {e}"))?;
-    Ok(ToolResult::ok(format!("{header}\n{content}")))
+        let mut buf: Vec<u8> = Vec::new();
+        tpu::cmd::head::run(path, mode, &mut buf, tpu::IoMode::Buffered, None)?;
+        let content = String::from_utf8(buf).map_err(|e| format!("head: non-UTF-8 output: {e}"))?;
+        let content = prepend_eol_note(args, &file, content);
+        Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -1781,24 +1950,25 @@ fn call_read_head(args: &Value) -> ToolResult {
 fn call_read_tail(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_tail", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let path = std::path::Path::new(&file);
+        let file = resolve_file_arg(args)?;
+        let path = std::path::Path::new(&file);
 
-    let mode = if let Some(n) = args.get("bytes").and_then(|v| v.as_u64()) {
-        tpu::cmd::tail::TailMode::Bytes { n }
-    } else {
-        let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-        let numbers = args
-            .get("numbers")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        tpu::cmd::tail::TailMode::Lines { n, numbers }
-    };
+        let mode = if let Some(n) = args.get("bytes").and_then(|v| v.as_u64()) {
+            tpu::cmd::tail::TailMode::Bytes { n }
+        } else {
+            let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
+            let numbers = args
+                .get("numbers")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            tpu::cmd::tail::TailMode::Lines { n, numbers }
+        };
 
-    let mut buf: Vec<u8> = Vec::new();
-    tpu::cmd::tail::run(path, mode, &mut buf, tpu::IoMode::Buffered, None)?;
-    let content = String::from_utf8(buf).map_err(|e| format!("tail: non-UTF-8 output: {e}"))?;
-    Ok(ToolResult::ok(format!("{header}\n{content}")))
+        let mut buf: Vec<u8> = Vec::new();
+        tpu::cmd::tail::run(path, mode, &mut buf, tpu::IoMode::Buffered, None)?;
+        let content = String::from_utf8(buf).map_err(|e| format!("tail: non-UTF-8 output: {e}"))?;
+        let content = prepend_eol_note(args, &file, content);
+        Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -1806,200 +1976,209 @@ fn call_read_tail(args: &Value) -> ToolResult {
 fn call_count_file(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_count_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let path = std::path::Path::new(&file);
+        let file = resolve_file_arg(args)?;
+        let path = std::path::Path::new(&file);
 
-    let lines = args.get("lines").and_then(|v| v.as_bool()).unwrap_or(false);
-    let words = args.get("words").and_then(|v| v.as_bool()).unwrap_or(false);
-    let chars = args.get("chars").and_then(|v| v.as_bool()).unwrap_or(false);
-    let bytes = args.get("bytes").and_then(|v| v.as_bool()).unwrap_or(false);
-    // Stats (encoding/bom/line_ending) are always emitted by the MCP tool
-    // regardless of the caller-supplied flag, matching the advertised contract.
-    let stats = true;
+        let lines = args.get("lines").and_then(|v| v.as_bool()).unwrap_or(false);
+        let words = args.get("words").and_then(|v| v.as_bool()).unwrap_or(false);
+        let chars = args.get("chars").and_then(|v| v.as_bool()).unwrap_or(false);
+        let bytes = args.get("bytes").and_then(|v| v.as_bool()).unwrap_or(false);
+        // Stats (encoding/bom/line_ending) are always emitted by the MCP tool
+        // regardless of the caller-supplied flag, matching the advertised contract.
+        let stats = true;
 
-    let mut patterns: Vec<String> = Vec::new();
-    let mut labels: Vec<String> = Vec::new();
-    if let Some(entries) = args.get("patterns").and_then(|v| v.as_array()) {
-        for entry in entries {
-            let pattern = entry
-                .get("pattern")
-                .and_then(|v| v.as_str())
-                .ok_or("patterns entry missing 'pattern' field")?;
-            // Always push a label for every pattern to keep vec positions
-            // aligned with `patterns`; default to the pattern string itself
-            // (matching count::run's own fallback behaviour).
-            let label = entry.get("label").and_then(|v| v.as_str()).unwrap_or(pattern);
-            patterns.push(pattern.to_owned());
-            labels.push(label.to_owned());
+        let mut patterns: Vec<String> = Vec::new();
+        let mut labels: Vec<String> = Vec::new();
+        if let Some(entries) = args.get("patterns").and_then(|v| v.as_array()) {
+            for entry in entries {
+                let pattern = entry
+                    .get("pattern")
+                    .and_then(|v| v.as_str())
+                    .ok_or("patterns entry missing 'pattern' field")?;
+                // Always push a label for every pattern to keep vec positions
+                // aligned with `patterns`; default to the pattern string itself
+                // (matching count::run's own fallback behaviour).
+                let label = entry
+                    .get("label")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(pattern);
+                patterns.push(pattern.to_owned());
+                labels.push(label.to_owned());
+            }
         }
-    }
-    // Collect all user-supplied pattern labels into a set.  This is used
-    // only to decide whether to initialise a "patterns" sub-object on
-    // result_obj (see below); the actual per-metric routing is driven by
-    // standard_metric_names and standard_metrics_placed, not by this set.
-    let pattern_label_set: std::collections::HashSet<String> =
-        labels.iter().cloned().collect();
+        // Collect all user-supplied pattern labels into a set.  This is used
+        // only to decide whether to initialise a "patterns" sub-object on
+        // result_obj (see below); the actual per-metric routing is driven by
+        // standard_metric_names and standard_metrics_placed, not by this set.
+        let pattern_label_set: std::collections::HashSet<String> = labels.iter().cloned().collect();
 
-    // Determine the expected standard metric names from the enabled flags.
-    // count::run always emits standard metrics *before* pattern metrics, so
-    // the first occurrence of each standard-metric name is authoritative for
-    // the top-level result object.  Any subsequent occurrence of the same name
-    // (i.e. a pattern label that collides with a standard metric) is routed
-    // to the "patterns" sub-object, preserving the real metric value.
-    // Mirror count::run's "emit all four when none are explicitly requested"
-    // rule so the fold step knows which metric names to expect at the top level.
-    let any_standard = lines || words || chars || bytes;
-    let emit_lines = lines || !any_standard;
-    let emit_words = words || !any_standard;
-    let emit_chars = chars || !any_standard;
-    let emit_bytes = bytes || !any_standard;
-    let standard_metric_names: std::collections::HashSet<&str> = {
-        let mut s = std::collections::HashSet::new();
-        if emit_lines { s.insert("lines"); }
-        if emit_words { s.insert("words"); }
-        if emit_chars { s.insert("chars"); }
-        if emit_bytes { s.insert("bytes"); }
-        // stats is always true for the MCP tool; stats metrics are always expected.
-        s.insert("encoding"); s.insert("bom"); s.insert("line_ending");
-        s
-    };
-
-    let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    let writer = SharedBufWriter(buf.clone());
-    let mut out = tpu::output::json_output_to(Box::new(writer));
-
-    tpu::cmd::count::run(
-        path,
-        lines,
-        words,
-        chars,
-        bytes,
-        &patterns,
-        &labels,
-        stats,
-        out.as_mut(),
-        tpu::IoMode::Buffered,
-    )?;
-    drop(out);
-    let raw = buf.lock().unwrap().clone();
-    let ndjson =
-        String::from_utf8(raw).map_err(|e| format!("count: non-UTF-8 output: {e}"))?;
-
-    // Fold each {"reason":"data","metric":M,...} line into a single result
-    // object.  Standard metrics use a "count" field; encoding/bom/line_ending
-    // use a "value" field.
-    //
-    // Routing rules:
-    //  - A metric in standard_metric_names whose name hasn't been placed yet →
-    //    top-level key (authoritative standard value).
-    //  - Any other metric (pattern label, or a second occurrence of a name that
-    //    matches a standard metric) → "patterns" sub-object.
-    let mut result_obj = serde_json::json!({"reason": "x-tpu-mcp-result"});
-    if !pattern_label_set.is_empty() {
-        result_obj["patterns"] = serde_json::json!({});
-    }
-    let mut standard_metrics_placed: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
-    for line in ndjson.lines() {
-        if line.is_empty() {
-            continue;
-        }
-        let parsed: Value = serde_json::from_str(line)
-            .map_err(|e| format!("count: malformed JSON line {line:?}: {e}"))?;
-        let metric = match parsed.get("metric").and_then(|v| v.as_str()) {
-            Some(m) => m.to_owned(),
-            None => continue,
+        // Determine the expected standard metric names from the enabled flags.
+        // count::run always emits standard metrics *before* pattern metrics, so
+        // the first occurrence of each standard-metric name is authoritative for
+        // the top-level result object.  Any subsequent occurrence of the same name
+        // (i.e. a pattern label that collides with a standard metric) is routed
+        // to the "patterns" sub-object, preserving the real metric value.
+        // Mirror count::run's "emit all four when none are explicitly requested"
+        // rule so the fold step knows which metric names to expect at the top level.
+        let any_standard = lines || words || chars || bytes;
+        let emit_lines = lines || !any_standard;
+        let emit_words = words || !any_standard;
+        let emit_chars = chars || !any_standard;
+        let emit_bytes = bytes || !any_standard;
+        let standard_metric_names: std::collections::HashSet<&str> = {
+            let mut s = std::collections::HashSet::new();
+            if emit_lines {
+                s.insert("lines");
+            }
+            if emit_words {
+                s.insert("words");
+            }
+            if emit_chars {
+                s.insert("chars");
+            }
+            if emit_bytes {
+                s.insert("bytes");
+            }
+            // stats is always true for the MCP tool; stats metrics are always expected.
+            s.insert("encoding");
+            s.insert("bom");
+            s.insert("line_ending");
+            s
         };
-        let val = if let Some(count) = parsed.get("count") {
-            count.clone()
-        } else if let Some(value) = parsed.get("value") {
-            value.clone()
-        } else {
-            continue;
-        };
-        // Route the metric to the top-level only when it is a known standard
-        // metric and hasn't been placed yet.  All other metrics (pattern
-        // labels, or a label that duplicates a standard metric name) go to
-        // the "patterns" sub-object.
-        if standard_metric_names.contains(metric.as_str())
-            && standard_metrics_placed.insert(metric.clone())
-        {
-            result_obj[metric] = val;
-        } else if result_obj.get("patterns").is_some() {
-            result_obj["patterns"][&metric] = val;
-        }
-    }
 
-    let result_line = serde_json::to_string(&result_obj)?;
-    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
-    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let writer = SharedBufWriter(buf.clone());
+        let mut out = tpu::output::json_output_to(Box::new(writer));
+
+        tpu::cmd::count::run(
+            path,
+            lines,
+            words,
+            chars,
+            bytes,
+            &patterns,
+            &labels,
+            stats,
+            out.as_mut(),
+            tpu::IoMode::Buffered,
+        )?;
+        drop(out);
+        let raw = buf.lock().unwrap().clone();
+        let ndjson = String::from_utf8(raw).map_err(|e| format!("count: non-UTF-8 output: {e}"))?;
+
+        // Fold each {"reason":"data","metric":M,...} line into a single result
+        // object.  Standard metrics use a "count" field; encoding/bom/line_ending
+        // use a "value" field.
+        //
+        // Routing rules:
+        //  - A metric in standard_metric_names whose name hasn't been placed yet →
+        //    top-level key (authoritative standard value).
+        //  - Any other metric (pattern label, or a second occurrence of a name that
+        //    matches a standard metric) → "patterns" sub-object.
+        let mut result_obj = serde_json::json!({"reason": "x-tpu-mcp-result"});
+        if !pattern_label_set.is_empty() {
+            result_obj["patterns"] = serde_json::json!({});
+        }
+        let mut standard_metrics_placed: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for line in ndjson.lines() {
+            if line.is_empty() {
+                continue;
+            }
+            let parsed: Value = serde_json::from_str(line)
+                .map_err(|e| format!("count: malformed JSON line {line:?}: {e}"))?;
+            let metric = match parsed.get("metric").and_then(|v| v.as_str()) {
+                Some(m) => m.to_owned(),
+                None => continue,
+            };
+            let val = if let Some(count) = parsed.get("count") {
+                count.clone()
+            } else if let Some(value) = parsed.get("value") {
+                value.clone()
+            } else {
+                continue;
+            };
+            // Route the metric to the top-level only when it is a known standard
+            // metric and hasn't been placed yet.  All other metrics (pattern
+            // labels, or a label that duplicates a standard metric name) go to
+            // the "patterns" sub-object.
+            if standard_metric_names.contains(metric.as_str())
+                && standard_metrics_placed.insert(metric.clone())
+            {
+                result_obj[metric] = val;
+            } else if result_obj.get("patterns").is_some() {
+                result_obj["patterns"][&metric] = val;
+            }
+        }
+
+        let result_line = serde_json::to_string(&result_obj)?;
+        let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+        Ok(ToolResult::ok(format!(
+            "{header}\n{result_line}\n{status_line}"
+        )))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_append_file(
-    args: &Value,
-    config: &ServerConfig,
-) -> ToolResult {
+fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_append_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let content_raw = require_str(args, "content")?;
-    let content = normalize_to_lf(content_raw);
-    let path = std::path::Path::new(&file);
+        let file = resolve_file_arg(args)?;
+        let content_raw = require_str(args, "content")?;
+        let content = normalize_to_lf(content_raw);
+        let path = std::path::Path::new(&file);
 
-    let le_override = match args.get("line_ending").and_then(|v| v.as_str()) {
-        None => None,
-        Some(s) => Some(tpu::encoding::parse_line_ending(s)?),
-    };
-    let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
+        let le_override = eol_write_override(args, &file, config)?;
+        let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
 
-    // Run validate guards before any modification.
-    if let Some(validates) = args.get("validate").and_then(|v| v.as_array()) {
-        let pairs = flatten_validate_pairs(validates)?;
-        tpu::cmd::validate::run_all(&pairs, path, false, tpu::IoMode::Buffered)?;
-    }
+        // Run validate guards before any modification.
+        if let Some(validates) = args.get("validate").and_then(|v| v.as_array()) {
+            let pairs = flatten_validate_pairs(validates)?;
+            tpu::cmd::validate::run_all(&pairs, path, false, tpu::IoMode::Buffered)?;
+        }
 
-    if diff {
-        let mut diff_buf: Vec<u8> = Vec::new();
+        if diff {
+            let mut diff_buf: Vec<u8> = Vec::new();
+            tpu::cmd::append::run(
+                path,
+                &content,
+                le_override,
+                Some(&mut diff_buf),
+                tpu::IoMode::Buffered,
+                mojibake_policy_from_args(args),
+            )?;
+            if !diff_buf.is_empty() {
+                let diff_text = String::from_utf8_lossy(&diff_buf);
+                let sep = diff_separator(&diff_text);
+                let status = serde_json::json!({"status":"success","file":file,"changed":true});
+                let status_line = serde_json::to_string(&status)?;
+                return Ok(ToolResult::ok(format!(
+                    "{header}\n{diff_text}{sep}{status_line}"
+                )));
+            }
+            let status = serde_json::json!({"status":"success","file":file,"changed":false});
+            let status_line = serde_json::to_string(&status)?;
+            return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
+        }
+
         tpu::cmd::append::run(
             path,
             &content,
             le_override,
-            Some(&mut diff_buf),
+            None,
             tpu::IoMode::Buffered,
             mojibake_policy_from_args(args),
         )?;
-        if !diff_buf.is_empty() {
-            let diff_text = String::from_utf8_lossy(&diff_buf);
-            let sep = diff_separator(&diff_text);
-            let status = serde_json::json!({"status":"success","file":file,"changed":true});
-            let status_line = serde_json::to_string(&status)?;
-            return Ok(ToolResult::ok(format!("{header}\n{diff_text}{sep}{status_line}")));
-        }
-        let status = serde_json::json!({"status":"success","file":file,"changed":false});
+        delete_bak_if_exists(&file);
+        let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
+        let status = serde_json::json!({
+            "status": "success",
+            "file": file,
+            "mtime_epoch_ms": stamp.mtime_epoch_ms,
+            "size": stamp.size,
+        });
         let status_line = serde_json::to_string(&status)?;
-        return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
-    }
-
-    tpu::cmd::append::run(
-        path,
-        &content,
-        le_override,
-        None,
-        tpu::IoMode::Buffered,
-        mojibake_policy_from_args(args),
-    )?;
-    delete_bak_if_exists(&file);
-    let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
-    let status = serde_json::json!({
-        "status": "success",
-        "file": file,
-        "mtime_epoch_ms": stamp.mtime_epoch_ms,
-        "size": stamp.size,
-    });
-    let status_line = serde_json::to_string(&status)?;
-    Ok(ToolResult::ok(format!("{header}\n{status_line}")))
+        Ok(ToolResult::ok(format!("{header}\n{status_line}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -2007,350 +2186,347 @@ fn call_append_file(
 fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_find", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    // Collect patterns: primary "pattern" + optional "patterns" array.
-    let mut all_patterns: Vec<String> = Vec::new();
-    if let Some(p) = args.get("pattern").and_then(|v| v.as_str()) {
-        all_patterns.push(p.to_owned());
-    }
-    if let Some(arr) = args.get("patterns").and_then(|v| v.as_array()) {
-        for p in arr {
-            if let Some(s) = p.as_str() {
-                all_patterns.push(s.to_owned());
-            }
+        // Collect patterns: primary "pattern" + optional "patterns" array.
+        let mut all_patterns: Vec<String> = Vec::new();
+        if let Some(p) = args.get("pattern").and_then(|v| v.as_str()) {
+            all_patterns.push(p.to_owned());
         }
-    }
-
-    // Collect paths: primary "path" + optional "paths" array; normalise URIs.
-    let mut all_paths: Vec<String> = Vec::new();
-    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-        all_paths.push(normalize_file_path(p));
-    }
-    if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
-        for p in arr {
-            if let Some(s) = p.as_str() {
-                all_paths.push(normalize_file_path(s));
-            }
-        }
-    }
-
-    if all_patterns.is_empty() {
-        return Err("find: at least one pattern is required".into());
-    }
-    if all_paths.is_empty() {
-        return Err("find: at least one path is required".into());
-    }
-
-    let fixed_strings = args
-        .get("fixed_strings")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let multiline = args
-        .get("multiline")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let ignore_case = args
-        .get("ignore_case")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let all_match = args
-        .get("all_match")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let invert = args
-        .get("invert")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let numbers = args
-        .get("numbers")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let count = args.get("count").and_then(|v| v.as_bool()).unwrap_or(false);
-    let after = args.get("after").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-    let before = args.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-
-    let glob = args
-        .get("glob")
-        .and_then(|v| v.as_str())
-        .map(str::to_owned);
-
-    let pattern_refs: Vec<&str> = all_patterns.iter().map(String::as_str).collect();
-    let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
-
-    let on_error = match args.get("on_error") {
-        None => config.default_on_error,
-        Some(v) => match v.as_str() {
-            Some("fail") => tpu::cmd::copy::OnError::Fail,
-            Some("warn") => tpu::cmd::copy::OnError::Warn,
-            Some(other) => {
-                return Err(format!(
-                    "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
-                )
-                .into());
-            }
-            None => {
-                return Err(
-                    format!("invalid value for `on_error`: expected a string, got {v}").into(),
-                );
-            }
-        },
-    };
-    let mut walk_warnings: Vec<String> = Vec::new();
-
-    let mut buf: Vec<u8> = Vec::new();
-    let result = tpu::cmd::find::run_with_policy(
-        &path_refs,
-        &pattern_refs,
-        glob.as_deref(),
-        fixed_strings,
-        multiline,
-        ignore_case,
-        all_match,
-        invert,
-        before,
-        after,
-        count,
-        numbers,
-        &mut buf,
-        tpu::IoMode::Buffered,
-        on_error,
-        &mut walk_warnings,
-    );
-
-    match result {
-        Ok(_) => {
-            let mut content =
-                String::from_utf8(buf).map_err(|e| format!("find: non-UTF-8 output: {e}"))?;
-            // Ensure content ends with newline so the status trailer is on its own line.
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            // Build status with optional warnings array.
-            let warnings_json: Vec<serde_json::Value> = match config.progress_detail {
-                ProgressDetail::EachFile => walk_warnings
-                    .iter()
-                    .map(|w| serde_json::Value::String(w.clone()))
-                    .collect(),
-                ProgressDetail::Summary => {
-                    let n = walk_warnings.len();
-                    if n > 0 {
-                        vec![serde_json::Value::String(format!(
-                            "{n} path(s) skipped (use progressDetail=each-file to list)"
-                        ))]
-                    } else {
-                        vec![]
-                    }
+        if let Some(arr) = args.get("patterns").and_then(|v| v.as_array()) {
+            for p in arr {
+                if let Some(s) = p.as_str() {
+                    all_patterns.push(s.to_owned());
                 }
-            };
-            let mut status = serde_json::json!({ "status": "success" });
-            if !warnings_json.is_empty() {
-                status["warnings"] = serde_json::Value::Array(warnings_json);
             }
-            let status_line = serde_json::to_string(&status)?;
-            Ok(ToolResult::ok(format!("{header}\n{content}{status_line}")))
         }
-        Err(e) => {
-            let msg = if walk_warnings.is_empty() {
-                e.to_string()
-            } else {
-                format!("{}\n{e}", walk_warnings.join("\n"))
-            };
-            Err(msg.into())
+
+        // Collect paths: primary "path" + optional "paths" array; normalise URIs.
+        let mut all_paths: Vec<String> = Vec::new();
+        if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+            all_paths.push(normalize_file_path(p));
         }
-    }
+        if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
+            for p in arr {
+                if let Some(s) = p.as_str() {
+                    all_paths.push(normalize_file_path(s));
+                }
+            }
+        }
+
+        if all_patterns.is_empty() {
+            return Err("find: at least one pattern is required".into());
+        }
+        if all_paths.is_empty() {
+            return Err("find: at least one path is required".into());
+        }
+
+        let fixed_strings = args
+            .get("fixed_strings")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let multiline = args
+            .get("multiline")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let ignore_case = args
+            .get("ignore_case")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let all_match = args
+            .get("all_match")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let invert = args
+            .get("invert")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let numbers = args
+            .get("numbers")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let count = args.get("count").and_then(|v| v.as_bool()).unwrap_or(false);
+        let after = args.get("after").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+        let before = args.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+
+        let glob = args.get("glob").and_then(|v| v.as_str()).map(str::to_owned);
+
+        let pattern_refs: Vec<&str> = all_patterns.iter().map(String::as_str).collect();
+        let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
+
+        let on_error = match args.get("on_error") {
+            None => config.default_on_error,
+            Some(v) => match v.as_str() {
+                Some("fail") => tpu::cmd::copy::OnError::Fail,
+                Some("warn") => tpu::cmd::copy::OnError::Warn,
+                Some(other) => {
+                    return Err(format!(
+                        "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(format!(
+                        "invalid value for `on_error`: expected a string, got {v}"
+                    )
+                    .into());
+                }
+            },
+        };
+        let mut walk_warnings: Vec<String> = Vec::new();
+
+        let mut buf: Vec<u8> = Vec::new();
+        let result = tpu::cmd::find::run_with_policy(
+            &path_refs,
+            &pattern_refs,
+            glob.as_deref(),
+            fixed_strings,
+            multiline,
+            ignore_case,
+            all_match,
+            invert,
+            before,
+            after,
+            count,
+            numbers,
+            &mut buf,
+            tpu::IoMode::Buffered,
+            on_error,
+            &mut walk_warnings,
+        );
+
+        match result {
+            Ok(_) => {
+                let mut content =
+                    String::from_utf8(buf).map_err(|e| format!("find: non-UTF-8 output: {e}"))?;
+                // Ensure content ends with newline so the status trailer is on its own line.
+                if !content.is_empty() && !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                // Build status with optional warnings array.
+                let warnings_json: Vec<serde_json::Value> = match config.progress_detail {
+                    ProgressDetail::EachFile => walk_warnings
+                        .iter()
+                        .map(|w| serde_json::Value::String(w.clone()))
+                        .collect(),
+                    ProgressDetail::Summary => {
+                        let n = walk_warnings.len();
+                        if n > 0 {
+                            vec![serde_json::Value::String(format!(
+                                "{n} path(s) skipped (use progressDetail=each-file to list)"
+                            ))]
+                        } else {
+                            vec![]
+                        }
+                    }
+                };
+                let mut status = serde_json::json!({ "status": "success" });
+                if !warnings_json.is_empty() {
+                    status["warnings"] = serde_json::Value::Array(warnings_json);
+                }
+                let status_line = serde_json::to_string(&status)?;
+                Ok(ToolResult::ok(format!("{header}\n{content}{status_line}")))
+            }
+            Err(e) => {
+                let msg = if walk_warnings.is_empty() {
+                    e.to_string()
+                } else {
+                    format!("{}\n{e}", walk_warnings.join("\n"))
+                };
+                Err(msg.into())
+            }
+        }
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_copy_file(
-    args: &Value,
-    config: &ServerConfig,
-) -> ToolResult {
+fn call_copy_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_copy_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let source = normalize_file_path(require_str(args, "source")?);
-    let dest = normalize_file_path(require_str(args, "dest")?);
-    let recursive = args
-        .get("recursive")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let overwrite = args
-        .get("overwrite")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let on_error = match args.get("on_error") {
-        None => config.default_on_error,
-        Some(v) => match v.as_str() {
-            Some("fail") => tpu::cmd::copy::OnError::Fail,
-            Some("warn") => tpu::cmd::copy::OnError::Warn,
-            Some(other) => {
-                return Err(format!(
-                    "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
-                )
-                .into());
+        let source = normalize_file_path(require_str(args, "source")?);
+        let dest = normalize_file_path(require_str(args, "dest")?);
+        let recursive = args
+            .get("recursive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let overwrite = args
+            .get("overwrite")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let on_error = match args.get("on_error") {
+            None => config.default_on_error,
+            Some(v) => match v.as_str() {
+                Some("fail") => tpu::cmd::copy::OnError::Fail,
+                Some("warn") => tpu::cmd::copy::OnError::Warn,
+                Some(other) => {
+                    return Err(format!(
+                        "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(format!(
+                        "invalid value for `on_error`: expected a string, got {v}"
+                    )
+                    .into());
+                }
+            },
+        };
+        let opts = tpu::cmd::copy::CopyOptions {
+            recursive,
+            overwrite,
+            on_error,
+        };
+
+        // In EachFile mode, capture Shell::warn output for the `log` array.  In
+        // Summary mode the warning count is already in report.warnings, so we
+        // write to a sink to avoid retaining every warning string in memory for
+        // large tree walks.
+        let warn_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for SharedWriter {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
             }
-            None => {
-                return Err(
-                    format!("invalid value for `on_error`: expected a string, got {v}").into(),
-                );
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
             }
-        },
-    };
-    let opts = tpu::cmd::copy::CopyOptions {
-        recursive,
-        overwrite,
-        on_error,
-    };
-
-    // In EachFile mode, capture Shell::warn output for the `log` array.  In
-    // Summary mode the warning count is already in report.warnings, so we
-    // write to a sink to avoid retaining every warning string in memory for
-    // large tree walks.
-    let warn_buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
-    struct SharedWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-    impl std::io::Write for SharedWriter {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
         }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
+        let mut shell = if matches!(config.progress_detail, ProgressDetail::EachFile) {
+            tpu::shell::Shell::from_write(Box::new(SharedWriter(warn_buf.clone())))
+        } else {
+            tpu::shell::Shell::from_write(Box::new(std::io::sink()))
+        };
+
+        let report = tpu::cmd::copy::run(&source, std::path::Path::new(&dest), opts, &mut shell)?;
+        drop(shell);
+
+        // Human-mode warn() emits "warning: {message}\n"; strip the prefix to get
+        // a clean string array that MCP clients can read directly.
+        let raw = String::from_utf8_lossy(&warn_buf.lock().unwrap()).into_owned();
+        let warn_lines: Vec<String> = raw
+            .lines()
+            .map(|l| l.strip_prefix("warning: ").unwrap_or(l).to_string())
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut result_obj = serde_json::json!({
+            "reason":   "x-tpu-mcp-result",
+            "copied":   report.copied,
+            "skipped":  report.skipped,
+            "warnings": report.warnings,
+        });
+        if matches!(config.progress_detail, ProgressDetail::EachFile) {
+            result_obj["log"] = serde_json::Value::Array(
+                warn_lines
+                    .iter()
+                    .map(|s| serde_json::Value::String(s.clone()))
+                    .collect(),
+            );
         }
-    }
-    let mut shell = if matches!(config.progress_detail, ProgressDetail::EachFile) {
-        tpu::shell::Shell::from_write(Box::new(SharedWriter(warn_buf.clone())))
-    } else {
-        tpu::shell::Shell::from_write(Box::new(std::io::sink()))
-    };
-
-    let report = tpu::cmd::copy::run(&source, std::path::Path::new(&dest), opts, &mut shell)?;
-    drop(shell);
-
-    // Human-mode warn() emits "warning: {message}\n"; strip the prefix to get
-    // a clean string array that MCP clients can read directly.
-    let raw = String::from_utf8_lossy(&warn_buf.lock().unwrap()).into_owned();
-    let warn_lines: Vec<String> = raw
-        .lines()
-        .map(|l| l.strip_prefix("warning: ").unwrap_or(l).to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    let mut result_obj = serde_json::json!({
-        "reason":   "x-tpu-mcp-result",
-        "copied":   report.copied,
-        "skipped":  report.skipped,
-        "warnings": report.warnings,
-    });
-    if matches!(config.progress_detail, ProgressDetail::EachFile) {
-        result_obj["log"] = serde_json::Value::Array(
-            warn_lines
-                .iter()
-                .map(|s| serde_json::Value::String(s.clone()))
-                .collect(),
-        );
-    }
-    let result_line = serde_json::to_string(&result_obj)?;
-    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
-    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
+        let result_line = serde_json::to_string(&result_obj)?;
+        let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+        Ok(ToolResult::ok(format!(
+            "{header}\n{result_line}\n{status_line}"
+        )))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
-fn call_render_file(
-    args: &Value,
-    config: &ServerConfig,
-) -> ToolResult {
+fn call_render_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_render_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    use std::collections::BTreeMap;
-    let output = normalize_file_path(require_str(args, "output")?);
-    // Normalize CRLF → LF at the MCP boundary, consistent with other write tools.
-    let template_inline_owned = match args.get("template") {
-        None => None,
-        Some(v) => {
-            let s = v
-                .as_str()
-                .ok_or_else(|| format!("render: `template` must be a string, got {v}"))?;
-            Some(s.replace("\r\n", "\n").replace('\r', "\n"))
-        }
-    };
-    let template_inline = template_inline_owned.as_deref();
-    let template_file = match args.get("template_file") {
-        None => None,
-        Some(v) => {
-            let s = v
-                .as_str()
-                .ok_or_else(|| format!("render: `template_file` must be a string, got {v}"))?;
-            Some(normalize_file_path(s))
-        }
-    };
-    let mut vars: BTreeMap<String, String> = BTreeMap::new();
-    if let Some(vars_val) = args.get("vars") {
-        let map = vars_val
-            .as_object()
-            .ok_or_else(|| format!("render: `vars` must be an object, got {vars_val}"))?;
-        for (k, v) in map {
-            // Enforce the same key constraints as the CLI parser.
-            if k.is_empty()
-                || !k
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-            {
-                return Err(format!(
-                    "render: vars key {k:?} may only contain ASCII letters, digits, '_' or '-'"
-                )
-                .into());
+        use std::collections::BTreeMap;
+        let output = normalize_file_path(require_str(args, "output")?);
+        // Normalize CRLF → LF at the MCP boundary, consistent with other write tools.
+        let template_inline_owned = match args.get("template") {
+            None => None,
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| format!("render: `template` must be a string, got {v}"))?;
+                Some(s.replace("\r\n", "\n").replace('\r', "\n"))
             }
-            let val = v
-                .as_str()
-                .ok_or_else(|| format!("render: vars[{k}]: value must be a string"))?;
-            // Normalize CRLF → LF so variable values don't produce doubled
-            // carriage returns when written to CRLF-convention destination files.
-            vars.insert(k.clone(), val.replace("\r\n", "\n").replace('\r', "\n"));
+        };
+        let template_inline = template_inline_owned.as_deref();
+        let template_file = match args.get("template_file") {
+            None => None,
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| format!("render: `template_file` must be a string, got {v}"))?;
+                Some(normalize_file_path(s))
+            }
+        };
+        let mut vars: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(vars_val) = args.get("vars") {
+            let map = vars_val
+                .as_object()
+                .ok_or_else(|| format!("render: `vars` must be an object, got {vars_val}"))?;
+            for (k, v) in map {
+                // Enforce the same key constraints as the CLI parser.
+                if k.is_empty()
+                    || !k
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                {
+                    return Err(format!(
+                        "render: vars key {k:?} may only contain ASCII letters, digits, '_' or '-'"
+                    )
+                    .into());
+                }
+                let val = v
+                    .as_str()
+                    .ok_or_else(|| format!("render: vars[{k}]: value must be a string"))?;
+                // Normalize CRLF → LF so variable values don't produce doubled
+                // carriage returns when written to CRLF-convention destination files.
+                vars.insert(k.clone(), val.replace("\r\n", "\n").replace('\r', "\n"));
+            }
         }
-    }
-    let missing = match args.get("missing") {
-        None => tpu::cmd::render::MissingPolicy::Error,
-        Some(v) => match v.as_str() {
-            Some("error") => tpu::cmd::render::MissingPolicy::Error,
-            Some("empty") => tpu::cmd::render::MissingPolicy::Empty,
-            Some("leave") => tpu::cmd::render::MissingPolicy::Leave,
-            Some(other) => {
-                return Err(format!(
+        let missing = match args.get("missing") {
+            None => tpu::cmd::render::MissingPolicy::Error,
+            Some(v) => match v.as_str() {
+                Some("error") => tpu::cmd::render::MissingPolicy::Error,
+                Some("empty") => tpu::cmd::render::MissingPolicy::Empty,
+                Some("leave") => tpu::cmd::render::MissingPolicy::Leave,
+                Some(other) => {
+                    return Err(format!(
                     "render: invalid missing policy {other:?}; expected one of \"error\", \"empty\", or \"leave\""
                 )
                 .into());
-            }
-            None => {
-                return Err(format!(
-                    "render: invalid value for `missing`: expected a string, got {v}"
-                )
-                .into());
-            }
-        },
-    };
-    let policy = mojibake_policy_from_args(args);
-    let report = tpu::cmd::render::run(
-        std::path::Path::new(&output),
-        template_inline,
-        template_file.as_deref().map(std::path::Path::new),
-        None,
-        &vars,
-        missing,
-        tpu::IoMode::Buffered,
-        policy,
-    )?;
-    delete_bak_if_exists(&output);
-    let stamp = stamp_and_verify(std::path::Path::new(&output), config.verify_delay_ms)?;
-    let result_obj = serde_json::json!({
-        "reason": "x-tpu-mcp-result",
-        "output": output,
-        "substitutions": report.substitutions,
-        "missing": report.missing,
-        "mtime_epoch_ms": stamp.mtime_epoch_ms,
-        "size": stamp.size,
-    });
-    let result_line = serde_json::to_string(&result_obj)?;
-    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
-    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
+                }
+                None => {
+                    return Err(format!(
+                        "render: invalid value for `missing`: expected a string, got {v}"
+                    )
+                    .into());
+                }
+            },
+        };
+        let policy = mojibake_policy_from_args(args);
+        let report = tpu::cmd::render::run(
+            std::path::Path::new(&output),
+            template_inline,
+            template_file.as_deref().map(std::path::Path::new),
+            None,
+            &vars,
+            missing,
+            tpu::IoMode::Buffered,
+            policy,
+        )?;
+        delete_bak_if_exists(&output);
+        let stamp = stamp_and_verify(std::path::Path::new(&output), config.verify_delay_ms)?;
+        let result_obj = serde_json::json!({
+            "reason": "x-tpu-mcp-result",
+            "output": output,
+            "substitutions": report.substitutions,
+            "missing": report.missing,
+            "mtime_epoch_ms": stamp.mtime_epoch_ms,
+            "size": stamp.size,
+        });
+        let result_line = serde_json::to_string(&result_obj)?;
+        let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+        Ok(ToolResult::ok(format!(
+            "{header}\n{result_line}\n{status_line}"
+        )))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -2358,41 +2534,45 @@ fn call_render_file(
 fn call_setup(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_setup", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let target = match args.get("target") {
-        None => None,
-        Some(v) => match v.as_str() {
-            Some(s) => Some(normalize_file_path(s)),
+        let target = match args.get("target") {
+            None => None,
+            Some(v) => match v.as_str() {
+                Some(s) => Some(normalize_file_path(s)),
+                None => {
+                    return Err("`target` must be a string path when provided".into());
+                }
+            },
+        };
+        match target {
             None => {
-                return Err("`target` must be a string path when provided".into());
+                // Mixed mode: header line + raw markdown block content.
+                let block = tpu::cmd::setup::full_block();
+                Ok(ToolResult::ok(format!("{header}\n{block}")))
             }
-        },
-    };
-    match target {
-        None => {
-            // Mixed mode: header line + raw markdown block content.
-            let block = tpu::cmd::setup::full_block();
-            Ok(ToolResult::ok(format!("{header}\n{block}")))
-        }
-        Some(path) => {
-            let (updated, replaced) =
-                tpu::cmd::setup::inject(std::path::Path::new(&path), tpu::IoMode::Buffered)?;
-            let mut result_obj = serde_json::json!({
-                "reason": "x-tpu-mcp-result",
-                "target": path,
-                "updated": updated,
-                "replaced": replaced,
-            });
-            if updated {
-                delete_bak_if_exists(&path);
-                let stamp = stamp_and_verify(std::path::Path::new(&path), config.verify_delay_ms)?;
-                result_obj["mtime_epoch_ms"] = serde_json::Value::Number(stamp.mtime_epoch_ms.into());
-                result_obj["size"] = serde_json::Value::Number(stamp.size.into());
+            Some(path) => {
+                let (updated, replaced) =
+                    tpu::cmd::setup::inject(std::path::Path::new(&path), tpu::IoMode::Buffered)?;
+                let mut result_obj = serde_json::json!({
+                    "reason": "x-tpu-mcp-result",
+                    "target": path,
+                    "updated": updated,
+                    "replaced": replaced,
+                });
+                if updated {
+                    delete_bak_if_exists(&path);
+                    let stamp =
+                        stamp_and_verify(std::path::Path::new(&path), config.verify_delay_ms)?;
+                    result_obj["mtime_epoch_ms"] =
+                        serde_json::Value::Number(stamp.mtime_epoch_ms.into());
+                    result_obj["size"] = serde_json::Value::Number(stamp.size.into());
+                }
+                let result_line = serde_json::to_string(&result_obj)?;
+                let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+                Ok(ToolResult::ok(format!(
+                    "{header}\n{result_line}\n{status_line}"
+                )))
             }
-            let result_line = serde_json::to_string(&result_obj)?;
-            let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
-            Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
         }
-    }
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -2400,129 +2580,149 @@ fn call_setup(args: &Value, config: &ServerConfig) -> ToolResult {
 fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_doctor", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let mut all_paths: Vec<String> = Vec::new();
-    if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-        all_paths.push(normalize_file_path(p));
-    }
-    if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
-        for p in arr {
-            if let Some(s) = p.as_str() {
-                all_paths.push(normalize_file_path(s));
+        let mut all_paths: Vec<String> = Vec::new();
+        if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
+            all_paths.push(normalize_file_path(p));
+        }
+        if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
+            for p in arr {
+                if let Some(s) = p.as_str() {
+                    all_paths.push(normalize_file_path(s));
+                }
             }
         }
-    }
-    if all_paths.is_empty() {
-        return Err("doctor: at least one `path` or entry in `paths` is required".into());
-    }
+        if all_paths.is_empty() {
+            return Err("doctor: at least one `path` or entry in `paths` is required".into());
+        }
 
-    let fix = match args.get("fix") {
-        None => tpu::cmd::doctor::DoctorFix::None,
-        Some(v) => match v.as_str() {
-            Some("none") => tpu::cmd::doctor::DoctorFix::None,
-            Some("peel") => tpu::cmd::doctor::DoctorFix::Peel,
-            Some(other) => {
-                return Err(format!(
-                    "invalid value for `fix`: {other:?}; expected \"none\" or \"peel\""
+        let (fix, fix_eol) = match args.get("fix") {
+            None => (tpu::cmd::doctor::DoctorFix::None, false),
+            Some(v) => match v.as_str() {
+                Some("none") => (tpu::cmd::doctor::DoctorFix::None, false),
+                Some("peel") => (tpu::cmd::doctor::DoctorFix::Peel, false),
+                Some("eol") => (tpu::cmd::doctor::DoctorFix::None, true),
+                Some("all") => (tpu::cmd::doctor::DoctorFix::Peel, true),
+                Some(other) => {
+                    return Err(format!(
+                    "invalid value for `fix`: {other:?}; expected \"none\", \"peel\", \"eol\", or \"all\""
                 )
                 .into());
-            }
-            None => {
-                return Err(format!("invalid value for `fix`: expected a string, got {v}").into());
-            }
-        },
-    };
+                }
+                None => {
+                    return Err(
+                        format!("invalid value for `fix`: expected a string, got {v}").into(),
+                    );
+                }
+            },
+        };
+        // `eol`/`all` require a repository root to resolve git's expected line
+        // endings; reject early with a clear message rather than silently no-op.
+        let git_root = git_root_arg(args);
+        if fix_eol && git_root.is_none() {
+            return Err("doctor: `fix: \"eol\"`/`\"all\"` requires a `git_root` argument".into());
+        }
 
-    let on_error = match args.get("on_error") {
-        None => config.default_on_error,
-        Some(v) => match v.as_str() {
-            Some("warn") => tpu::cmd::copy::OnError::Warn,
-            Some("fail") => tpu::cmd::copy::OnError::Fail,
-            Some(other) => {
-                return Err(format!(
-                    "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
-                )
-                .into());
-            }
-            None => {
-                return Err(
-                    format!("invalid value for `on_error`: expected a string, got {v}").into(),
-                );
-            }
-        },
-    };
+        let on_error = match args.get("on_error") {
+            None => config.default_on_error,
+            Some(v) => match v.as_str() {
+                Some("warn") => tpu::cmd::copy::OnError::Warn,
+                Some("fail") => tpu::cmd::copy::OnError::Fail,
+                Some(other) => {
+                    return Err(format!(
+                        "invalid value for `on_error`: {other:?}; expected \"warn\" or \"fail\""
+                    )
+                    .into());
+                }
+                None => {
+                    return Err(format!(
+                        "invalid value for `on_error`: expected a string, got {v}"
+                    )
+                    .into());
+                }
+            },
+        };
 
-    let opts = tpu::cmd::doctor::DoctorOptions {
-        format: tpu::cmd::doctor::DoctorFormat::Json,
-        fix,
-        quiet: true,
-        guess: false,
-    };
+        let opts = tpu::cmd::doctor::DoctorOptions {
+            format: tpu::cmd::doctor::DoctorFormat::Json,
+            fix,
+            quiet: true,
+            guess: false,
+        };
 
-    let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
-    let mut walk_warnings: Vec<String> = Vec::new();
-    let mut sink: Vec<u8> = Vec::new();
-    let report = tpu::cmd::doctor::run_with_policy(
-        &path_refs,
-        opts,
-        &mut sink,
-        tpu::IoMode::Buffered,
-        on_error,
-        &mut walk_warnings,
-    )?;
+        let path_refs: Vec<&str> = all_paths.iter().map(String::as_str).collect();
+        let mut walk_warnings: Vec<String> = Vec::new();
+        let mut sink: Vec<u8> = Vec::new();
+        let report = tpu::cmd::doctor::run_with_policy(
+            &path_refs,
+            opts,
+            &mut sink,
+            tpu::IoMode::Buffered,
+            on_error,
+            &mut walk_warnings,
+            git_root.as_deref(),
+            fix_eol,
+        )?;
 
-    let files: Vec<Value> = report
-        .issues
-        .iter()
-        .map(|issue| {
-            let matches: Vec<Value> = issue
-                .mojibake_matches
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "byte_offset": m.byte_offset,
-                        "line": m.line,
-                        "col": m.col,
-                        "pattern": m.pattern.name(),
+        let files: Vec<Value> = report
+            .issues
+            .iter()
+            .map(|issue| {
+                let matches: Vec<Value> = issue
+                    .mojibake_matches
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "byte_offset": m.byte_offset,
+                            "line": m.line,
+                            "col": m.col,
+                            "pattern": m.pattern.name(),
+                        })
                     })
-                })
-                .collect();
-            let rc_matches: Vec<Value> = issue
-                .replacement_char_matches
-                .iter()
-                .map(|m| {
-                    serde_json::json!({
-                        "byte_offset": m.byte_offset,
-                        "line": m.line,
-                        "col": m.col,
-                        "context": m.context.as_str(),
-                        "suggested": m.suggested.map(|c| format!("U+{:04X}", c as u32)),
-                        "suggested_char": m.suggested.map(|c| c.to_string()),
+                    .collect();
+                let rc_matches: Vec<Value> = issue
+                    .replacement_char_matches
+                    .iter()
+                    .map(|m| {
+                        serde_json::json!({
+                            "byte_offset": m.byte_offset,
+                            "line": m.line,
+                            "col": m.col,
+                            "context": m.context.as_str(),
+                            "suggested": m.suggested.map(|c| format!("U+{:04X}", c as u32)),
+                            "suggested_char": m.suggested.map(|c| c.to_string()),
+                        })
                     })
+                    .collect();
+                serde_json::json!({
+                    "path": issue.path.display().to_string(),
+                    "encoding_detected": issue.encoding_detected,
+                    "valid_in_detected_encoding": issue.valid_in_detected_encoding,
+                    "mojibake_matches": matches,
+                    "replacement_char_matches": rc_matches,
+                    "peel_suggested": issue.peel_suggested.is_some(),
+                    "repaired": issue.repaired,
+                    "eol_mismatch": issue.eol_mismatch.map(|m| serde_json::json!({
+                        "expected": tpu::git::line_ending_name(m.expected),
+                        "actual": tpu::git::line_ending_name(m.actual),
+                    })),
+                    "eol_repaired": issue.eol_repaired,
                 })
-                .collect();
-            serde_json::json!({
-                "path": issue.path.display().to_string(),
-                "encoding_detected": issue.encoding_detected,
-                "valid_in_detected_encoding": issue.valid_in_detected_encoding,
-                "mojibake_matches": matches,
-                "replacement_char_matches": rc_matches,
-                "peel_suggested": issue.peel_suggested.is_some(),
-                "repaired": issue.repaired,
             })
-        })
-        .collect();
+            .collect();
 
-    let doc = serde_json::json!({
-        "reason": "x-tpu-mcp-result",
-        "files": files,
-        "total_files_scanned": report.total_files_scanned,
-        "total_issues": report.total_issues(),
-        "total_repaired": report.total_repaired,
-        "walk_warnings": walk_warnings,
-    });
-    let result_line = serde_json::to_string(&doc)?;
-    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
-    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
+        let doc = serde_json::json!({
+            "reason": "x-tpu-mcp-result",
+            "files": files,
+            "total_files_scanned": report.total_files_scanned,
+            "total_issues": report.total_issues(),
+            "total_repaired": report.total_repaired,
+            "walk_warnings": walk_warnings,
+        });
+        let result_line = serde_json::to_string(&doc)?;
+        let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+        Ok(ToolResult::ok(format!(
+            "{header}\n{result_line}\n{status_line}"
+        )))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -2530,27 +2730,29 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
 fn call_stat_file(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_stat_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    let file = resolve_file_arg(args)?;
-    let meta = std::fs::metadata(&file)?;
-    let mtime_epoch_ms = mtime_as_epoch_ms(&meta);
-    let created_epoch_ms = meta
-        .created()
-        .ok()
-        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0);
-    let readonly = meta.permissions().readonly();
-    let size = meta.len();
-    let result_obj = serde_json::json!({
-        "reason": "x-tpu-mcp-result",
-        "size": size,
-        "mtime_epoch_ms": mtime_epoch_ms,
-        "created_epoch_ms": created_epoch_ms,
-        "readonly": readonly,
-    });
-    let result_line = serde_json::to_string(&result_obj)?;
-    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
-    Ok(ToolResult::ok(format!("{header}\n{result_line}\n{status_line}")))
+        let file = resolve_file_arg(args)?;
+        let meta = std::fs::metadata(&file)?;
+        let mtime_epoch_ms = mtime_as_epoch_ms(&meta);
+        let created_epoch_ms = meta
+            .created()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let readonly = meta.permissions().readonly();
+        let size = meta.len();
+        let result_obj = serde_json::json!({
+            "reason": "x-tpu-mcp-result",
+            "size": size,
+            "mtime_epoch_ms": mtime_epoch_ms,
+            "created_epoch_ms": created_epoch_ms,
+            "readonly": readonly,
+        });
+        let result_line = serde_json::to_string(&result_obj)?;
+        let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+        Ok(ToolResult::ok(format!(
+            "{header}\n{result_line}\n{status_line}"
+        )))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -2558,22 +2760,22 @@ fn call_stat_file(args: &Value) -> ToolResult {
 fn call_validate_file(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_validate_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
-    // `tpu` has no standalone `validate` subcommand; --validate is a pre-write
-    // flag on `tpu write`.  This tool calls the library directly to avoid an
-    // unnecessary write operation.
-    let file = resolve_file_arg(args)?;
-    let selector = require_str(args, "selector")?;
-    let value = require_str(args, "value")?;
+        // `tpu` has no standalone `validate` subcommand; --validate is a pre-write
+        // flag on `tpu write`.  This tool calls the library directly to avoid an
+        // unnecessary write operation.
+        let file = resolve_file_arg(args)?;
+        let selector = require_str(args, "selector")?;
+        let value = require_str(args, "value")?;
 
-    let is_binary = args
-        .get("is_binary")
-        .and_then(|v| v.as_bool())
-        .unwrap_or_else(|| is_binary_selector(selector));
+        let is_binary = args
+            .get("is_binary")
+            .and_then(|v| v.as_bool())
+            .unwrap_or_else(|| is_binary_selector(selector));
 
-    let pairs = vec![selector.to_string(), value.to_string()];
-    tpu::cmd::validate::run_all(&pairs, Path::new(&file), is_binary, tpu::IoMode::Buffered)?;
-    let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
-    Ok(ToolResult::ok(format!("{header}\n{status_line}")))
+        let pairs = vec![selector.to_string(), value.to_string()];
+        tpu::cmd::validate::run_all(&pairs, Path::new(&file), is_binary, tpu::IoMode::Buffered)?;
+        let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+        Ok(ToolResult::ok(format!("{header}\n{status_line}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -2634,6 +2836,16 @@ pub struct ServerConfig {
     /// Default: `true` on Windows, `false` elsewhere.  Disable with
     /// `--no-io-worker` (or `TPU_MCP_NO_IO_WORKER=1`).
     pub io_worker_enabled: bool,
+
+    /// When true, mutating tools (`tpu_write_file`, `tpu_replace_in_file`,
+    /// `tpu_edit_file`, `tpu_append_file`) normalise the target file's line
+    /// endings to git's expected convention — but only when the call also
+    /// supplies a `git_root` and does not pass an explicit `line_ending`.
+    ///
+    /// Off by default (writes never silently change line endings).  Enabled
+    /// by the `--eol-normalize` flag or `TPU_EOL_NORMALIZE=1`, which the VS
+    /// Code extension forwards from its `tpu.normalizeLineEndings` setting.
+    pub eol_normalize: bool,
 }
 
 /// How much per-entry detail tree-walking tools should include in their
@@ -2656,6 +2868,7 @@ impl Default for ServerConfig {
             default_on_error: tpu::cmd::copy::OnError::Warn,
             progress_detail: ProgressDetail::EachFile,
             io_worker_enabled: cfg!(windows),
+            eol_normalize: false,
         }
     }
 }
@@ -2678,6 +2891,7 @@ impl ServerConfig {
             "trace": self.trace,
             "default_on_error": on_error,
             "progress_detail": progress_detail,
+            "eol_normalize": self.eol_normalize,
         })
     }
 
@@ -2701,11 +2915,16 @@ impl ServerConfig {
             Some("summary") => ProgressDetail::Summary,
             Some(other) => return Err(format!("unknown progress_detail: {other:?}")),
         };
+        let eol_normalize = v
+            .get("eol_normalize")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(d.eol_normalize);
         Ok(ServerConfig {
             verify_delay_ms,
             trace,
             default_on_error,
             progress_detail,
+            eol_normalize,
             // Always false inside the worker — the worker is the leaf that
             // actually performs file I/O.  Routing through another worker
             // would loop.
@@ -3476,6 +3695,7 @@ mod integration_tests {
                 default_on_error: tpu::cmd::copy::OnError::Warn,
                 progress_detail: ProgressDetail::EachFile,
                 io_worker_enabled: false,
+                eol_normalize: false,
             },
         )?;
         if tr.is_error {
@@ -3511,7 +3731,11 @@ mod integration_tests {
             .filter(|l| serde_json::from_str::<serde_json::Value>(l.trim()).is_err())
             .filter(|l| !l.trim().is_empty())
             .collect();
-        assert_eq!(content_lines.len(), 2, "expected 2 matching lines; got: {result:?}");
+        assert_eq!(
+            content_lines.len(),
+            2,
+            "expected 2 matching lines; got: {result:?}"
+        );
         assert!(
             content_lines[0].contains("alpha fox here"),
             "line 0 must contain 'alpha fox here'; got: {:?}",
@@ -4113,7 +4337,10 @@ mod integration_tests {
         let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
 
         let result = ndjson_result_line(&out);
-        assert_eq!(result["reason"], "x-tpu-mcp-result", "result line must be present; full output: {out:?}");
+        assert_eq!(
+            result["reason"], "x-tpu-mcp-result",
+            "result line must be present; full output: {out:?}"
+        );
 
         for metric in ["lines", "words", "chars", "bytes"] {
             assert!(
@@ -4200,13 +4427,11 @@ mod integration_tests {
         let f = dir.path().join("count_stats.txt");
         fs::write(&f, "hello\n").unwrap();
 
-        for stats_flag in [
-            serde_json::json!(true),
-            serde_json::json!(false),
-        ] {
+        for stats_flag in [serde_json::json!(true), serde_json::json!(false)] {
             let args = serde_json::json!({ "file": f.to_str().unwrap(), "stats": stats_flag });
-            let out = call("tpu_count_file", &args)
-                .unwrap_or_else(|e| panic!("tpu_count_file must succeed (stats={stats_flag}): {e}"));
+            let out = call("tpu_count_file", &args).unwrap_or_else(|e| {
+                panic!("tpu_count_file must succeed (stats={stats_flag}): {e}")
+            });
             let result = ndjson_result_line(&out);
             for key in ["encoding", "bom", "line_ending"] {
                 assert!(
@@ -4218,7 +4443,8 @@ mod integration_tests {
 
         // Also test with no stats arg at all.
         let args = serde_json::json!({ "file": f.to_str().unwrap() });
-        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed (no stats arg)");
+        let out =
+            call("tpu_count_file", &args).expect("tpu_count_file must succeed (no stats arg)");
         let result = ndjson_result_line(&out);
         for key in ["encoding", "bom", "line_ending"] {
             assert!(

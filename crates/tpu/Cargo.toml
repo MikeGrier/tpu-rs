@@ -21,7 +21,7 @@ name = "tpu"
 path = "src/main.rs"
 
 [dependencies]
-harrier     = "0.1.2"
+harrier     = "0.2.0"
 redwing     = "0.3.0"
 anstream    = { workspace = true }
 anstyle     = { workspace = true }
@@ -37,6 +37,10 @@ md-5 = "0.10"
 crc32fast = "1"
 globset = "0.4"
 walkdir = "2"
+# Git-aware line-ending detection: pure-Rust gitoxide. `attributes` pulls in
+# gix-filter (eol), gix-attributes, excludes and index support; `sha1`
+# satisfies gix's requirement that at least one hash algorithm be enabled.
+gix = { version = "0.85", default-features = false, features = ["attributes", "sha1"] }
 
 [target."cfg(windows)".dependencies]
 # MoveFileExW for atomic replace-existing rename in copy_one.

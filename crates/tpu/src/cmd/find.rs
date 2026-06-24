@@ -195,8 +195,7 @@ pub fn expand_paths_with_policy(
                                     .path()
                                     .map(|p| p.display().to_string())
                                     .unwrap_or_else(|| "?".to_string());
-                                warnings_out
-                                    .push(format!("find: cannot access {path_hint}: {e}"));
+                                warnings_out.push(format!("find: cannot access {path_hint}: {e}"));
                                 continue;
                             }
                         },

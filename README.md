@@ -64,6 +64,12 @@ win32-arm64).
   optionally repairs existing damage.
 - **Round-trips real-world encodings.** UTF-8, UTF-16LE/BE, Windows-1252,
   Shift-JIS, and CRLF/LF/CR line endings are detected and preserved.
+- **Git-aware line endings (opt-in).** Pass a repository root (`--git-root`
+  on the CLI, or a `git_root` argument over MCP) to detect when a file's
+  on-disk line endings disagree with git's expected convention (per
+  `.gitattributes` / `core.autocrlf` / `core.eol`); reads surface a `note:`,
+  and `tpu doctor --fix=eol` (or `tpu_doctor` with `fix: "eol"`) normalises
+  them. Write-time normalisation is available but off by default.
 - **Safer than shelling out.** Atomic writes, automatic `.bak` backups,
   pre-flight `validate` selectors, and walk tools that warn on
   inaccessible entries instead of aborting mid-tree.

@@ -725,14 +725,17 @@ fn mcp_it_12_doctor_scan_and_peel() {
         json!({ "path": dirty.to_str().unwrap(), "fix": "peel" }),
     );
     let vp = ndjson_result_line(&peel);
-    assert_eq!(vp["total_repaired"].as_u64().unwrap(), 1, "peel result: {vp}");
+    assert_eq!(
+        vp["total_repaired"].as_u64().unwrap(),
+        1,
+        "peel result: {vp}"
+    );
 
     // Post-repair, the file's bytes must be the UTF-8 for "cafe<U+00E9>\n"
     // (one peel layer removes the spurious wrapping).
     let repaired_bytes = std::fs::read(&dirty).expect("dirty file readable post-repair");
     assert_eq!(
-        repaired_bytes,
-        b"caf\xc3\xa9\n",
+        repaired_bytes, b"caf\xc3\xa9\n",
         "peel must recover the original UTF-8 bytes; got: {repaired_bytes:?}"
     );
 
@@ -751,7 +754,10 @@ fn mcp_it_12_doctor_scan_and_peel() {
 fn mcp_it_13_doctor_requires_path() {
     let mut s = McpSession::start();
     s.initialize();
-    let result = s.rpc("tools/call", json!({ "name": "tpu_doctor", "arguments": {} }));
+    let result = s.rpc(
+        "tools/call",
+        json!({ "name": "tpu_doctor", "arguments": {} }),
+    );
     assert_eq!(
         result.get("isError").and_then(|v| v.as_bool()),
         Some(true),
