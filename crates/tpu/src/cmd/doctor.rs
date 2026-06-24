@@ -530,16 +530,12 @@ fn diagnose_file(
         };
     let decoded_text: &str = &decoded;
 
-    // Allow-marker opt-out for the *whole file* (suppresses all mojibake /
-    // replacement-char diagnostics).  A git line-ending mismatch is a separate
-    // concern and is still reported even when the marker is present.
-    if mojibake::allowed_by_marker(decoded_text) {
-        return Ok(eol_only_issue(path, encoding_name, eol_mismatch));
-    }
-
     if had_errors {
         // Encoding-invalid: don't bother running the mojibake scan, the
-        // replacement chars would create false positives.
+        // replacement chars would create false positives.  This is checked
+        // *before* the allow-marker opt-out because that marker only
+        // suppresses mojibake / replacement-char diagnostics — it does not
+        // assert that the bytes are valid in their detected encoding.
         return Ok(Some(DoctorIssue {
             path: path.to_path_buf(),
             encoding_detected: encoding_name,
@@ -551,6 +547,13 @@ fn diagnose_file(
             eol_mismatch,
             eol_repaired: false,
         }));
+    }
+
+    // Allow-marker opt-out for the *whole file* (suppresses all mojibake /
+    // replacement-char diagnostics).  A git line-ending mismatch is a separate
+    // concern and is still reported even when the marker is present.
+    if mojibake::allowed_by_marker(decoded_text) {
+        return Ok(eol_only_issue(path, encoding_name, eol_mismatch));
     }
 
     let report = mojibake::scan(decoded_text);
@@ -1353,6 +1356,25 @@ mod tests {
         let p = write(&tmp, "ok.txt", body.as_bytes());
         let res = diagnose_file(&p, IoMode::Buffered, false, None).unwrap();
         assert!(res.is_none());
+    }
+
+    #[test]
+    fn allow_marker_does_not_suppress_encoding_invalid() {
+        let tmp = TempDir::new().unwrap();
+        // A UTF-8 BOM forces UTF-8 detection; the lone 0xFF byte is then
+        // invalid in that encoding (`had_errors == true`).  The
+        // `allow-mojibake` marker must NOT suppress the *encoding-invalid*
+        // diagnostic — it only suppresses mojibake / replacement-char
+        // findings.  Regression for PR #41 review discussion r3470390733.
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(format!("// {}\n", mojibake::ALLOW_MARKER).as_bytes());
+        bytes.extend_from_slice(b"broken\xFFhere\n");
+        let p = write(&tmp, "marked-but-invalid.txt", &bytes);
+        let issue = diagnose_file(&p, IoMode::Buffered, false, None)
+            .unwrap()
+            .expect("encoding-invalid file must still be flagged despite the marker");
+        assert!(!issue.valid_in_detected_encoding);
+        assert!(issue.mojibake_matches.is_empty());
     }
 
     #[test]
