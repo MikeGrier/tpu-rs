@@ -114,20 +114,23 @@ pub(crate) fn bom_bytes_for(encoding: &'static encoding_rs::Encoding) -> &'stati
 /// Scan `bytes` in 2-byte (UTF-16 code-unit) steps, replacing every
 /// occurrence of the 2-byte `needle` with `replacement`.
 ///
-/// Bytes that do not match the needle are forwarded one byte at a time.
-/// Any odd-length tail (which should not occur in valid UTF-16 but is
-/// forwarded safely rather than silently dropped).
+/// Both the scan and the forwarding advance a whole code unit (2 bytes) at a
+/// time, so the `needle` is only ever matched on a code-unit boundary.  A
+/// 1-byte scan would let `needle` straddle two adjacent units (e.g. the high
+/// byte of one unit plus the low byte of the next) and corrupt the stream.
+/// Any odd-length tail (which should not occur in valid UTF-16) is forwarded
+/// rather than silently dropped.
 pub(crate) fn replace_u16_pairs(bytes: &[u8], needle: [u8; 2], replacement: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 20);
     let mut i = 0;
     while i + 1 < bytes.len() {
         if bytes[i] == needle[0] && bytes[i + 1] == needle[1] {
             out.extend_from_slice(replacement);
-            i += 2;
         } else {
             out.push(bytes[i]);
-            i += 1;
+            out.push(bytes[i + 1]);
         }
+        i += 2;
     }
     if i < bytes.len() {
         out.push(bytes[i]);
@@ -350,5 +353,43 @@ mod tests {
     #[test]
     fn output_encoding_variants_are_distinct() {
         assert_ne!(OutputEncoding::Preserve, OutputEncoding::Utf8);
+    }
+
+    // ── replace_u16_pairs (UTF-16 code-unit stepping) ────────────────────────
+
+    #[test]
+    fn replace_u16_pairs_replaces_aligned_needle() {
+        // UTF-16LE: 'A' (U+0041) followed by an LF code unit (U+000A).
+        let bytes = [0x41, 0x00, 0x0A, 0x00];
+        let out = replace_u16_pairs(&bytes, [0x0A, 0x00], &[0x0D, 0x00, 0x0A, 0x00]);
+        assert_eq!(out, [0x41, 0x00, 0x0D, 0x00, 0x0A, 0x00]);
+    }
+
+    #[test]
+    fn replace_u16_pairs_ignores_cross_code_unit_false_match() {
+        // UTF-16LE: U+0A41 then U+0100 -> bytes 41 0A 00 01.  A 1-byte scan
+        // would see [0x0A, 0x00] straddling the two code units at offset 1 and
+        // corrupt the stream; a 2-byte scan must leave the input untouched.
+        let bytes = [0x41, 0x0A, 0x00, 0x01];
+        let out = replace_u16_pairs(&bytes, [0x0A, 0x00], &[0x0D, 0x00, 0x0A, 0x00]);
+        assert_eq!(out, bytes);
+    }
+
+    #[test]
+    fn replace_u16_pairs_forwards_odd_trailing_byte() {
+        // Malformed odd-length input: the trailing byte is preserved.
+        let bytes = [0x0A, 0x00, 0x42];
+        let out = replace_u16_pairs(&bytes, [0x0A, 0x00], &[0x0D, 0x00, 0x0A, 0x00]);
+        assert_eq!(out, [0x0D, 0x00, 0x0A, 0x00, 0x42]);
+    }
+
+    #[test]
+    fn apply_line_ending_to_all_utf16le_preserves_cross_unit_bytes() {
+        // U+0A41, U+0100, then an actual LF unit (U+000A).  Converting to CRLF
+        // must rewrite only the real line ending and leave the first two units
+        // intact (no spurious match at the odd byte boundary).
+        let bytes = vec![0x41, 0x0A, 0x00, 0x01, 0x0A, 0x00];
+        let out = apply_line_ending_to_all(bytes, encoding_rs::UTF_16LE, LineEnding::CrLf);
+        assert_eq!(out, [0x41, 0x0A, 0x00, 0x01, 0x0D, 0x00, 0x0A, 0x00]);
     }
 }

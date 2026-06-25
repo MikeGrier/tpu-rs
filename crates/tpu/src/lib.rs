@@ -216,8 +216,12 @@ pub fn recover_stranded_backup(file: &Path) -> io::Result<bool> {
 /// - If `file` does not exist, parent directories are created first and the
 ///   temp file is persisted directly.
 ///
-/// Every filesystem mutation is wrapped in [`retry_io`] so a transient Windows
-/// AV/Defender sharing violation does not fail the write.
+/// The directory-creation, rename, and persist steps are each wrapped in
+/// [`retry_io`] so a transient Windows AV/Defender sharing violation does not
+/// fail the write.  The temp-file `write_all`/`flush` are not retried — a
+/// partially written temp file cannot be safely re-driven without extra
+/// bookkeeping, and a failure there simply discards the (not-yet-installed)
+/// temp file, leaving the original untouched.
 ///
 /// Callers remain responsible for any pre-write content checks (e.g. the
 /// mojibake guard) and post-write side effects (e.g. diff emission); this
