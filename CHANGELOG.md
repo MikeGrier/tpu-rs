@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.5.1](https://github.com/MikeGrier/tpu-rs/compare/v0.5.0...v0.5.1) (2026-06-25)
+
+
+### Bug Fixes
+
+* correct replace --line-ending on UTF-16 and unify atomic writes ([38cb035](https://github.com/MikeGrier/tpu-rs/commit/38cb035de623e22fada3cd376b924a56a7fb38ee))
+* step replace_u16_pairs by whole UTF-16 code units ([c801d57](https://github.com/MikeGrier/tpu-rs/commit/c801d570d247997f74e7f03ed4e9a545d17a93f0))
+
 ## [0.5.0](https://github.com/MikeGrier/tpu-rs/compare/v0.4.0...v0.5.0) (2026-06-25)
 
 
