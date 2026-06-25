@@ -1297,17 +1297,19 @@ fn run(
                 &file,
                 &pattern,
                 &decoded_replacement,
-                multiline,
-                fixed_strings,
-                le_override,
                 diff_out,
-                count,
-                dry_run,
-                IoMode::Mmap,
-                if allow_mojibake {
-                    mojibake::WritePolicy::permissive()
-                } else {
-                    mojibake::WritePolicy::default()
+                cmd::replace::ReplaceOptions {
+                    multiline,
+                    fixed_strings,
+                    line_ending_override: le_override,
+                    count_only: count,
+                    dry_run,
+                    io_mode: IoMode::Mmap,
+                    policy: if allow_mojibake {
+                        mojibake::WritePolicy::permissive()
+                    } else {
+                        mojibake::WritePolicy::default()
+                    },
                 },
             )?;
             if count {
@@ -1861,17 +1863,19 @@ fn run(
                 &path_refs,
                 &pattern_refs,
                 glob.as_deref(),
-                fixed_strings,
-                multiline,
-                ignore_case,
-                all_match,
-                invert,
-                before,
-                after,
-                count,
-                numbers,
+                cmd::find::FindOptions {
+                    fixed_string: fixed_strings,
+                    multiline,
+                    ignore_case,
+                    all_match,
+                    invert,
+                    lines_before: before,
+                    lines_after: after,
+                    count_only: count,
+                    numbers,
+                    io_mode: IoMode::Mmap,
+                },
                 &mut buf,
-                IoMode::Mmap,
                 on_error_mode,
                 &mut walk_warnings,
             );

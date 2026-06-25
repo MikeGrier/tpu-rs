@@ -59,14 +59,13 @@ fn replace_rejects_replacement_that_introduces_mojibake() {
         &path,
         "world",
         replacement_bytes,
-        false, // multiline
-        true,  // fixed_strings
-        None,  // line_ending_override
-        None,  // diff_out
-        false, // count_only
-        false, // dry_run
-        tpu::IoMode::Buffered,
-        WritePolicy::default(),
+        None, // diff_out
+        tpu::cmd::replace::ReplaceOptions {
+            fixed_strings: true,
+            io_mode: tpu::IoMode::Buffered,
+            policy: WritePolicy::default(),
+            ..Default::default()
+        },
     )
     .expect_err("replace must reject newly-introduced mojibake");
 
@@ -102,14 +101,13 @@ fn replace_with_allow_mojibake_flag_succeeds() {
         &path,
         "world",
         replacement_bytes,
-        false,
-        true,
         None,
-        None,
-        false,
-        false,
-        tpu::IoMode::Buffered,
-        WritePolicy::permissive(),
+        tpu::cmd::replace::ReplaceOptions {
+            fixed_strings: true,
+            io_mode: tpu::IoMode::Buffered,
+            policy: WritePolicy::permissive(),
+            ..Default::default()
+        },
     )
     .expect("replace must succeed when guard is permissive");
 
