@@ -596,11 +596,8 @@ mod tests {
             bytes.extend_from_slice(&unit.to_le_bytes());
         }
 
-        let mut f = NamedTempFile::new().unwrap();
-        f.write_all(&bytes).unwrap();
-        f.flush().unwrap();
-        let path = f.path().to_path_buf();
-        drop(f);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("input.txt");
         fs::write(&path, &bytes).unwrap();
 
         run_test(
@@ -616,10 +613,7 @@ mod tests {
         )
         .unwrap();
 
-        let result = fs::read(&path).unwrap();
-        let _ = fs::remove_file(format!("{}.bak", path.display()));
-        let _ = fs::remove_file(&path);
-        result
+        fs::read(&path).unwrap()
     }
 
     #[test]
