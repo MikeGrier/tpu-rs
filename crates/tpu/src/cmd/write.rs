@@ -152,8 +152,8 @@ pub fn run(
     // Denormalise: substitute each LF code unit with the target line ending.
     let encoded_bytes = match target_le {
         LineEnding::Lf => encoded.into_owned(),
-        LineEnding::CrLf => denormalize_lf_to_crlf(&encoded, target_encoding),
-        LineEnding::Cr => denormalize_lf_to_cr(&encoded, target_encoding),
+        LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, target_encoding),
+        LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, target_encoding),
     };
 
     // Prepend BOM if required.
@@ -199,82 +199,6 @@ fn detect_target(
     let source = Source::new(branch, SourceConfig::default())?;
     let had_bom = source.bom_len() > 0;
     Ok((source.encoding(), source.line_ending(), had_bom))
-}
-
-// ── LF denormalisation helpers ────────────────────────────────────────────────
-//
-// Each helper replaces logical LF code units in `bytes` — which are in the
-// native representation for the given encoding — with CRLF or CR.
-//
-// For UTF-16LE:  LF = [0x0A, 0x00]       CRLF = [0x0D, 0x00, 0x0A, 0x00]
-// For UTF-16BE:  LF = [0x00, 0x0A]       CRLF = [0x00, 0x0D, 0x00, 0x0A]
-// All others:    LF = [0x0A]              CRLF = [0x0D, 0x0A]
-//
-// The input bytes come directly from encoding_rs::Encoding::encode(), so they
-// contain only LF (not CRLF) because the source string had '\n' characters.
-// There is therefore no risk of double-inserting CR before an existing CR.
-
-fn denormalize_lf_to_crlf(bytes: &[u8], encoding: &'static Encoding) -> Vec<u8> {
-    if encoding == encoding_rs::UTF_16LE {
-        replace_u16_pairs(bytes, [0x0A, 0x00], &[0x0D, 0x00, 0x0A, 0x00])
-    } else if encoding == encoding_rs::UTF_16BE {
-        replace_u16_pairs(bytes, [0x00, 0x0A], &[0x00, 0x0D, 0x00, 0x0A])
-    } else {
-        insert_cr_before_lf(bytes)
-    }
-}
-
-fn denormalize_lf_to_cr(bytes: &[u8], encoding: &'static Encoding) -> Vec<u8> {
-    if encoding == encoding_rs::UTF_16LE {
-        replace_u16_pairs(bytes, [0x0A, 0x00], &[0x0D, 0x00])
-    } else if encoding == encoding_rs::UTF_16BE {
-        replace_u16_pairs(bytes, [0x00, 0x0A], &[0x00, 0x0D])
-    } else {
-        bytes
-            .iter()
-            .map(|&b| if b == 0x0A { 0x0D } else { b })
-            .collect()
-    }
-}
-
-/// Scan `bytes` in 2-byte (UTF-16 code-unit) steps, replacing every
-/// occurrence of the 2-byte `needle` with `replacement`.
-///
-/// Bytes that do not match the needle are forwarded one byte at a time.
-/// This handles any odd-length tail (which should not occur in valid UTF-16
-/// but is forwarded safely rather than silently dropped).
-fn replace_u16_pairs(bytes: &[u8], needle: [u8; 2], replacement: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 20);
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == needle[0] && bytes[i + 1] == needle[1] {
-            out.extend_from_slice(replacement);
-            i += 2;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    if i < bytes.len() {
-        out.push(bytes[i]);
-    }
-    out
-}
-
-/// Insert `\r` (0x0D) before each `\n` (0x0A) byte in a single-byte or
-/// multi-byte UTF-8 stream.
-///
-/// Only `\n` bytes are targeted; no byte in a valid UTF-8 or single-byte
-/// encoding can be confused with `\n` (0x0A is never a continuation byte).
-fn insert_cr_before_lf(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 20);
-    for &b in bytes {
-        if b == 0x0A {
-            out.push(0x0D);
-        }
-        out.push(b);
-    }
-    out
 }
 
 // ── Diff helpers ──────────────────────────────────────────────────────────────
