@@ -126,13 +126,13 @@ pub fn run(
     // ── Denormalise LF → target line ending ───────────────────────────────────
     let encoded_bytes = match target_le {
         LineEnding::Lf => encoded,
-        LineEnding::CrLf => denormalize_lf_to_crlf(&encoded, encoding),
-        LineEnding::Cr => denormalize_lf_to_cr(&encoded, encoding),
+        LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, encoding),
+        LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, encoding),
     };
 
     // ── Re-prepend BOM if the original file had one ───────────────────────────
     let output_bytes: Vec<u8> = if had_bom {
-        let bom: &[u8] = bom_bytes_for(encoding);
+        let bom: &[u8] = crate::encoding::bom_bytes_for(encoding);
         let mut v = Vec::with_capacity(bom.len() + encoded_bytes.len());
         v.extend_from_slice(bom);
         v.extend_from_slice(&encoded_bytes);
@@ -145,85 +145,4 @@ pub fn run(
     crate::atomic_write(file, &output_bytes)?;
 
     Ok(())
-}
-
-// ── BOM helpers ───────────────────────────────────────────────────────────────
-
-/// Return the BOM byte sequence for `encoding`, or an empty slice if none.
-fn bom_bytes_for(encoding: &'static encoding_rs::Encoding) -> &'static [u8] {
-    if encoding == encoding_rs::UTF_8 {
-        &[0xEF, 0xBB, 0xBF]
-    } else if encoding == encoding_rs::UTF_16LE {
-        &[0xFF, 0xFE]
-    } else if encoding == encoding_rs::UTF_16BE {
-        &[0xFE, 0xFF]
-    } else {
-        &[]
-    }
-}
-
-// ── LF denormalisation helpers ────────────────────────────────────────────────
-//
-// These replace logical LF code units (in the target encoding's native
-// representation) with CRLF or CR.  The logic mirrors write.rs exactly.
-//
-// For UTF-16LE:  LF = [0x0A, 0x00]       CRLF = [0x0D, 0x00, 0x0A, 0x00]
-// For UTF-16BE:  LF = [0x00, 0x0A]       CRLF = [0x00, 0x0D, 0x00, 0x0A]
-// All others:    LF = [0x0A]              CRLF = [0x0D, 0x0A]
-
-fn denormalize_lf_to_crlf(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> Vec<u8> {
-    if encoding == encoding_rs::UTF_16LE {
-        replace_u16_pairs(bytes, [0x0A, 0x00], &[0x0D, 0x00, 0x0A, 0x00])
-    } else if encoding == encoding_rs::UTF_16BE {
-        replace_u16_pairs(bytes, [0x00, 0x0A], &[0x00, 0x0D, 0x00, 0x0A])
-    } else {
-        insert_cr_before_lf(bytes)
-    }
-}
-
-fn denormalize_lf_to_cr(bytes: &[u8], encoding: &'static encoding_rs::Encoding) -> Vec<u8> {
-    if encoding == encoding_rs::UTF_16LE {
-        replace_u16_pairs(bytes, [0x0A, 0x00], &[0x0D, 0x00])
-    } else if encoding == encoding_rs::UTF_16BE {
-        replace_u16_pairs(bytes, [0x00, 0x0A], &[0x00, 0x0D])
-    } else {
-        bytes
-            .iter()
-            .map(|&b| if b == 0x0A { 0x0D } else { b })
-            .collect()
-    }
-}
-
-/// Replace all 2-byte `needle` occurrences in `bytes` with `replacement`.
-///
-/// Scans in 2-byte steps; any odd trailing byte is forwarded unchanged.
-fn replace_u16_pairs(bytes: &[u8], needle: [u8; 2], replacement: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 20);
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == needle[0] && bytes[i + 1] == needle[1] {
-            out.extend_from_slice(replacement);
-            i += 2;
-        } else {
-            out.push(bytes[i]);
-            i += 1;
-        }
-    }
-    if i < bytes.len() {
-        out.push(bytes[i]);
-    }
-    out
-}
-
-/// Insert `\r` (0x0D) before each `\n` (0x0A) byte in a single-byte or
-/// multi-byte encoding stream.
-fn insert_cr_before_lf(bytes: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 20);
-    for &b in bytes {
-        if b == 0x0A {
-            out.push(0x0D);
-        }
-        out.push(b);
-    }
-    out
 }

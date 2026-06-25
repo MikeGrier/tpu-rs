@@ -83,6 +83,204 @@ pub fn parse_line_ending(
     }
 }
 
+// ── Line-ending denormalisation / normalisation (native byte space) ───────────
+//
+// These helpers operate directly on a file's *native* encoded bytes — they
+// never decode to UTF-8 and re-encode.  That matters because:
+//   * `encoding_rs` has no UTF-16 *encoder*: `Encoding::encode` silently falls
+//     back to UTF-8 for UTF-16LE/BE, which would corrupt the stream.
+//   * decode()/encode() round-trips strip (and fail to re-add) a leading BOM.
+// Operating on native bytes leaves the BOM and every non-newline byte
+// untouched, and keeps UTF-16 code units correctly aligned.
+//
+// Encoding-specific line-ending code units:
+//   UTF-16LE  CR = [0x0D, 0x00]  LF = [0x0A, 0x00]  CRLF = [0x0D,0x00,0x0A,0x00]
+//   UTF-16BE  CR = [0x00, 0x0D]  LF = [0x00, 0x0A]  CRLF = [0x00,0x0D,0x00,0x0A]
+//   All else  CR = [0x0D]        LF = [0x0A]        CRLF = [0x0D, 0x0A]
+
+/// Return the BOM byte sequence for `encoding`, or an empty slice if none.
+pub(crate) fn bom_bytes_for(encoding: &'static encoding_rs::Encoding) -> &'static [u8] {
+    if encoding == encoding_rs::UTF_8 {
+        &[0xEF, 0xBB, 0xBF]
+    } else if encoding == encoding_rs::UTF_16LE {
+        &[0xFF, 0xFE]
+    } else if encoding == encoding_rs::UTF_16BE {
+        &[0xFE, 0xFF]
+    } else {
+        &[]
+    }
+}
+
+/// Scan `bytes` in 2-byte (UTF-16 code-unit) steps, replacing every
+/// occurrence of the 2-byte `needle` with `replacement`.
+///
+/// Bytes that do not match the needle are forwarded one byte at a time.
+/// Any odd-length tail (which should not occur in valid UTF-16 but is
+/// forwarded safely rather than silently dropped).
+pub(crate) fn replace_u16_pairs(bytes: &[u8], needle: [u8; 2], replacement: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 20);
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == needle[0] && bytes[i + 1] == needle[1] {
+            out.extend_from_slice(replacement);
+            i += 2;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    if i < bytes.len() {
+        out.push(bytes[i]);
+    }
+    out
+}
+
+/// Insert `\r` (0x0D) before each `\n` (0x0A) byte in a single-byte or
+/// multi-byte UTF-8 stream.
+///
+/// Only `\n` bytes are targeted; no byte in a valid UTF-8 or single-byte
+/// encoding can be confused with `\n` (0x0A is never a continuation byte).
+pub(crate) fn insert_cr_before_lf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 20);
+    for &b in bytes {
+        if b == 0x0A {
+            out.push(0x0D);
+        }
+        out.push(b);
+    }
+    out
+}
+
+/// Convert LF-only native `bytes` to CRLF endings for `encoding`.
+///
+/// The input must already be LF-only (e.g. straight from
+/// `Encoding::encode`), so there is no risk of double-inserting CR before an
+/// existing CR.
+pub(crate) fn denormalize_lf_to_crlf(
+    bytes: &[u8],
+    encoding: &'static encoding_rs::Encoding,
+) -> Vec<u8> {
+    if encoding == encoding_rs::UTF_16LE {
+        replace_u16_pairs(bytes, [0x0A, 0x00], &[0x0D, 0x00, 0x0A, 0x00])
+    } else if encoding == encoding_rs::UTF_16BE {
+        replace_u16_pairs(bytes, [0x00, 0x0A], &[0x00, 0x0D, 0x00, 0x0A])
+    } else {
+        insert_cr_before_lf(bytes)
+    }
+}
+
+/// Convert LF-only native `bytes` to lone-CR endings for `encoding`.
+///
+/// The input must already be LF-only (see [`denormalize_lf_to_crlf`]).
+pub(crate) fn denormalize_lf_to_cr(
+    bytes: &[u8],
+    encoding: &'static encoding_rs::Encoding,
+) -> Vec<u8> {
+    if encoding == encoding_rs::UTF_16LE {
+        replace_u16_pairs(bytes, [0x0A, 0x00], &[0x0D, 0x00])
+    } else if encoding == encoding_rs::UTF_16BE {
+        replace_u16_pairs(bytes, [0x00, 0x0A], &[0x00, 0x0D])
+    } else {
+        bytes
+            .iter()
+            .map(|&b| if b == 0x0A { 0x0D } else { b })
+            .collect()
+    }
+}
+
+/// Normalise CRLF and lone-CR endings to LF in a single-byte / UTF-8 stream.
+///
+/// `0x0D` / `0x0A` are unambiguous line-ending bytes in every non-UTF-16
+/// encoding harrier detects (UTF-8 continuation bytes and Shift-JIS trailing
+/// bytes never take those values), so a byte-level scan is safe.
+pub(crate) fn normalize_bytes_to_lf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x0D {
+            // CR (lone) or CRLF → LF.
+            out.push(0x0A);
+            if i + 1 < bytes.len() && bytes[i + 1] == 0x0A {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Normalise CRLF and lone-CR endings to LF in a UTF-16 stream, given the
+/// 2-byte `cr` and `lf` code units in the correct byte order.
+///
+/// Scans in 2-byte (code-unit) steps so a `0x0D` / `0x0A` byte that happens to
+/// be one half of an unrelated code unit (e.g. `U+0D00`) is never mistaken for
+/// a line terminator.
+pub(crate) fn normalize_u16_to_lf(bytes: &[u8], cr: [u8; 2], lf: [u8; 2]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == cr[0] && bytes[i + 1] == cr[1] {
+            // CR unit (lone) or CRLF → LF unit.
+            out.extend_from_slice(&lf);
+            if i + 3 < bytes.len() && bytes[i + 2] == lf[0] && bytes[i + 3] == lf[1] {
+                i += 4;
+            } else {
+                i += 2;
+            }
+        } else {
+            out.push(bytes[i]);
+            out.push(bytes[i + 1]);
+            i += 2;
+        }
+    }
+    if i < bytes.len() {
+        // Odd trailing byte (should not occur in valid UTF-16); forward it.
+        out.push(bytes[i]);
+    }
+    out
+}
+
+/// Rewrite every line ending in `bytes` (in the file's native `encoding`) to
+/// `target`, leaving the BOM and all non-newline bytes untouched.
+///
+/// The input is first normalised to LF-only in native byte space, then the
+/// `target` ending is applied.  No decode/re-encode round-trip is performed.
+pub(crate) fn apply_line_ending_to_all(
+    bytes: Vec<u8>,
+    encoding: &'static encoding_rs::Encoding,
+    target: LineEnding,
+) -> Vec<u8> {
+    if encoding == encoding_rs::UTF_16LE {
+        let lf = normalize_u16_to_lf(&bytes, [0x0D, 0x00], [0x0A, 0x00]);
+        match target {
+            LineEnding::Lf => lf,
+            LineEnding::CrLf => replace_u16_pairs(&lf, [0x0A, 0x00], &[0x0D, 0x00, 0x0A, 0x00]),
+            LineEnding::Cr => replace_u16_pairs(&lf, [0x0A, 0x00], &[0x0D, 0x00]),
+        }
+    } else if encoding == encoding_rs::UTF_16BE {
+        let lf = normalize_u16_to_lf(&bytes, [0x00, 0x0D], [0x00, 0x0A]);
+        match target {
+            LineEnding::Lf => lf,
+            LineEnding::CrLf => replace_u16_pairs(&lf, [0x00, 0x0A], &[0x00, 0x0D, 0x00, 0x0A]),
+            LineEnding::Cr => replace_u16_pairs(&lf, [0x00, 0x0A], &[0x00, 0x0D]),
+        }
+    } else {
+        let lf = normalize_bytes_to_lf(&bytes);
+        match target {
+            LineEnding::Lf => lf,
+            LineEnding::CrLf => insert_cr_before_lf(&lf),
+            LineEnding::Cr => lf
+                .iter()
+                .map(|&b| if b == 0x0A { 0x0D } else { b })
+                .collect(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
