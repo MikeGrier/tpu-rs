@@ -19,15 +19,13 @@
 //! [`WritePolicy::permissive`] / `--allow-mojibake` /
 //! `"allow_mojibake": true` to override.
 
-use std::{fs, io::Write, path::Path, sync::Arc};
-
 use harrier::{
     denormalise::DenormaliseWriter,
     encoding::{LineEnding, SourceConfig},
     source::Source,
     view::View,
 };
-use tempfile::NamedTempFile;
+use std::{fs, io::Write, path::Path, sync::Arc};
 
 use crate::{
     IoMode,
@@ -217,33 +215,8 @@ fn run_binary(
     drop(b2);
     drop(branch);
 
-    // Atomic write: temp → rename original to .bak → persist temp.
-    let dir = file
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut tmp = NamedTempFile::new_in(dir)?;
-    tmp.write_all(&out_bytes)?;
-
-    let bak_path = format!("{}.bak", file.display());
-    crate::retry_io(|| fs::rename(file, &bak_path))?;
-    let mut tmp = Some(tmp);
-    crate::retry_io(|| {
-        let t = tmp
-            .take()
-            .expect("persist retry: temp file already consumed");
-        match t.persist(file) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                tmp = Some(e.file);
-                Err(e.error)
-            }
-        }
-    })
-    .map_err(|e| {
-        let _ = crate::retry_io(|| fs::rename(&bak_path, file)); // best-effort restore
-        e
-    })?;
+    // Atomic write via the shared temp→.bak→persist→restore helper.
+    crate::atomic_write(file, &out_bytes)?;
 
     Ok(op_count)
 }
@@ -395,32 +368,8 @@ fn run_line(
             .map_err(|e| format!("edit: {}: {e}", file.display()))?;
     }
 
-    let dir = file
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut tmp = NamedTempFile::new_in(dir)?;
-    tmp.write_all(&out_bytes)?;
-
-    let bak_path = format!("{}.bak", file.display());
-    crate::retry_io(|| fs::rename(file, &bak_path))?;
-    let mut tmp = Some(tmp);
-    crate::retry_io(|| {
-        let t = tmp
-            .take()
-            .expect("persist retry: temp file already consumed");
-        match t.persist(file) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                tmp = Some(e.file);
-                Err(e.error)
-            }
-        }
-    })
-    .map_err(|e| {
-        let _ = crate::retry_io(|| fs::rename(&bak_path, file)); // best-effort restore
-        e
-    })?;
+    // Atomic write via the shared temp→.bak→persist→restore helper.
+    crate::atomic_write(file, &out_bytes)?;
 
     // Emit the unified text diff after a successful write.
     if let (Some(out), Some(old)) = (diff_out, old_norm) {

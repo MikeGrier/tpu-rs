@@ -40,7 +40,7 @@
 //! cause.  Pass [`WritePolicy::permissive`] / `--allow-mojibake` /
 //! `"allow_mojibake": true` to override.
 
-use std::{fs, io::Write, path::Path, sync::Arc};
+use std::{io::Write, path::Path, sync::Arc};
 
 use harrier::{
     denormalise::DenormaliseWriter,
@@ -48,7 +48,6 @@ use harrier::{
     source::Source,
 };
 use regex::bytes::Regex;
-use tempfile::NamedTempFile;
 
 use crate::{
     IoMode,
@@ -216,18 +215,6 @@ pub fn run(
 
     let out_bytes = redwing::materialize(&*b2)?;
 
-    // If --line-ending was specified, the branch/splice mechanism only applied
-    // the target line ending to replacement regions; unmatched regions still
-    // carry the original file's line endings.  Normalize the entire output to
-    // LF then re-denormalise to the target so that the whole file uses the
-    // requested line ending.
-    let out_bytes: Vec<u8> = if line_ending_override.is_some() {
-        let lf_only: Vec<u8> = out_bytes.into_iter().filter(|&b| b != b'\r').collect();
-        denormalize_bytes(&lf_only, line_ending)
-    } else {
-        out_bytes
-    };
-
     // Release all branch and view handles before any file-system work.
     // On Windows a memory-mapped file cannot be renamed while a mapping is open.
     drop(splices);
@@ -257,32 +244,8 @@ pub fn run(
                 .map_err(|e| format!("replace: {}: {e}", file.display()))?;
         }
 
-        let dir = file
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or(Path::new("."));
-        let mut tmp = NamedTempFile::new_in(dir)?;
-        tmp.write_all(&out_bytes)?;
-
-        let bak_path = format!("{}.bak", file.display());
-        crate::retry_io(|| fs::rename(file, &bak_path))?;
-        let mut tmp = Some(tmp);
-        crate::retry_io(|| {
-            let t = tmp
-                .take()
-                .expect("persist retry: temp file already consumed");
-            match t.persist(file) {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    tmp = Some(e.file);
-                    Err(e.error)
-                }
-            }
-        })
-        .map_err(|e| {
-            let _ = crate::retry_io(|| fs::rename(&bak_path, file)); // attempt to restore on failure
-            e
-        })?;
+        // Atomic write via the shared temp→.bak→persist→restore helper.
+        crate::atomic_write(file, &out_bytes)?;
     }
 
     // Emit the diff (for both --diff after a successful write and --dry-run).
@@ -334,52 +297,112 @@ fn denormalize_bytes(norm: &[u8], le: LineEnding) -> Vec<u8> {
 // When `line_ending_override` is Some, the spliced output still contains the
 // original file's line terminators in un-replaced regions.  The functions below
 // normalise the entire materialized output to the requested line ending in a
-// second pass, using the same encoding-aware approach as `cmd::write`.
+// second pass.
 //
-// Encoding-specific rules (same as write.rs):
-//   UTF-16LE  LF = [0x0A, 0x00]    CRLF = [0x0D, 0x00, 0x0A, 0x00]
-//   UTF-16BE  LF = [0x00, 0x0A]    CRLF = [0x00, 0x0D, 0x00, 0x0A]
-//   All else  LF = [0x0A]          CRLF = [0x0D, 0x0A]
+// This works entirely in the file's *native* byte space — it never decodes to
+// UTF-8 and re-encodes.  That matters for two reasons:
+//   * encoding_rs has no UTF-16 *encoder*: `Encoding::encode` silently falls
+//     back to UTF-8 for UTF-16LE/BE, which would corrupt the stream.
+//   * decode()/encode() round-trips strip (and fail to re-add) a leading BOM.
+// Operating on native bytes leaves the BOM and every non-newline byte
+// untouched, and keeps UTF-16 code units correctly aligned.
+//
+// Encoding-specific line-ending code units:
+//   UTF-16LE  CR = [0x0D, 0x00]  LF = [0x0A, 0x00]  CRLF = [0x0D,0x00,0x0A,0x00]
+//   UTF-16BE  CR = [0x00, 0x0D]  LF = [0x00, 0x0A]  CRLF = [0x00,0x0D,0x00,0x0A]
+//   All else  CR = [0x0D]        LF = [0x0A]        CRLF = [0x0D, 0x0A]
 
-/// Decode `bytes` (using `encoding`), normalise all line endings to LF in
-/// UTF-8 text space, re-encode, then apply the `target` line ending via
-/// encoding-aware denormalisation.
+/// Rewrite every line ending in `bytes` (in the file's native `encoding`) to
+/// `target`, leaving the BOM and all non-newline bytes untouched.
+///
+/// The input is first normalised to LF-only in native byte space, then the
+/// `target` ending is applied.  No decode/re-encode round-trip is performed.
 fn apply_line_ending_to_all(
     bytes: Vec<u8>,
     encoding: &'static encoding_rs::Encoding,
     target: LineEnding,
 ) -> Vec<u8> {
-    // decode() converts any encoding (incl. UTF-16LE/BE) to UTF-8.
-    let (decoded, _, _) = encoding.decode(&bytes);
-    // Normalise CRLF and bare CR to LF in text space.
-    let normalized = decoded.replace("\r\n", "\n").replace('\r', "\n");
-    // Re-encode to the file's original encoding (produces LF code units).
-    let (re_encoded, _, _) = encoding.encode(&normalized);
-    // Apply the target line ending.
-    match target {
-        LineEnding::Lf => re_encoded.into_owned(),
-        LineEnding::CrLf => {
-            if encoding == encoding_rs::UTF_16LE {
-                le_replace_pairs(&re_encoded, [0x0A, 0x00], &[0x0D, 0x00, 0x0A, 0x00])
-            } else if encoding == encoding_rs::UTF_16BE {
-                le_replace_pairs(&re_encoded, [0x00, 0x0A], &[0x00, 0x0D, 0x00, 0x0A])
-            } else {
-                le_insert_cr_before_lf(&re_encoded)
-            }
+    if encoding == encoding_rs::UTF_16LE {
+        let lf = normalize_u16_to_lf(&bytes, [0x0D, 0x00], [0x0A, 0x00]);
+        match target {
+            LineEnding::Lf => lf,
+            LineEnding::CrLf => le_replace_pairs(&lf, [0x0A, 0x00], &[0x0D, 0x00, 0x0A, 0x00]),
+            LineEnding::Cr => le_replace_pairs(&lf, [0x0A, 0x00], &[0x0D, 0x00]),
         }
-        LineEnding::Cr => {
-            if encoding == encoding_rs::UTF_16LE {
-                le_replace_pairs(&re_encoded, [0x0A, 0x00], &[0x0D, 0x00])
-            } else if encoding == encoding_rs::UTF_16BE {
-                le_replace_pairs(&re_encoded, [0x00, 0x0A], &[0x00, 0x0D])
-            } else {
-                re_encoded
-                    .iter()
-                    .map(|&b| if b == 0x0A { 0x0D } else { b })
-                    .collect()
-            }
+    } else if encoding == encoding_rs::UTF_16BE {
+        let lf = normalize_u16_to_lf(&bytes, [0x00, 0x0D], [0x00, 0x0A]);
+        match target {
+            LineEnding::Lf => lf,
+            LineEnding::CrLf => le_replace_pairs(&lf, [0x00, 0x0A], &[0x00, 0x0D, 0x00, 0x0A]),
+            LineEnding::Cr => le_replace_pairs(&lf, [0x00, 0x0A], &[0x00, 0x0D]),
+        }
+    } else {
+        let lf = normalize_bytes_to_lf(&bytes);
+        match target {
+            LineEnding::Lf => lf,
+            LineEnding::CrLf => le_insert_cr_before_lf(&lf),
+            LineEnding::Cr => lf
+                .iter()
+                .map(|&b| if b == 0x0A { 0x0D } else { b })
+                .collect(),
         }
     }
+}
+
+/// Normalise CRLF and lone-CR endings to LF in a single-byte / UTF-8 stream.
+///
+/// `0x0D` / `0x0A` are unambiguous line-ending bytes in every non-UTF-16
+/// encoding harrier detects (UTF-8 continuation bytes and Shift-JIS trailing
+/// bytes never take those values), so a byte-level scan is safe.
+fn normalize_bytes_to_lf(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x0D {
+            // CR (lone) or CRLF → LF.
+            out.push(0x0A);
+            if i + 1 < bytes.len() && bytes[i + 1] == 0x0A {
+                i += 2;
+            } else {
+                i += 1;
+            }
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Normalise CRLF and lone-CR endings to LF in a UTF-16 stream, given the
+/// 2-byte `cr` and `lf` code units in the correct byte order.
+///
+/// Scans in 2-byte (code-unit) steps so a `0x0D` / `0x0A` byte that happens to
+/// be one half of an unrelated code unit (e.g. `U+0D00`) is never mistaken for
+/// a line terminator.
+fn normalize_u16_to_lf(bytes: &[u8], cr: [u8; 2], lf: [u8; 2]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == cr[0] && bytes[i + 1] == cr[1] {
+            // CR unit (lone) or CRLF → LF unit.
+            out.extend_from_slice(&lf);
+            if i + 3 < bytes.len() && bytes[i + 2] == lf[0] && bytes[i + 3] == lf[1] {
+                i += 4;
+            } else {
+                i += 2;
+            }
+        } else {
+            out.push(bytes[i]);
+            out.push(bytes[i + 1]);
+            i += 2;
+        }
+    }
+    if i < bytes.len() {
+        // Odd trailing byte (should not occur in valid UTF-16); forward it.
+        out.push(bytes[i]);
+    }
+    out
 }
 
 /// Scan `bytes` in 2-byte steps, replacing every occurrence of `needle`
@@ -670,6 +693,92 @@ mod tests {
         let content = b"one\r\ntwo\r\n";
         let (out, _) = replace_file(content, "^two", b"TWO", true, false);
         assert_eq!(out, b"one\r\nTWO\r\n");
+    }
+
+    /// Encode `text` (LF-only) as UTF-16LE with a BOM, mapping each `\n` to the
+    /// `ending` byte sequence, then run `replace` with `line_ending_override`
+    /// and return the resulting raw file bytes.
+    fn replace_utf16le_with_override(
+        text_lf: &str,
+        ending: &str,
+        pattern: &str,
+        replacement: &[u8],
+        line_ending_override: Option<LineEnding>,
+    ) -> Vec<u8> {
+        let native = text_lf.replace('\n', ending);
+        let mut bytes: Vec<u8> = vec![0xFF, 0xFE]; // UTF-16LE BOM
+        for unit in native.encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(&bytes).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+        drop(f);
+        fs::write(&path, &bytes).unwrap();
+
+        run_test(
+            &path,
+            pattern,
+            replacement,
+            false,
+            false,
+            line_ending_override,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        let result = fs::read(&path).unwrap();
+        let _ = fs::remove_file(format!("{}.bak", path.display()));
+        let _ = fs::remove_file(&path);
+        result
+    }
+
+    #[test]
+    fn replace_utf16le_line_ending_crlf_to_lf() {
+        // Regression for the double line-ending pass.  The old, non-encoding-
+        // aware first pass stripped *every* 0x0D byte regardless of code-unit
+        // alignment — including the 0x0D of each `[0x0D,0x00]` CR unit — which
+        // misaligned the whole UTF-16 stream before the second pass decoded it.
+        //
+        // `--line-ending` rewrites *all* endings whole-file even when the
+        // pattern matches nothing (matching is incidental here; note that
+        // `replace` matches against the file's native bytes, so an ASCII
+        // pattern does not match UTF-16-encoded text anyway).  The output must
+        // still decode cleanly, keep its BOM, and carry LF-only endings.
+        let out = replace_utf16le_with_override(
+            "foo\nbar\n",
+            "\r\n",
+            "no-such-match",
+            b"",
+            Some(LineEnding::Lf),
+        );
+        // Result is valid UTF-16LE (even length, BOM preserved).
+        assert_eq!(out.len() % 2, 0, "UTF-16LE byte length must stay even");
+        assert_eq!(&out[..2], &[0xFF, 0xFE], "BOM must be preserved");
+        let (decoded, _, had_errors) = encoding_rs::UTF_16LE.decode(&out);
+        assert!(!had_errors, "decoded with replacement chars: {decoded:?}");
+        assert_eq!(decoded, "foo\nbar\n");
+        assert!(!decoded.contains('\r'), "CRLF was not converted to LF");
+    }
+
+    #[test]
+    fn replace_utf16le_line_ending_lf_to_crlf() {
+        let out = replace_utf16le_with_override(
+            "foo\nbar\n",
+            "\n",
+            "no-such-match",
+            b"",
+            Some(LineEnding::CrLf),
+        );
+        assert_eq!(out.len() % 2, 0, "UTF-16LE byte length must stay even");
+        assert_eq!(&out[..2], &[0xFF, 0xFE], "BOM must be preserved");
+        let (decoded, _, had_errors) = encoding_rs::UTF_16LE.decode(&out);
+        assert!(!had_errors, "decoded with replacement chars: {decoded:?}");
+        assert_eq!(decoded, "foo\r\nbar\r\n");
     }
 
     #[test]

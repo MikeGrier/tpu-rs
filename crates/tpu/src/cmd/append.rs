@@ -20,12 +20,7 @@
 //! Pass [`WritePolicy::permissive`] / `--allow-mojibake` /
 //! `"allow_mojibake": true` to override.
 
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{fs, io::Write, path::Path, sync::Arc};
 
 use harrier::{
     encoding::{LineEnding, SourceConfig},
@@ -146,35 +141,8 @@ pub fn run(
         encoded_bytes
     };
 
-    // ── Atomic write via temp file in the same directory ─────────────────────
-    let dir = file
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-
-    let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
-    tmp.write_all(&output_bytes)?;
-    tmp.flush()?;
-
-    let bak = PathBuf::from(format!("{}.bak", file.display()));
-    crate::retry_io(|| fs::rename(file, &bak))?;
-    let mut tmp = Some(tmp);
-    crate::retry_io(|| {
-        let t = tmp
-            .take()
-            .expect("persist retry: temp file already consumed");
-        match t.persist(file) {
-            Ok(_) => Ok(()),
-            Err(e) => {
-                tmp = Some(e.file);
-                Err(e.error)
-            }
-        }
-    })
-    .map_err(|e| {
-        let _ = crate::retry_io(|| fs::rename(&bak, file)); // attempt to restore original
-        e
-    })?;
+    // ── Atomic write via the shared temp→.bak→persist→restore helper ─────────
+    crate::atomic_write(file, &output_bytes)?;
 
     Ok(())
 }

@@ -20,7 +20,7 @@ use tpu::IoMode;
 // Re-export library functions so that cmd modules (which are compiled in both
 // the lib and bin crate contexts) can use `crate::open_as_branch` etc.
 pub use tpu::git;
-pub use tpu::{open_as_branch, read_raw_bytes, recover_stranded_backup, retry_io};
+pub use tpu::{atomic_write, open_as_branch, read_raw_bytes, recover_stranded_backup, retry_io};
 
 /// Resolve the line-ending override for a mutating write
 /// (`write`/`replace`/`edit`/`append`).

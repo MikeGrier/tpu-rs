@@ -284,6 +284,30 @@ represent non-printable characters.
 
 ---
 
+## Security / trust boundary
+
+`tpu-mcp` is a general-purpose **local** file editor. By design it imposes **no
+workspace-root confinement**: any path the host user can access can be read or
+written, including absolute paths and `file://` URIs outside the current
+project (the `file` argument is only scheme-stripped and percent-decoded, not
+restricted). The trust boundary is the same as the user's own shell.
+
+Because the call surface is an LLM tool, treat this the way you would treat
+giving a shell to an automated agent:
+
+- A prompt-injected agent could be steered to read or overwrite sensitive
+  paths (e.g. `~/.ssh/...`, credential files). Run the server under an account
+  or sandbox whose filesystem permissions are scoped to what the agent should
+  touch if that matters for your threat model.
+- The write-time mojibake guard is a **safety net, not a security control**: it
+  can be bypassed by content containing the `encoding-check: allow-mojibake`
+  marker, which an LLM can be steered to include.
+- User-supplied regular expressions go through the `regex` crate, which is
+  linear-time and not subject to catastrophic backtracking, so untrusted
+  patterns cannot cause a regex-DoS.
+
+---
+
 ## Git-aware line endings (opt-in)
 
 `tpu-mcp` can detect when a file's on-disk line endings differ from what git

@@ -352,6 +352,15 @@ pub fn run_worker() -> ! {
 
     let stdin = io::stdin();
     let stdout = io::stdout();
+    // INVARIANT: this `stdout` is a structured protocol channel — the worker
+    // pipe carries newline-delimited JSON and nothing else.  (The same is true
+    // of the MCP server's own stdout, which speaks JSON-RPC.)  A stray
+    // `println!`/`print!`/direct stdout write from `tpu` library code or any
+    // dependency would interleave noise into the framing and break the parent's
+    // line reader.  All payload must flow through `write_response`; everything
+    // diagnostic must go to stderr.  `tpu` is disciplined about writing to
+    // caller-supplied `Vec<u8>`/`Write` buffers rather than stdout — keep it
+    // that way.
     let mut out = stdout.lock();
 
     for line in stdin.lock().lines() {
