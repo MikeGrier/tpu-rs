@@ -794,9 +794,12 @@ fn is_utf16(encoding_name: &str) -> bool {
 /// The transform operates at the byte level and is only correct for
 /// ASCII-transparent encodings (UTF-8, Windows-1252, Shift-JIS, …) where the
 /// `0x0D` / `0x0A` line-ending bytes never appear inside a multi-byte
-/// character.  UTF-16 files are left untouched (still reported) because their
-/// line endings are multi-byte and would be corrupted by a byte-level pass.
-/// Sets `issue.eol_repaired` only when bytes were actually rewritten.
+/// character.  UTF-16 never reaches the rewrite path: [`diagnose_file`] skips
+/// it during detection (`eol_mismatch` is always `None`), so UTF-16 EOL
+/// mismatches are neither reported nor repaired.  The `is_utf16` guard below
+/// is therefore a belt-and-suspenders no-op that keeps the two code paths in
+/// lock-step.  Sets `issue.eol_repaired` only when bytes were actually
+/// rewritten.
 fn apply_eol_fix(issue: &mut DoctorIssue, io_mode: IoMode) -> Result<(), Box<dyn Error>> {
     let Some(mismatch) = issue.eol_mismatch else {
         return Ok(());

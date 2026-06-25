@@ -120,7 +120,7 @@ struct Cli {
     /// whatever git would materialise for that path (per `.gitattributes`
     /// and `core.autocrlf` / `core.eol`).  Can also be enabled via the
     /// `TPU_EOL_NORMALIZE` environment variable (forwarded by the VS Code
-    /// extension's `tpu.normalizeLineEndings` setting).
+    /// extension's `tpu-mcp.normalizeLineEndings` setting).
     #[arg(long, global = true)]
     eol_normalize: bool,
 
@@ -1042,7 +1042,7 @@ fn run(
     };
     // Write-time line-ending normalisation (default off).  Enabled by the
     // `--eol-normalize` flag or the `TPU_EOL_NORMALIZE` environment variable
-    // (the VS Code extension forwards its `tpu.normalizeLineEndings` setting
+    // (the VS Code extension forwards its `tpu-mcp.normalizeLineEndings` setting
     // this way).  Only takes effect when `--git-root` is also supplied.
     let eol_normalize = cli.eol_normalize || std::env::var_os("TPU_EOL_NORMALIZE").is_some();
     let on_error_mode = match cli.on_error.as_str() {

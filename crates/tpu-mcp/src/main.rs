@@ -383,7 +383,7 @@ fn parse_config() -> (tools::ServerConfig, Vec<String>) {
     let mut io_worker_enabled: bool =
         cfg!(windows) && std::env::var_os("TPU_MCP_NO_IO_WORKER").is_none_or(|v| v.is_empty());
     // Write-time line-ending normalisation (default off).  The VS Code
-    // extension forwards its `tpu.normalizeLineEndings` setting as the env
+    // extension forwards its `tpu-mcp.normalizeLineEndings` setting as the env
     // var; the `--eol-normalize` flag below overrides it on.
     let mut eol_normalize: bool =
         std::env::var_os("TPU_EOL_NORMALIZE").is_some_and(|v| !v.is_empty());
