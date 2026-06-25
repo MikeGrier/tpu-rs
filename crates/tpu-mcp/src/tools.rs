@@ -3214,6 +3214,18 @@ fn mojibake_policy_from_args(args: &Value) -> tpu::mojibake::WritePolicy {
 ///   2. Minimal percent-decoding: `%3A` → `:`, `%2F` → `/`, `%5C` → `\`,
 ///      and all other `%XX` sequences.  Windows drive-letter colons are
 ///      sometimes percent-encoded by strict URI serialisers.
+///
+/// ## Trust boundary
+///
+/// This function performs **no workspace-root confinement**: the returned
+/// path is whatever the caller asked for, and the tool will read or write any
+/// path the host user can access.  That is intentional for a general-purpose
+/// local file editor, but because the call surface is an LLM tool, a
+/// prompt-injected agent could be steered to touch sensitive paths (e.g.
+/// `~/.ssh/...`).  The trust boundary is therefore the same as the user's own
+/// shell — operators who need confinement should run the server under an
+/// account or sandbox with appropriately scoped filesystem permissions.  See
+/// the "Security / trust boundary" section of the tpu-mcp README.
 fn resolve_file_arg(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let raw = require_str(args, "file")?;
     Ok(normalize_file_path(raw))

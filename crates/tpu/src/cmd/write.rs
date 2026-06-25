@@ -23,18 +23,13 @@
 //! [`crate::mojibake::ALLOW_MARKER`] sentinel are never flagged
 //! regardless of policy.
 
-use std::{
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
-};
+use std::{fs, io::Write, path::Path};
 
 use encoding_rs::Encoding;
 use harrier::{
     encoding::{LineEnding, SourceConfig},
     source::Source,
 };
-use tempfile::NamedTempFile;
 
 use crate::{
     IoMode,
@@ -171,58 +166,8 @@ pub fn run(
         encoded_bytes
     };
 
-    // Write atomically via a temp file in the same directory (same filesystem).
-    // For new files, ensure parent directories exist before creating the temp
-    // file (NamedTempFile::new_in fails if the directory doesn't exist yet).
-    let dir = file
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-
-    let file_exists = file.try_exists()?;
-    if !file_exists {
-        fs::create_dir_all(dir)?;
-    }
-
-    let mut tmp = NamedTempFile::new_in(dir)?;
-    tmp.write_all(&output_bytes)?;
-    tmp.flush()?;
-
-    if file_exists {
-        let bak = PathBuf::from(format!("{}.bak", file.display()));
-        crate::retry_io(|| fs::rename(file, &bak))?;
-        let mut tmp = Some(tmp);
-        crate::retry_io(|| {
-            let t = tmp
-                .take()
-                .expect("persist retry: temp file already consumed");
-            match t.persist(file) {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    tmp = Some(e.file);
-                    Err(e.error)
-                }
-            }
-        })
-        .map_err(|e| {
-            let _ = crate::retry_io(|| fs::rename(&bak, file)); // attempt to restore
-            e
-        })?;
-    } else {
-        let mut tmp = Some(tmp);
-        crate::retry_io(|| {
-            let t = tmp
-                .take()
-                .expect("persist retry: temp file already consumed");
-            match t.persist(file) {
-                Ok(_) => Ok(()),
-                Err(e) => {
-                    tmp = Some(e.file);
-                    Err(e.error)
-                }
-            }
-        })?;
-    }
+    // Atomic write via the shared temp→.bak→persist→restore helper.
+    crate::atomic_write(file, &output_bytes)?;
 
     // Emit the text diff after a successful write.
     if let (Some(out), Some(old)) = (diff_out, old_bytes) {
@@ -398,36 +343,19 @@ pub fn run_binary(
     new_bytes: &[u8],
     diff_out: Option<&mut dyn Write>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = crate::recover_stranded_backup(file);
+
     // Read old bytes for diff (before any overwrite).
     let old_bytes: Option<Vec<u8>> = if diff_out.is_some() && file.exists() {
-        Some(fs::read(file)?)
+        Some(crate::retry_io(|| fs::read(file))?)
     } else {
         None
     };
 
-    let dir = file
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(Path::new("."));
-    let mut tmp = NamedTempFile::new_in(dir)?;
-    tmp.write_all(new_bytes)?;
-    tmp.flush()?;
-
-    if file.exists() {
-        let bak = PathBuf::from(format!("{}.bak", file.display()));
-        fs::rename(file, &bak)?;
-        if let Err(e) = tmp.persist(file) {
-            let _ = fs::rename(&bak, file);
-            return Err(e.error.into());
-        }
-    } else {
-        if let Some(parent) = file.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
-        }
-        tmp.persist(file).map_err(|e| e.error)?;
-    }
+    // Atomic write via the shared temp→.bak→persist→restore helper.  This
+    // creates parent directories first and wraps every filesystem mutation in
+    // `retry_io` for AV resilience — matching the text path.
+    crate::atomic_write(file, new_bytes)?;
 
     // Emit the binary diff after a successful write.
     if let (Some(out), Some(old)) = (diff_out, old_bytes) {
@@ -691,6 +619,19 @@ mod tests {
         run_binary(&path, &all, None).unwrap();
         assert_eq!(fs::read(&path).unwrap(), all);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn write_binary_creates_missing_parent_dirs() {
+        // Regression: `run_binary` previously created the temp file before
+        // `create_dir_all`, so writing into a not-yet-existent nested directory
+        // failed at temp-file creation.  Routing through `atomic_write` creates
+        // the parent directory first.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a").join("b").join("c").join("data.bin");
+        let content: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF];
+        run_binary(&path, content, None).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), content);
     }
 
     // ── run_binary: diff output ────────────────────────────────────────────────

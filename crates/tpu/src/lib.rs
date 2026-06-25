@@ -15,6 +15,7 @@ pub mod test_fixtures;
 use std::{
     error::Error,
     fs, io,
+    io::Write as _,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -22,6 +23,7 @@ use std::{
 
 use memmap2::MmapOptions;
 use redwing::Branch;
+use tempfile::NamedTempFile;
 
 /// Controls how tpu reads file content into a redwing branch.
 ///
@@ -193,6 +195,78 @@ pub fn recover_stranded_backup(file: &Path) -> io::Result<bool> {
     // an AV scan triggered by the very crash that stranded it.
     retry_io(|| fs::rename(&bak, file))?;
     Ok(true)
+}
+
+// ── Shared atomic write ───────────────────────────────────────────────────────
+
+/// Atomically replace (or create) `file` with `bytes`.
+///
+/// This is the single implementation of the temp→`.bak`→persist→restore swap
+/// shared by every mutating `cmd::*` command (`write`, `append`, `replace`,
+/// `edit`, and the binary `write` path).  Extracting it guarantees the
+/// resilience behaviour is uniform and prevents the variants from drifting
+/// apart.
+///
+/// Behaviour:
+/// - A temp file is created in `file`'s parent directory (same filesystem, so
+///   the final swap is a rename rather than a copy) and `bytes` written to it.
+/// - If `file` already exists it is first renamed to `<file>.bak`; the temp
+///   file is then persisted into place.  If the persist fails, the `.bak` is
+///   renamed back so the original content is never lost.
+/// - If `file` does not exist, parent directories are created first and the
+///   temp file is persisted directly.
+///
+/// Every filesystem mutation is wrapped in [`retry_io`] so a transient Windows
+/// AV/Defender sharing violation does not fail the write.
+///
+/// Callers remain responsible for any pre-write content checks (e.g. the
+/// mojibake guard) and post-write side effects (e.g. diff emission); this
+/// helper only performs the byte-for-byte atomic swap.
+pub fn atomic_write(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+
+    let file_exists = file.try_exists()?;
+    if !file_exists {
+        retry_io(|| fs::create_dir_all(dir))?;
+    }
+
+    let mut tmp = retry_io(|| NamedTempFile::new_in(dir))?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+
+    if file_exists {
+        let bak = backup_path_for(file);
+        retry_io(|| fs::rename(file, &bak))?;
+        persist_with_retry(tmp, file).inspect_err(|_e| {
+            let _ = retry_io(|| fs::rename(&bak, file)); // best-effort restore
+        })
+    } else {
+        persist_with_retry(tmp, file)
+    }
+}
+
+/// Persist `tmp` to `dest`, retrying on transient Windows AV errors.
+///
+/// On a transient failure the temp file (returned inside the `PersistError`)
+/// is recovered and the persist re-attempted, so retries do not leak the
+/// handle.
+fn persist_with_retry(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
+    let mut tmp = Some(tmp);
+    retry_io(|| {
+        let t = tmp
+            .take()
+            .expect("persist retry: temp file already consumed");
+        match t.persist(dest) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tmp = Some(e.file);
+                Err(e.error)
+            }
+        }
+    })
 }
 
 #[cfg(test)]
