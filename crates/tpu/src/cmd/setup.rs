@@ -190,7 +190,7 @@ to the repository root; there is no upward auto-discovery):
    mojibake. `eol`/`all` require `git_root`; the rewrite is atomic with a
    `<file>.bak` backup and UTF-16 files are skipped.
 3. **Normalise on write (off by default)**: when the server is started with
-   line-ending normalisation enabled (the `tpu.normalizeLineEndings` VS Code
+   line-ending normalisation enabled (the `tpu-mcp.normalizeLineEndings` VS Code
    setting, the `--eol-normalize` flag, or the `TPU_EOL_NORMALIZE` env var),
    mutating tools given a `git_root` denormalise to git's expected
    convention unless an explicit `line_ending` is supplied. This is **off by

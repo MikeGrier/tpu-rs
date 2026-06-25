@@ -24,3 +24,4 @@ serde_json  = { workspace = true }
 [dev-dependencies]
 tempfile = "3"
 sysinfo  = { version = "0.32", default-features = false, features = ["system"] }
+gix      = { version = "0.85", default-features = false, features = ["attributes", "sha1"] }

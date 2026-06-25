@@ -242,7 +242,7 @@ pub fn list() -> Value {
                         "description":
                             "Optional absolute path to a git repository root. When the \
                              server has line-ending normalisation enabled \
-                             (tpu.normalizeLineEndings setting / --eol-normalize / \
+                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
                              TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
                              write denormalises to git's expected convention for this path \
                              (per .gitattributes / core.autocrlf / core.eol). Off by \
@@ -362,7 +362,7 @@ pub fn list() -> Value {
                         "description":
                             "Optional absolute path to a git repository root. When the \
                              server has line-ending normalisation enabled \
-                             (tpu.normalizeLineEndings setting / --eol-normalize / \
+                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
                              TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
                              write denormalises to git's expected convention for this path. \
                              Off by default."
@@ -525,7 +525,7 @@ pub fn list() -> Value {
                         "description":
                             "Optional absolute path to a git repository root. When the \
                              server has line-ending normalisation enabled \
-                             (tpu.normalizeLineEndings setting / --eol-normalize / \
+                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
                              TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
                              write denormalises to git's expected convention for this path. \
                              Off by default."
@@ -912,7 +912,7 @@ pub fn list() -> Value {
                         "description":
                             "Optional absolute path to a git repository root. When the \
                              server has line-ending normalisation enabled \
-                             (tpu.normalizeLineEndings setting / --eol-normalize / \
+                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
                              TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
                              write denormalises to git's expected convention for this path. \
                              Off by default."
@@ -1932,7 +1932,8 @@ fn call_read_head(args: &Value) -> ToolResult {
         let file = resolve_file_arg(args)?;
         let path = std::path::Path::new(&file);
 
-        let mode = if let Some(n) = args.get("bytes").and_then(|v| v.as_u64()) {
+        let byte_mode = args.get("bytes").and_then(|v| v.as_u64());
+        let mode = if let Some(n) = byte_mode {
             tpu::cmd::head::HeadMode::Bytes { n }
         } else {
             let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -1946,7 +1947,14 @@ fn call_read_head(args: &Value) -> ToolResult {
         let mut buf: Vec<u8> = Vec::new();
         tpu::cmd::head::run(path, mode, &mut buf, tpu::IoMode::Buffered, None)?;
         let content = String::from_utf8(buf).map_err(|e| format!("head: non-UTF-8 output: {e}"))?;
-        let content = prepend_eol_note(args, &file, content);
+        // The EOL advisory only makes sense for line-oriented output; a byte
+        // slice has no notion of "the file's line endings" and prefixing a
+        // note would corrupt a byte-exact head.
+        let content = if byte_mode.is_some() {
+            content
+        } else {
+            prepend_eol_note(args, &file, content)
+        };
         Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
@@ -1958,7 +1966,8 @@ fn call_read_tail(args: &Value) -> ToolResult {
         let file = resolve_file_arg(args)?;
         let path = std::path::Path::new(&file);
 
-        let mode = if let Some(n) = args.get("bytes").and_then(|v| v.as_u64()) {
+        let byte_mode = args.get("bytes").and_then(|v| v.as_u64());
+        let mode = if let Some(n) = byte_mode {
             tpu::cmd::tail::TailMode::Bytes { n }
         } else {
             let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
@@ -1972,7 +1981,13 @@ fn call_read_tail(args: &Value) -> ToolResult {
         let mut buf: Vec<u8> = Vec::new();
         tpu::cmd::tail::run(path, mode, &mut buf, tpu::IoMode::Buffered, None)?;
         let content = String::from_utf8(buf).map_err(|e| format!("tail: non-UTF-8 output: {e}"))?;
-        let content = prepend_eol_note(args, &file, content);
+        // See `call_read_head`: the EOL advisory is line-oriented and must not
+        // be prefixed onto a byte-exact tail.
+        let content = if byte_mode.is_some() {
+            content
+        } else {
+            prepend_eol_note(args, &file, content)
+        };
         Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
@@ -2849,7 +2864,7 @@ pub struct ServerConfig {
     ///
     /// Off by default (writes never silently change line endings).  Enabled
     /// by the `--eol-normalize` flag or `TPU_EOL_NORMALIZE=1`, which the VS
-    /// Code extension forwards from its `tpu.normalizeLineEndings` setting.
+    /// Code extension forwards from its `tpu-mcp.normalizeLineEndings` setting.
     pub eol_normalize: bool,
 }
 
@@ -3424,6 +3439,71 @@ mod tests {
     fn git_root_arg_absent_or_empty_is_none() {
         assert_eq!(git_root_arg(&serde_json::json!({})), None);
         assert_eq!(git_root_arg(&serde_json::json!({ "git_root": "" })), None);
+    }
+
+    // -- EOL advisory is line-oriented: never prefixed onto byte output --
+
+    /// Build a repo whose `.gitattributes` forces `eol=lf`, write `name` with
+    /// CRLF endings (a mismatch git would flag), and return `(dir, file path)`.
+    fn repo_with_crlf_mismatch(name: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        gix::init(dir.path()).expect("git init");
+        std::fs::write(dir.path().join(".gitattributes"), "*.txt text eol=lf\n")
+            .expect("write .gitattributes");
+        let file = dir.path().join(name);
+        std::fs::write(&file, b"alpha\r\nbravo\r\ncharlie\r\n").expect("write file");
+        (dir, file)
+    }
+
+    #[test]
+    fn read_head_line_mode_prepends_eol_note() {
+        let (dir, file) = repo_with_crlf_mismatch("a.txt");
+        let args = serde_json::json!({
+            "file": file.to_string_lossy(),
+            "lines": 2,
+            "git_root": dir.path().to_string_lossy(),
+        });
+        let res = call_read_head(&args);
+        assert!(!res.is_error);
+        assert!(
+            res.text.contains("note:") && res.text.contains("line endings"),
+            "line-mode head should carry the EOL advisory: {}",
+            res.text
+        );
+    }
+
+    #[test]
+    fn read_head_byte_mode_omits_eol_note() {
+        let (dir, file) = repo_with_crlf_mismatch("a.txt");
+        let args = serde_json::json!({
+            "file": file.to_string_lossy(),
+            "bytes": 8,
+            "git_root": dir.path().to_string_lossy(),
+        });
+        let res = call_read_head(&args);
+        assert!(!res.is_error);
+        assert!(
+            !res.text.contains("note:"),
+            "byte-mode head must not prefix a line-oriented EOL note: {}",
+            res.text
+        );
+    }
+
+    #[test]
+    fn read_tail_byte_mode_omits_eol_note() {
+        let (dir, file) = repo_with_crlf_mismatch("a.txt");
+        let args = serde_json::json!({
+            "file": file.to_string_lossy(),
+            "bytes": 8,
+            "git_root": dir.path().to_string_lossy(),
+        });
+        let res = call_read_tail(&args);
+        assert!(!res.is_error);
+        assert!(
+            !res.text.contains("note:"),
+            "byte-mode tail must not prefix a line-oriented EOL note: {}",
+            res.text
+        );
     }
 
     // -- percent-decoding --
