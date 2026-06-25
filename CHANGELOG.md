@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.5.0](https://github.com/MikeGrier/tpu-rs/compare/v0.4.0...v0.5.0) (2026-06-25)
+
+
+### Features
+
+* **doctor:** git-aware line-ending detection and normalization ([d8d97a1](https://github.com/MikeGrier/tpu-rs/commit/d8d97a19d0b4094e4624b350928a9ad637c6bb87))
+
+
+### Bug Fixes
+
+* **ci:** install cross-compile target for pinned toolchain (1.95.0) not stable ([bab52be](https://github.com/MikeGrier/tpu-rs/commit/bab52be8cb4cf1e9275ed608eea898bfbb8a7234))
+* **doctor:** report encoding-invalid files even with allow-mojibake marker ([1f68e2d](https://github.com/MikeGrier/tpu-rs/commit/1f68e2d5e179b2a97bff6287012399a92409d16a))
+* **eol:** gate EOL note to line mode, correct setting name, fix UTF-16 docstring ([3da7840](https://github.com/MikeGrier/tpu-rs/commit/3da784001b39ba837d95fed66b0ca0447e922cb1))
+* **git:** report non-conforming EOL as actual; accept file:// git_root in MCP ([e27f883](https://github.com/MikeGrier/tpu-rs/commit/e27f8834128ed6e808018c77550cbb459d81e098))
+
 ## [0.4.0](https://github.com/MikeGrier/tpu-rs/compare/v0.3.1...v0.4.0) (2026-06-21)
 
 
