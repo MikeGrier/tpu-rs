@@ -481,6 +481,33 @@ fn run_single_file(
 
 // ── Public entry point ────────────────────────────────────────────────────────
 
+/// Options for [`run`] / [`run_with_policy`], bundling the many search flags
+/// so call sites name each field and cannot transpose the bare booleans
+/// (`fixed_string` / `multiline` / `ignore_case` / `all_match` / `invert`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FindOptions {
+    /// Treat each pattern as a literal fixed string rather than a regex.
+    pub fixed_string: bool,
+    /// Prepend `(?m)` so `^` / `$` match at LF boundaries.
+    pub multiline: bool,
+    /// Case-insensitive matching.
+    pub ignore_case: bool,
+    /// Require every pattern to match a line (AND) rather than any (OR).
+    pub all_match: bool,
+    /// Invert the match: emit lines that do *not* match.
+    pub invert: bool,
+    /// Number of context lines to emit before each match.
+    pub lines_before: usize,
+    /// Number of context lines to emit after each match.
+    pub lines_after: usize,
+    /// Emit only the match count, not the matching lines.
+    pub count_only: bool,
+    /// Prefix each emitted line with its 1-based line number.
+    pub numbers: bool,
+    /// File access strategy (mmap vs buffered).
+    pub io_mode: IoMode,
+}
+
 /// Run the `find` subcommand.
 ///
 /// Expands globs in `path_specs`, compiles `patterns` into regexes, and
@@ -488,38 +515,20 @@ fn run_single_file(
 ///
 /// The caller maps the returned [`FindResult`] to an exit code:
 /// `total_matches > 0` → 0, `total_matches == 0` → 1, `Err` → 2.
-#[allow(clippy::too_many_arguments, dead_code)]
+#[allow(dead_code)]
 pub fn run(
     path_specs: &[&str],
     patterns: &[&str],
     glob: Option<&str>,
-    fixed_string: bool,
-    multiline: bool,
-    ignore_case: bool,
-    all_match: bool,
-    invert: bool,
-    lines_before: usize,
-    lines_after: usize,
-    count_only: bool,
-    numbers: bool,
+    opts: FindOptions,
     out: &mut dyn Write,
-    io_mode: IoMode,
 ) -> Result<FindResult, Box<dyn std::error::Error>> {
     run_with_policy(
         path_specs,
         patterns,
         glob,
-        fixed_string,
-        multiline,
-        ignore_case,
-        all_match,
-        invert,
-        lines_before,
-        lines_after,
-        count_only,
-        numbers,
+        opts,
         out,
-        io_mode,
         crate::cmd::copy::OnError::Fail,
         &mut Vec::new(),
     )
@@ -529,25 +538,27 @@ pub fn run(
 /// sink for collected per-entry warnings. Use this from the CLI / MCP
 /// dispatch so inaccessible directories append warning records to
 /// `warnings_out` instead of aborting the entire find.
-#[allow(clippy::too_many_arguments)]
 pub fn run_with_policy(
     path_specs: &[&str],
     patterns: &[&str],
     glob: Option<&str>,
-    fixed_string: bool,
-    multiline: bool,
-    ignore_case: bool,
-    all_match: bool,
-    invert: bool,
-    lines_before: usize,
-    lines_after: usize,
-    count_only: bool,
-    numbers: bool,
+    opts: FindOptions,
     out: &mut dyn Write,
-    io_mode: IoMode,
     on_error: crate::cmd::copy::OnError,
     warnings_out: &mut Vec<String>,
 ) -> Result<FindResult, Box<dyn std::error::Error>> {
+    let FindOptions {
+        fixed_string,
+        multiline,
+        ignore_case,
+        all_match,
+        invert,
+        lines_before,
+        lines_after,
+        count_only,
+        numbers,
+        io_mode,
+    } = opts;
     let regexes = build_patterns(patterns, fixed_string, multiline, ignore_case)?;
     let files = expand_paths_with_policy(path_specs, glob, on_error, warnings_out)?;
     let multi_file = files.len() > 1;
@@ -628,17 +639,11 @@ mod tests {
             ],
             &["pattern"],
             None,
-            false,
-            false,
-            false,
-            false,
-            false,
-            0,
-            0,
-            false,
-            false,
+            FindOptions {
+                io_mode: IoMode::Buffered,
+                ..Default::default()
+            },
             &mut out,
-            IoMode::Buffered,
             crate::cmd::copy::OnError::Warn,
             &mut warnings,
         );

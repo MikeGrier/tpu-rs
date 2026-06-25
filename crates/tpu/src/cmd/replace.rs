@@ -109,20 +109,48 @@ pub fn decode_replacement(s: &str, literal: bool) -> Result<Vec<u8>, String> {
 /// present in the file's prior decoded content; pass
 /// [`WritePolicy::permissive`] (or the CLI's `--allow-mojibake`) to skip
 /// the check.
-#[allow(clippy::too_many_arguments)]
+/// Options for [`run`], bundling the many positional flags so that call
+/// sites name each field and cannot accidentally transpose the bare
+/// booleans (`multiline` / `fixed_strings` / `count_only` / `dry_run`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ReplaceOptions {
+    /// Prepend `(?m)` to the pattern so `^` / `$` match at LF boundaries.
+    pub multiline: bool,
+    /// Treat the pattern as a literal fixed string (regex-escaped).
+    pub fixed_strings: bool,
+    /// Override the output line ending; `None` preserves the file's.
+    pub line_ending_override: Option<LineEnding>,
+    /// Count matches without modifying the file.
+    pub count_only: bool,
+    /// Compute the substitution in memory without writing.
+    pub dry_run: bool,
+    /// File access strategy (mmap vs buffered).
+    pub io_mode: IoMode,
+    /// Write-time mojibake guard policy.
+    pub policy: WritePolicy,
+}
+
+/// Apply a regex (or fixed-string) replacement to `file` in place.
+///
+/// All boolean and policy knobs are bundled into [`ReplaceOptions`]; see its
+/// fields for the per-flag behaviour.  `diff_out`, when `Some`, receives a
+/// unified text diff (in normalised/LF space) after a successful write.
 pub fn run(
     file: &Path,
     pattern: &str,
     replacement: &[u8],
-    multiline: bool,
-    fixed_strings: bool,
-    line_ending_override: Option<LineEnding>,
     diff_out: Option<&mut dyn Write>,
-    count_only: bool,
-    dry_run: bool,
-    io_mode: IoMode,
-    policy: WritePolicy,
+    opts: ReplaceOptions,
 ) -> Result<usize, Box<dyn std::error::Error>> {
+    let ReplaceOptions {
+        multiline,
+        fixed_strings,
+        line_ending_override,
+        count_only,
+        dry_run,
+        io_mode,
+        policy,
+    } = opts;
     let escaped = if fixed_strings {
         regex::escape(pattern)
     } else {
@@ -404,14 +432,16 @@ mod tests {
             file,
             pattern,
             replacement,
-            multiline,
-            fixed_strings,
-            line_ending_override,
             diff_out,
-            count,
-            dry_run,
-            IoMode::Mmap,
-            crate::mojibake::WritePolicy::permissive(),
+            ReplaceOptions {
+                multiline,
+                fixed_strings,
+                line_ending_override,
+                count_only: count,
+                dry_run,
+                io_mode: IoMode::Mmap,
+                policy: crate::mojibake::WritePolicy::permissive(),
+            },
         )
     }
 
