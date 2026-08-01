@@ -15,6 +15,7 @@
 //! Tool set:
 //! - `read_file`         — read a text file with encoding/line-ending normalisation
 //! - `write_file`        — write text, preserving the file's existing encoding/line endings
+//! - `create_file`       — create a new file, failing if the path already exists
 //! - `replace_in_file`   — in-place regex substitution on a normalised LF view
 //! - `edit_file`         — targeted in-place edits at known line numbers or byte offsets
 //! - `read_file_binary`  — read raw bytes as a 7-bit-clean escaped string
@@ -119,6 +120,7 @@ fn invocation_header(tool: &str, args: &Value) -> String {
 pub const TOOL_NAMES: &[&str] = &[
     "tpu_read_file",
     "tpu_write_file",
+    "tpu_create_file",
     "tpu_replace_in_file",
     "tpu_edit_file",
     "tpu_read_file_binary",
@@ -293,6 +295,73 @@ pub fn list() -> Value {
             "annotations": { "readOnlyHint": false, "destructiveHint": false }
         },
         {
+            "name": "tpu_create_file",
+            "description":
+                "Create a NEW file and write UTF-8/LF text to it. Use this — not \
+                 tpu_write_file — whenever the intent is to make a brand-new file: the \
+                 name matches the intent and the call FAILS if the path already exists, \
+                 so an existing file is never silently overwritten. To overwrite or \
+                 modify a file that already exists, use tpu_write_file instead.\n\n\
+                 New files are UTF-8 with LF line endings by default. Set line_ending to \
+                 force CRLF/CR, or pass git_root to follow the repository's configured \
+                 convention (per .gitattributes / core.autocrlf / core.eol) when the \
+                 server has line-ending normalisation enabled. Parent directories are \
+                 created as needed.\n\n\
+                 ESCAPING: 'content' is the LITERAL text to write. The JSON-RPC transport \
+                 already handles JSON string escaping; do not add a second layer. To \
+                 insert a newline put a real newline in the JSON string.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "description":
+                            "Absolute path of the new file to create. Must not already \
+                             exist; the call fails if it does."
+                    },
+                    "content": {
+                        "type": "string",
+                        "description":
+                            "Full UTF-8 text content for the new file. Any CRLF or bare CR \
+                             line endings are normalized to LF before processing, then \
+                             written as LF unless line_ending (or git_root normalisation) \
+                             specifies otherwise."
+                    },
+                    "line_ending": {
+                        "type": "string",
+                        "enum": ["lf", "crlf", "cr"],
+                        "description":
+                            "Line ending for the new file. Omit for LF (the default for \
+                             new files) or to defer to git_root normalisation."
+                    },
+                    "git_root": {
+                        "type": "string",
+                        "description":
+                            "Optional absolute path to a git repository root. When the \
+                             server has line-ending normalisation enabled \
+                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
+                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
+                             new file is written with git's expected convention for this \
+                             path (per .gitattributes / core.autocrlf / core.eol). Off by \
+                             default — without the server setting this argument has no \
+                             effect."
+                    },
+                    "allow_mojibake": {
+                        "type": "boolean",
+                        "description":
+                            "If true, disable the write-time mojibake guard for this call. \
+                             By default, content that contains mojibake patterns (any of \
+                             the canonical Latin-1, punctuation, box-drawing, NBSP, or \
+                             double-encoded fingerprints) is rejected with an error. Use \
+                             this only when intentionally writing curated mojibake \
+                             fixtures. Default: false."
+                    }
+                },
+                "required": ["file", "content"]
+            },
+            "annotations": { "readOnlyHint": false, "destructiveHint": false }
+        },
+        {
             "name": "tpu_replace_in_file",
             "description":
                 "Perform an in-place regex substitution on a file. The pattern is matched \
@@ -309,8 +378,13 @@ pub fn list() -> Value {
                  ESCAPING — 'pattern' (regex mode, fixed_strings:false): escape ONLY \
                  regex metacharacters. Do NOT add an extra layer for JSON; the transport \
                  already handles that.\n\n\
-                 ESCAPING — 'replacement': capture refs use $1, $name, $$ (literal $). \
-                 The sequences \\n, \\r, \\t, \\\\ are expanded to LF / CR / TAB / \\ \
+                 ESCAPING — 'replacement': capture refs ($1, $name, $$) are honoured ONLY \
+                 when the pattern has at least one capturing group. When the pattern has \
+                 no groups — every fixed_strings search, and any regex without ( … ) — the \
+                 replacement is written literally, so a bare $ (e.g. $5.00, $HOME, \
+                 ${TOKEN}) is preserved rather than consumed. Add a capturing group and \
+                 use $1 if you need a back-reference. \
+                 The sequences \\n, \\r, \\t, \\\\ are always expanded to LF / CR / TAB / \\ \
                  before substitution; all other \\X pass through unchanged. Either a \
                  real newline in the JSON string OR the two characters backslash+n will \
                  produce a newline in the output — both are accepted.",
@@ -334,15 +408,20 @@ pub fn list() -> Value {
                     "replacement": {
                         "type": "string",
                         "description":
-                            "Replacement template. $0 is the whole match; $1/$name are \
-                             numbered/named capture groups; $$ is a literal dollar sign. \
+                            "Replacement template. Capture-group references are honoured \
+                             ONLY when the pattern has at least one capturing group: then \
+                             $0 is the whole match, $1/$name are numbered/named groups, and \
+                             $$ is a literal dollar sign. When the pattern has no groups \
+                             (every fixed_strings search, and any regex without ( … )) the \
+                             replacement is taken literally, so $ is written as-is (prices \
+                             like $5.00, variables like $HOME, or ${TOKEN} placeholders are \
+                             preserved). \
                              Any CRLF or bare CR in the replacement text is normalized \
                              to LF before substitution. \
                              Standard C-style backslash escapes are expanded before the \
                              regex engine sees the replacement: \\n becomes a newline, \
                              \\t a tab, \\r a carriage return, \\\\ a single backslash. \
-                             All other \\X sequences are passed through unchanged so that \
-                             capture-group syntax ($1, $name, $$) is not affected."
+                             All other \\X sequences are passed through unchanged."
                     },
                     "multiline": {
                         "type": "boolean",
@@ -1373,6 +1452,7 @@ pub fn call(
     match name {
         "tpu_read_file" => Ok(call_read_file(args)),
         "tpu_write_file" => Ok(call_write_file(args, config)),
+        "tpu_create_file" => Ok(call_create_file(args, config)),
         "tpu_replace_in_file" => Ok(call_replace_in_file(args, config)),
         "tpu_edit_file" => Ok(call_edit_file(args, config)),
         "tpu_read_file_binary" => Ok(call_read_file_binary(args)),
@@ -1568,6 +1648,39 @@ fn call_write_file(args: &Value, config: &ServerConfig) -> ToolResult {
         } else {
             Ok(ToolResult::ok(format!("{header}\n{status_line}")))
         }
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
+}
+
+fn call_create_file(args: &Value, config: &ServerConfig) -> ToolResult {
+    let header = invocation_header("tpu_create_file", args);
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
+        let file = resolve_file_arg(args)?;
+        let content_raw = require_str(args, "content")?;
+        let content = normalize_to_lf(content_raw);
+        let path = std::path::Path::new(&file);
+
+        let le_override = eol_write_override(args, &file, config)?;
+        let policy = mojibake_policy_from_args(args);
+
+        tpu::cmd::create::run(
+            path,
+            &content,
+            tpu::encoding::OutputEncoding::Preserve,
+            tpu::encoding::BomPolicy::default(),
+            le_override,
+            tpu::IoMode::Buffered,
+            policy,
+        )?;
+        let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
+        let status = serde_json::json!({
+            "status": "success",
+            "file": file,
+            "mtime_epoch_ms": stamp.mtime_epoch_ms,
+            "size": stamp.size,
+        });
+        let status_line = serde_json::to_string(&status)?;
+        Ok(ToolResult::ok(format!("{header}\n{status_line}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }

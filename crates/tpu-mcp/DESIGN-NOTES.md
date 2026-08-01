@@ -34,6 +34,54 @@ All other `\X` sequences are passed through unchanged so that capture-group synt
 any `\r` or `\r\n` introduced by the escape expansion is folded to LF before the
 normalised tpu view sees it.
 
+### Capture-group `$` expansion is conditional
+
+The `$`-reference expansion itself happens in the `tpu` library, not here, and only
+fires when the pattern has an explicit capturing group (see the "Replacement
+Capture-Group Expansion" section of the top-level design notes).  For a group-less
+pattern — every `fixed_strings` search, and any regex without `( … )` — the replacement
+is written literally, so a bare `$` (e.g. `$5.00`, `$HOME`, `${TOKEN}`) survives.  This
+is complementary to the backslash-escape handling above: `unescape_replacement` still
+runs regardless of group presence, because `\n`/`\t`/etc. are transport ergonomics, not
+capture syntax.  The `tpu_replace_in_file` schema documents both behaviours.
+
+---
+
+## `tpu_create_file` — a create-only sibling of `tpu_write_file`
+
+Agents frequently need to create brand-new files, but the `write_file` name does not
+signal that it also creates files.  Copilot therefore struggles to anticipate the right
+tool for "make a new file" and sometimes falls back to shell redirection (which corrupts
+encodings).  Rather than document `write_file` harder — swimming upstream against the
+tool name — `tpu-mcp` exposes a dedicated `tpu_create_file` tool.
+
+### Contract
+
+`call_create_file` mirrors `call_write_file` but calls `tpu::cmd::create::run`, which
+**fails if the target path already exists** (after recovering any stranded `<file>.bak`).
+The name and the fail-on-exists contract match the "create a new file" intent exactly, so
+an agent never has to reason about whether the call will create or overwrite.  To
+overwrite an existing file the agent uses `tpu_write_file`.
+
+### Parameter subset
+
+The tool is a deliberate subset of `write_file`, limited to what makes sense for a fresh
+file:
+
+| Parameter | Purpose |
+|---|---|
+| `file` (required) | absolute path of the new file; must not exist |
+| `content` (required) | UTF-8/LF text; CRLF/CR normalised to LF at the boundary |
+| `line_ending` (optional) | force `lf`/`crlf`/`cr` (default LF for new files) |
+| `git_root` (optional) | follow the repo's configured convention when the server has EOL normalisation enabled |
+| `allow_mojibake` (optional) | disable the write-time mojibake guard |
+
+`validate` and `diff` are intentionally omitted: there is nothing to validate against on a
+non-existent file, and the whole content is the change so a diff is redundant.  New files
+default to UTF-8/LF; non-UTF-8 output remains out of scope per the `tpu` design.  The tool
+runs through the same `stamp_and_verify` write-verification path as the other mutating
+tools.
+
 ---
 
 ## Write-verification stamp (Windows Defender mitigation)
