@@ -225,6 +225,80 @@ already handles it correctly.
 
 ---
 
+## Replacement Capture-Group Expansion — Conditional on Group Presence
+
+`tpu replace` expands capture-group references (`$0`, `$1`, `$name`, `$$`) in the
+replacement string via `regex::bytes::Captures::expand` **only when the compiled
+pattern actually contains at least one explicit capturing group**.  The presence of a
+group is detected with `Regex::captures_len() > 1` (the count includes the implicit
+whole-match group 0, so `> 1` means one or more explicit groups).
+
+When the pattern has no groups the replacement bytes are written verbatim: the per-match
+path pushes the raw bytes and the `--diff` preview path uses `regex::bytes::NoExpand`.
+
+### Rationale
+
+Historically the replacement was always run through `expand`, so a `$` that the user
+intended literally (prices like `$5.00`, shell variables like `$HOME`, `${TOKEN}`
+placeholders) was silently consumed as a group reference and lost — most painfully for
+`--fixed-strings` searches, where a capturing group is impossible by construction.  Tying
+expansion to group presence makes the common "literal search, literal replace" case
+behave as written while preserving back-references for patterns that opt into them.
+
+### Consequence
+
+`$0` is **not** interpreted as "the whole match" for a group-less pattern.  A caller who
+wants the matched text echoed back must introduce a capturing group (e.g. wrap the
+pattern in `( … )` and reference `$1`).  This is a deliberate, user-visible behavioural
+change from the previous always-expand semantics.
+
+Backslash-escape decoding (`\n`, `\t`, `\\`, …) is orthogonal and unchanged — it happens
+in the caller (`decode_replacement` / the MCP `unescape_replacement`) before the bytes
+reach `run`, regardless of group presence.
+
+---
+
+## `tpu create` — Create-Only File Writes
+
+`tpu::cmd::create::run` is a narrow wrapper over `tpu::cmd::write::run` that refuses to
+clobber an existing file: it errors if the target path already exists and otherwise
+delegates to `write::run` for the actual encoding-, line-ending-, and mojibake-aware
+write.  A stranded `<file>.bak` (from an interrupted prior write) is recovered first via
+`recover_stranded_backup`, so a half-completed write still counts as "exists".
+
+### Motivation
+
+Agents routinely need to create brand-new files, but the `write_file` name does not
+telegraph that it also creates files, so Copilot struggles to anticipate the right tool
+and sometimes reaches for shell redirection instead.  A dedicated create operation whose
+name and contract match the intent removes that ambiguity.  Documenting `write` harder
+was judged to be swimming upstream against the tool name.
+
+### Scope
+
+- New files default to UTF-8 with LF line endings; `output_encoding`, `bom_policy`, and
+  `line_ending_override` override those defaults exactly as they do for `write::run`.
+- A `tpu create` CLI subcommand mirrors the library contract (positional `FILE` and
+  optional inline `DATA`, `--utf8`, `--bom`, `--line-ending`, `--allow-mojibake`), reading
+  content from stdin when `DATA` is omitted.  This is how the MCP `tpu_create_file` tool
+  drives it, and it lets humans opt into create-only semantics (and command-line line
+  endings) rather than the clobbering `tpu write`.
+- No `.bak` is produced (there is no prior content) and no diff is emitted (the whole
+  content is the change).
+
+### `main()` runs on a large-stack worker thread
+
+The `tpu` binary parses its arguments and runs on a dedicated worker thread with a 16 MiB
+stack rather than the OS main thread.  clap's derive-built command tree and its debug-time
+`debug_assert` validation are stack-heavy, and on Windows the main thread's default stack
+is only ~1 MiB.  As the subcommand set grew (adding `create` was the tipping point), a
+plain `Cli::parse()` on the main thread began overflowing the stack in debug builds even
+for `tpu --help`.  Running the whole program on a thread with a generous stack keeps the
+tool robust as more subcommands are added; do not "simplify" this back onto the main
+thread.
+
+---
+
 ## Edit-Offset Composability
 
 ### Within a single `replace` call

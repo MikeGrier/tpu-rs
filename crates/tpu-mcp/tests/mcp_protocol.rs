@@ -240,6 +240,7 @@ fn mcp_it_1_initialize_and_tools_list() {
     for expected in [
         "tpu_read_file",
         "tpu_write_file",
+        "tpu_create_file",
         "tpu_replace_in_file",
         "tpu_edit_file",
         "tpu_read_file_binary",
@@ -295,6 +296,52 @@ fn mcp_it_2_write_then_read() {
     assert_has("read line 1", &content, "hello world");
     assert_has("read line 2", &content, "line two");
     assert_has("read line 3", &content, "line three");
+}
+
+/// MCP-IT-2b: tpu_create_file creates a new file and refuses to overwrite an
+/// existing one (isError=true), leaving the original untouched.
+#[test]
+fn mcp_it_2b_create_new_and_refuses_existing() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("created.txt");
+    let path = f.to_str().unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // First create succeeds and returns a write stamp.
+    let out = s.call_tool(
+        "tpu_create_file",
+        json!({
+            "file": path,
+            "content": "brand new\n",
+        }),
+    );
+    let stamp = last_json_line(&out);
+    assert!(
+        stamp["mtime_epoch_ms"].as_u64().unwrap_or(0) > 0,
+        "create response must contain mtime_epoch_ms; got: {out:?}"
+    );
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "brand new\n");
+
+    // Second create against the same path must fail without clobbering.
+    let result = s.rpc(
+        "tools/call",
+        json!({
+            "name": "tpu_create_file",
+            "arguments": { "file": path, "content": "should not overwrite\n" },
+        }),
+    );
+    assert_eq!(
+        result.get("isError").and_then(|v| v.as_bool()),
+        Some(true),
+        "create over an existing file must surface isError=true; got: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "brand new\n",
+        "existing file must be untouched after a failed create"
+    );
 }
 
 /// MCP-IT-3: tpu_replace_in_file replaces text and includes a write stamp.
