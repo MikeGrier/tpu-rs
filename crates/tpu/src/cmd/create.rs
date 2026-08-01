@@ -3,18 +3,28 @@
 //! `tpu create` — write text content to a **new** file, failing if the path
 //! already exists.
 //!
-//! `create` is a deliberately narrow wrapper over [`crate::cmd::write::run`]:
-//! it exists so that callers with a "make a brand-new file" intent have a tool
-//! whose name and contract match that intent exactly.  The primary consumer is
-//! the MCP `tpu_create_file` tool, where a distinct create operation removes
-//! the ambiguity agents hit when trying to anticipate whether `write` will
-//! create or overwrite.
+//! `create` exists so that callers with a "make a brand-new file" intent have
+//! a tool whose name and contract match that intent exactly. The primary
+//! consumer is the MCP `tpu_create_file` tool, where a distinct create
+//! operation removes the ambiguity agents hit when trying to anticipate
+//! whether `write` will create or overwrite.
+//!
+//! Unlike [`crate::cmd::write::run`], which this module used to delegate to,
+//! `create` does not rely on a `Path::exists()`/`try_exists()` pre-check for
+//! its no-clobber guarantee — a check like that is inherently racy, since
+//! another process could create the file between the check and the write.
+//! Instead, the actual persist step goes through [`crate::atomic_create_new`],
+//! which uses `NamedTempFile::persist_noclobber` — an OS-level primitive that
+//! atomically fails if the destination already exists. An initial
+//! `try_exists()` check is still performed first purely to produce a fast,
+//! friendly error message in the common case; it is advisory only.
 //!
 //! ## Contract
 //!
-//! - If `file` already exists, [`run`] returns an error and nothing is
-//!   written.  (A stranded `<file>.bak` from an interrupted prior write is
-//!   first recovered, so a half-completed write still counts as "exists".)
+//! - If `file` already exists at the time of the atomic create, [`run`]
+//!   returns an error and nothing is written.  (A stranded `<file>.bak` from
+//!   an interrupted prior write is first recovered, so a half-completed write
+//!   still counts as "exists".)
 //! - Otherwise the parent directories are created as needed and the content is
 //!   written fresh.  New files default to UTF-8 with LF line endings; the
 //!   `output_encoding`, `bom_policy`, and `line_ending_override` parameters
@@ -39,9 +49,12 @@ use crate::{
 /// clobber an existing file.
 ///
 /// Returns an error if `file` already exists (after recovering any stranded
-/// `<file>.bak`).  On success the file is created and populated via the same
-/// encoding-, line-ending-, and mojibake-aware path used by
-/// [`crate::cmd::write::run`].
+/// `<file>.bak`).  The no-clobber guarantee is enforced atomically by
+/// [`crate::atomic_create_new`] at persist time, not by the earlier
+/// `try_exists()` check (which exists only to produce a fast, friendly error
+/// message and is not itself race-free).  On success the file is created and
+/// populated using the same encoding- and line-ending-aware defaults, and the
+/// same write-time mojibake guard, used by [`crate::cmd::write::run`].
 pub fn run(
     file: &Path,
     content: &str,
@@ -51,28 +64,61 @@ pub fn run(
     io_mode: IoMode,
     policy: WritePolicy,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // `create` never reads an existing file, so `io_mode` (which only
+    // governs mmap-vs-buffered *reads*) has nothing to act on here. It is
+    // kept as a parameter for signature parity with the other `cmd::*`
+    // entry points and forward-compatibility.
+    let _ = io_mode;
+
     // Promote a stranded backup first so an interrupted prior write is not
     // mistaken for an absent file (and then silently clobbered).
     let _ = crate::recover_stranded_backup(file);
 
-    if file.exists() {
-        return Err(format!(
-            "create: {}: file already exists (use write to overwrite)",
-            file.display()
-        )
-        .into());
+    // Fast, advisory existence check purely for a clear, early error
+    // message. `try_exists()` (rather than `exists()`) ensures a genuine
+    // I/O error (permissions, a broken symlink, ...) is surfaced as an
+    // error instead of being silently treated as "file does not exist".
+    //
+    // This check is *not* what makes the create-only guarantee safe: another
+    // process could still create `file` between this check and the write
+    // below. The actual no-clobber guarantee comes from
+    // `atomic_create_new`'s OS-level `persist_noclobber` call, which is the
+    // sole, atomic authority on whether `file` exists at persist time.
+    match file.try_exists() {
+        Ok(true) => {
+            return Err(format!(
+                "create: {}: file already exists (use write to overwrite)",
+                file.display()
+            )
+            .into());
+        }
+        Ok(false) => {}
+        Err(e) => return Err(format!("create: {}: {e}", file.display()).into()),
     }
 
-    crate::cmd::write::run(
-        file,
+    if policy.reject_introduced_mojibake {
+        crate::mojibake::check_write_does_not_introduce_mojibake("", content)
+            .map_err(|e| format!("create: {}: {e}", file.display()))?;
+    }
+
+    let bytes = crate::cmd::write::encode_new_file_content(
         content,
         output_encoding,
         bom_policy,
         line_ending_override,
-        None,
-        io_mode,
-        policy,
-    )
+    );
+
+    crate::atomic_create_new(file, &bytes).map_err(|e| -> Box<dyn std::error::Error> {
+        if e.kind() == std::io::ErrorKind::AlreadyExists {
+            format!(
+                "create: {}: file already exists (use write to overwrite)",
+                file.display()
+            )
+            .into()
+        } else {
+            format!("create: {}: {e}", file.display()).into()
+        }
+    })
 }
 
 #[cfg(test)]
