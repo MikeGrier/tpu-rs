@@ -177,6 +177,46 @@ pub fn run(
     Ok(())
 }
 
+/// Encode `content` as it would be written to a **brand-new** file — i.e. as
+/// if [`detect_target`] had returned its non-existent-file defaults of
+/// UTF-8, LF, and no BOM.
+///
+/// Shared by [`run`]'s own new-file path (reached implicitly whenever `file`
+/// does not exist, via [`detect_target`]) and by
+/// [`crate::cmd::create::run`], which never has an existing file to detect
+/// against and so needs the same defaults without going through the full
+/// read/detect machinery.
+pub(crate) fn encode_new_file_content(
+    content: &str,
+    output_encoding: OutputEncoding,
+    bom_policy: BomPolicy,
+    line_ending_override: Option<LineEnding>,
+) -> Vec<u8> {
+    // A file that doesn't exist yet is always treated as UTF-8/LF/no-BOM by
+    // `detect_target`, so both `OutputEncoding` variants resolve to UTF-8
+    // output here and `write_bom` only fires for `Utf8` + `BomPolicy::Force`.
+    let write_bom = output_encoding == OutputEncoding::Utf8 && bom_policy == BomPolicy::Force;
+
+    let encoded_bytes = match line_ending_override.unwrap_or(LineEnding::Lf) {
+        LineEnding::Lf => content.as_bytes().to_vec(),
+        LineEnding::CrLf => {
+            crate::encoding::denormalize_lf_to_crlf(content.as_bytes(), encoding_rs::UTF_8)
+        }
+        LineEnding::Cr => {
+            crate::encoding::denormalize_lf_to_cr(content.as_bytes(), encoding_rs::UTF_8)
+        }
+    };
+
+    if write_bom {
+        let mut v = Vec::with_capacity(UTF8_BOM.len() + encoded_bytes.len());
+        v.extend_from_slice(UTF8_BOM);
+        v.extend_from_slice(&encoded_bytes);
+        v
+    } else {
+        encoded_bytes
+    }
+}
+
 /// Detect the encoding, dominant line-ending, and BOM presence of `file`.
 ///
 /// Returns `(UTF-8, LF, false)` for new (non-existent) or empty files.

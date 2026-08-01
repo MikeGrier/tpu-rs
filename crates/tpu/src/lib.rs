@@ -273,6 +273,109 @@ fn persist_with_retry(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
     })
 }
 
+/// Persist `tmp` to `dest` only if `dest` does not already exist, retrying on
+/// transient Windows AV errors.
+///
+/// A non-transient failure (in particular `io::ErrorKind::AlreadyExists`,
+/// which `NamedTempFile::persist_noclobber` returns when `dest` is present)
+/// is returned immediately without retrying.
+fn persist_noclobber_with_retry(tmp: NamedTempFile, dest: &Path) -> io::Result<()> {
+    let mut tmp = Some(tmp);
+    retry_io(|| {
+        let t = tmp
+            .take()
+            .expect("persist retry: temp file already consumed");
+        match t.persist_noclobber(dest) {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                tmp = Some(e.file);
+                Err(e.error)
+            }
+        }
+    })
+}
+
+/// Atomically create `file` with `bytes`, failing with
+/// [`io::ErrorKind::AlreadyExists`] if it already exists.
+///
+/// This is the create-only counterpart to [`atomic_write`], used by
+/// `cmd::create::run`.  It performs no separate existence pre-check of its
+/// own: the temp file is persisted into place via
+/// `NamedTempFile::persist_noclobber`, an OS-level no-clobber primitive
+/// (`link`+`unlink` on Unix, a non-replacing `MoveFileEx` on Windows) that is
+/// the sole, atomic authority on whether `file` exists at persist time. This
+/// closes the TOCTOU window that a `Path::exists()`/`try_exists()` check
+/// followed by a plain rename-into-place would leave open — another process
+/// could otherwise create `file` in between the check and the write, and
+/// the plain rename would silently clobber it.
+///
+/// Callers that want a fast, advisory "does this already exist" check for an
+/// early, friendly error message may still perform one before calling this
+/// function; it just must not be relied upon for correctness, since this
+/// function re-validates atomically regardless.
+pub fn atomic_create_new(file: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    retry_io(|| fs::create_dir_all(dir))?;
+
+    let mut tmp = retry_io(|| NamedTempFile::new_in(dir))?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+
+    persist_noclobber_with_retry(tmp, file)
+}
+
+#[cfg(test)]
+mod atomic_create_new_tests {
+    use super::*;
+
+    #[test]
+    fn creates_new_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("new.txt");
+        atomic_create_new(&f, b"hello").unwrap();
+        assert_eq!(fs::read(&f).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn creates_parent_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a").join("b").join("new.txt");
+        atomic_create_new(&f, b"hello").unwrap();
+        assert_eq!(fs::read(&f).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn refuses_to_clobber_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("exists.txt");
+        fs::write(&f, b"original").unwrap();
+        let err = atomic_create_new(&f, b"replacement").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // The existing file must be completely untouched by the failed attempt.
+        assert_eq!(fs::read(&f).unwrap(), b"original");
+    }
+
+    /// Regression test for the TOCTOU race this function exists to close: a
+    /// file created *after* any earlier existence check but *before* the
+    /// final persist must still be refused, because the no-clobber guarantee
+    /// comes from the persist call itself, not from a separate check.
+    #[test]
+    fn refuses_to_clobber_file_created_after_call_starts_conceptually() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("race.txt");
+        // Simulate "another process" winning the race by creating the file
+        // immediately before the no-clobber persist call, with no
+        // intervening existence check on our side.
+        fs::write(&f, b"winner").unwrap();
+        let err = atomic_create_new(&f, b"loser").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&f).unwrap(), b"winner");
+    }
+}
+
 #[cfg(test)]
 mod recover_tests {
     use super::*;

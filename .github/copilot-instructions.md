@@ -131,9 +131,13 @@ for cargo just because a previous step used it.
 | `cargo_nextest_list` | `cargo nextest list` (requires cargo-nextest) |
 | `cargo_setup` / `cargo_diagnostic` | *(no terminal equivalent)* |
 
-Always pass `working_dir` set to the absolute workspace root
-(`c:\GitHub\tpu-rs`) — the default is the cargo-mcp server's own working
-directory and will usually fail to resolve the manifest or toolchain.
+Always pass `working_dir` set to the absolute path of your local checkout of
+this workspace's root — the default is the cargo-mcp server's own working
+directory and will usually fail to resolve the manifest or toolchain. This
+path is machine- and OS-specific (e.g. `c:\GitHub\tpu-rs` on a Windows
+checkout, `/home/you/tpu-rs` on Linux/macOS) — do not hardcode any single
+literal path from this file; use the actual root of the checkout you are
+working in.
 
 ### Boolean arguments
 
