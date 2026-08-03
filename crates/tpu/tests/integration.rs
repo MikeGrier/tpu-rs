@@ -487,6 +487,62 @@ macro_rules! write_suite {
     };
 }
 
+/// `tpu create` CLI tests: create-only writes that refuse to clobber.
+mod create_cli {
+    use super::*;
+
+    /// `create` writes a brand-new file from stdin.
+    #[test]
+    fn creates_new_file_from_stdin() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("new.txt");
+        ok_stdin(tpu().arg("create").arg(&dst), b"hello\nworld\n");
+        assert!(dst.exists(), "file should have been created");
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "hello\nworld\n");
+    }
+
+    /// `create` with inline content writes it without touching stdin.
+    #[test]
+    fn creates_new_file_from_data_arg() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("data.txt");
+        ok(tpu().arg("create").arg(&dst).arg("inline\n"));
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "inline\n");
+    }
+
+    /// `create` refuses to overwrite an existing file and leaves it untouched.
+    #[test]
+    fn refuses_to_overwrite_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("existing.txt");
+        fs::write(&dst, b"original\n").unwrap();
+        let o = err(tpu().arg("create").arg(&dst).arg("new\n"));
+        let s = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            s.contains("already exists"),
+            "expected an 'already exists' error; got: {s}"
+        );
+        assert_eq!(
+            fs::read_to_string(&dst).unwrap(),
+            "original\n",
+            "existing file must be left untouched"
+        );
+    }
+
+    /// `create --line-ending=crlf` honours the requested line ending.
+    #[test]
+    fn honours_crlf_line_ending() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("crlf.txt");
+        ok(tpu()
+            .arg("create")
+            .arg("--line-ending=crlf")
+            .arg(&dst)
+            .arg("a\nb\n"));
+        assert_eq!(fs::read(&dst).unwrap(), b"a\r\nb\r\n");
+    }
+}
+
 /// 6 `tpu replace` tests for one non-empty text asset file.
 macro_rules! replace_suite {
     ($mod:ident, $file:literal) => {

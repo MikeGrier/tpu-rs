@@ -101,6 +101,85 @@ through `Get-Content` / `Set-Content` — read and write via
 `tools/check-encoding.ps1` afterwards.
 <!-- tpu-mcp:setup:end -->
 
+<!-- cargo-mcp:setup:begin -->
+## Cargo commands — use `cargo_*` MCP tools, never the terminal
+
+This workspace runs the **cargo-mcp** MCP server. When building, testing,
+linting, or otherwise driving Cargo in this Rust workspace, ALWAYS prefer
+the `cargo_*` MCP tools over running `cargo` in a PowerShell or bash
+terminal. This holds even mid-workflow — don't switch back to the terminal
+for cargo just because a previous step used it.
+
+| MCP tool | Replaces |
+|---|---|
+| `cargo_metadata` | `cargo metadata` |
+| `cargo_check` | `cargo check` |
+| `cargo_build` | `cargo build` |
+| `cargo_test` | `cargo test` |
+| `cargo_clippy` | `cargo clippy` |
+| `cargo_fmt_check` | `cargo fmt --check` |
+| `cargo_fmt` | `cargo fmt` |
+| `cargo_tree` | `cargo tree` |
+| `cargo_doc` | `cargo doc` |
+| `cargo_clean` | `cargo clean` |
+| `cargo_update` | `cargo update` |
+| `cargo_fix` | `cargo fix` |
+| `cargo_add` | `cargo add` |
+| `cargo_remove` | `cargo remove` |
+| `cargo_publish` | `cargo publish` |
+| `cargo_nextest_run` | `cargo nextest run` (requires cargo-nextest) |
+| `cargo_nextest_list` | `cargo nextest list` (requires cargo-nextest) |
+| `cargo_setup` / `cargo_diagnostic` | *(no terminal equivalent)* |
+
+Always pass `working_dir` set to the absolute path of your local checkout of
+this workspace's root — the default is the cargo-mcp server's own working
+directory and will usually fail to resolve the manifest or toolchain. This
+path is machine- and OS-specific (e.g. `c:\GitHub\tpu-rs` on a Windows
+checkout, `/home/you/tpu-rs` on Linux/macOS) — do not hardcode any single
+literal path from this file; use the actual root of the checkout you are
+working in.
+
+### Boolean arguments
+
+Boolean flags (`all_targets`, `release`, `workspace`, `lib`, `tests`, …)
+take a JSON boolean (`true` / `false`). If a CLI flag you expected is
+missing from the echoed `x-cargo-mcp-invocation` argv, you probably sent
+the boolean in an unrecognised shape — check for a `warning` notification.
+
+### `cargo_test` timeouts
+
+`timeout_secs` is a hard wall-clock cap on the test **execution** phase
+(armed after build/link finishes, so slow builds never trip it). Default
+via the VS Code extension is 30 s; pass `timeout_secs: 0` to disable for a
+slow or polling suite. In `test_filter` mode, `per_test_timeout_secs`
+guards against a single hung test (idle watchdog in batched mode, hard cap
+in per-test mode); a 30 s fallback keeps hung-test protection always on.
+
+### Redirecting large output (`output_path`)
+
+`cargo_check`, `cargo_build`, `cargo_test`, `cargo_clippy`, and `cargo_doc`
+accept `output_path` (relative, parent must exist) to write the full NDJSON
+transcript to a file and return only a compact summary. Use it instead of
+piping to a temp file when the full output would bloat context; read the
+summary first, then open the file only if it shows failures.
+
+### Per-call env (`env`)
+
+Every cargo-spawning tool accepts an `env` object to set/unset env vars for
+that one call (e.g. `{ "env": { "RUSTFLAGS": "-C debuginfo=2" } }`). Use it
+for one-shot debug knobs instead of shelling out; don't use it for
+permanent config (put that in `Cargo.toml` / `.cargo/config.toml`) or
+secrets.
+
+### Optional: cargo-nextest
+
+`cargo-nextest` is not currently installed. `cargo_test` remains the
+canonical tool and is the ONLY way to run doctests. If nextest is installed
+later (`cargo install cargo-nextest --locked` or
+`cargo binstall cargo-nextest`), prefer `cargo_nextest_run` for per-test
+process isolation, built-in retries, and filter expressions.
+<!-- cargo-mcp:setup:end -->
+
 ## Tool preference (use the first available)
 
 1. **Editor edit tools** (the IDE's built-in edit / replace operations) —

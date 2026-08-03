@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.6.0](https://github.com/MikeGrier/tpu-rs/compare/v0.5.1...v0.6.0) (2026-08-03)
+
+
+### Features
+
+* **tpu:** add create-only file writes and fix replace literal $ handling ([bfc8199](https://github.com/MikeGrier/tpu-rs/commit/bfc8199f29402ef7c2a895c9b214b90646e9de2d))
+
+
+### Bug Fixes
+
+* **tpu:** close TOCTOU race in `create` and fix hardcoded path in docs ([5aa3af0](https://github.com/MikeGrier/tpu-rs/commit/5aa3af0fd45db1ade2f9ae9e172385c4e60150c9))
+
 ## [0.5.1](https://github.com/MikeGrier/tpu-rs/compare/v0.5.0...v0.5.1) (2026-06-25)
 
 

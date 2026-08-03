@@ -24,8 +24,19 @@
 //! that decoding via [`crate::escape::decode_bytes`] unless the user passes
 //! `--literal-replacement`.  By the time bytes reach [`run`] they should
 //! already contain real LF/TAB/etc. bytes for any escapes the user wrote.
-//! Capture-group references (`$0`, `$1`, `$name`, `$$`) are then expanded by
-//! the regex engine via [`regex::Captures::expand`].
+//!
+//! ## Capture-group expansion vs. literal `$`
+//!
+//! Capture-group references (`$0`, `$1`, `$name`, `$$`) are expanded by the
+//! regex engine via [`regex::bytes::Captures::expand`] **only when the pattern
+//! actually contains at least one explicit capture group**.  When the pattern
+//! has no groups — every `fixed_strings` search, and any regex without `( … )`
+//! — the replacement bytes are written verbatim, so a literal `$` (prices like
+//! `$5.00`, shell variables, `${TOKEN}` placeholders) is preserved instead of
+//! being silently consumed as a group reference.  This means `$0` is *not*
+//! interpreted as "the whole match" for a group-less pattern; add a capturing
+//! group (e.g. wrap the pattern in `( … )` and use `$1`) if you need a
+//! back-reference.
 //!
 //! ## Write-time mojibake guard
 //!
@@ -175,6 +186,16 @@ pub fn run(
 
     let re = Regex::new(&effective_pattern)?;
 
+    // When the pattern has no explicit capture groups, `$` in the replacement
+    // cannot reference anything useful, so we treat the replacement bytes as a
+    // literal string rather than a capture-group template.  This keeps `$`
+    // (e.g. prices like `$5.00`, shell variables, template placeholders)
+    // intact instead of silently consuming it as a group reference.  Fixed-
+    // string patterns (`fixed_strings`) always land here, so a literal search
+    // implies a literal replacement.  `captures_len()` counts the implicit
+    // whole-match group 0, so `> 1` means at least one explicit group exists.
+    let has_capture_groups = re.captures_len() > 1;
+
     // Snapshot the normalised old bytes now for diff computation later.
     // Only paid when --diff or --dry-run is requested.
     let old_norm: Option<Vec<u8>> = if diff_out.is_some() {
@@ -211,9 +232,15 @@ pub fn run(
             let source_end = view.byte_range_start() + view.offset_map.to_source(m.end() as u64);
             let source_len = source_end - source_start;
 
-            // Expand capture-group back-references in normalised space.
+            // Expand capture-group back-references in normalised space.  When
+            // the pattern has no explicit groups the replacement is taken
+            // verbatim, so `$` survives instead of being read as a reference.
             let mut norm_repl: Vec<u8> = Vec::new();
-            caps.expand(replacement, &mut norm_repl);
+            if has_capture_groups {
+                caps.expand(replacement, &mut norm_repl);
+            } else {
+                norm_repl.extend_from_slice(replacement);
+            }
 
             // Denormalise: restore the file's dominant line terminator.
             let content = denormalize_bytes(&norm_repl, line_ending);
@@ -278,7 +305,12 @@ pub fn run(
 
     // Emit the diff (for both --diff after a successful write and --dry-run).
     if let (Some(out), Some(old)) = (diff_out, old_norm) {
-        let new_norm = re.replace_all(&old, replacement).into_owned();
+        let new_norm = if has_capture_groups {
+            re.replace_all(&old, replacement).into_owned()
+        } else {
+            re.replace_all(&old, regex::bytes::NoExpand(replacement))
+                .into_owned()
+        };
         emit_unified_diff(file, &old, &new_norm, out)?;
     }
 
@@ -662,16 +694,54 @@ mod tests {
 
     #[test]
     fn replace_back_reference_zero() {
-        // $0 expands to the whole match.
-        let (out, _) = replace_file(b"hello\n", "ell", b"[$0]", false, false);
+        // $0 expands to the whole match when the pattern has a capturing group.
+        let (out, _) = replace_file(b"hello\n", "(ell)", b"[$0]", false, false);
         assert_eq!(out, b"h[ell]o\n");
     }
 
     #[test]
     fn replace_literal_dollar() {
-        // $$ in replacement template becomes a literal $.
-        let (out, _) = replace_file(b"price 10\n", r"\d+", b"$$$$5", false, false);
+        // $$ in the replacement template becomes a literal $ when the pattern
+        // has a capturing group (so capture expansion is active).
+        let (out, _) = replace_file(b"price 10\n", r"(\d+)", b"$$$$5", false, false);
         assert_eq!(out, b"price $$5\n");
+    }
+
+    #[test]
+    fn replace_group_less_pattern_keeps_dollar_literal() {
+        // With no capturing group the replacement is literal, so a bare `$`
+        // (prices, variables, placeholders) survives instead of being read as
+        // a capture reference.
+        let (out, _) = replace_file(b"amount X\n", "X", b"$5.00", false, false);
+        assert_eq!(out, b"amount $5.00\n");
+    }
+
+    #[test]
+    fn replace_group_less_pattern_dollar_zero_is_literal() {
+        // $0 is NOT interpreted as the whole match when the pattern has no
+        // capturing group — it is written verbatim.
+        let (out, _) = replace_file(b"hello\n", "ell", b"[$0]", false, false);
+        assert_eq!(out, b"h[$0]o\n");
+    }
+
+    #[test]
+    fn replace_fixed_string_keeps_dollar_literal() {
+        // A fixed-string search never has a capturing group, so its
+        // replacement is always literal.
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"COST here\n").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+        drop(f);
+        fs::write(&path, b"COST here\n").unwrap();
+        run_test(
+            &path, "COST", b"$9.99", false, true, None, None, false, false,
+        )
+        .unwrap();
+        let out = fs::read(&path).unwrap();
+        let _ = fs::remove_file(format!("{}.bak", path.display()));
+        let _ = fs::remove_file(&path);
+        assert_eq!(out, b"$9.99 here\n");
     }
 
     #[test]

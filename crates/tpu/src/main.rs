@@ -20,7 +20,10 @@ use tpu::IoMode;
 // Re-export library functions so that cmd modules (which are compiled in both
 // the lib and bin crate contexts) can use `crate::open_as_branch` etc.
 pub use tpu::git;
-pub use tpu::{atomic_write, open_as_branch, read_raw_bytes, recover_stranded_backup, retry_io};
+pub use tpu::{
+    atomic_create_new, atomic_write, open_as_branch, read_raw_bytes, recover_stranded_backup,
+    retry_io,
+};
 
 /// Resolve the line-ending override for a mutating write
 /// (`write`/`replace`/`edit`/`append`).
@@ -314,20 +317,70 @@ enum Commands {
         allow_mojibake: bool,
     },
 
+    /// Create a NEW file, writing UTF-8/LF text to it.
+    ///
+    /// Like `write`, but fails if the target path already exists so an
+    /// existing file is never overwritten; use `write` to overwrite.  Parent
+    /// directories are created as needed.
+    ///
+    /// New files are UTF-8 with LF line endings by default.  Use --utf8 to
+    /// force UTF-8 output and --bom to control a UTF-8 BOM, and --line-ending
+    /// to force CRLF/CR.
+    Create {
+        /// File to create.  Must not already exist.
+        file: PathBuf,
+
+        /// Force UTF-8 output encoding (the default for new files).
+        #[arg(long)]
+        utf8: bool,
+
+        /// Controls whether a UTF-8 byte-order mark (BOM, U+FEFF) is
+        /// prepended.  Only meaningful with --utf8.
+        ///
+        ///   strip  — no BOM in output (default).
+        ///
+        ///   force  — always prepend a UTF-8 BOM.
+        ///
+        ///   preserve — behaves as strip for new files.
+        #[arg(long, requires = "utf8", value_name = "MODE")]
+        bom: Option<BomPolicy>,
+
+        /// Content to write.  When omitted, content is read from stdin
+        /// (UTF-8/LF), which is how `tpu-mcp` (tpu_create_file) invokes this
+        /// subcommand.
+        #[arg(allow_hyphen_values = true)]
+        data: Option<String>,
+
+        /// Override the output line ending.  Without this flag the new file
+        /// uses LF (or git's convention when --eol-normalize and --git-root
+        /// are in effect).
+        #[arg(long, value_name = "ENDING", value_parser = ["lf", "crlf", "cr"])]
+        line_ending: Option<String>,
+
+        /// Bypass the write-time mojibake guard.  Without this flag, content
+        /// that introduces mojibake matches is rejected.
+        #[arg(long)]
+        allow_mojibake: bool,
+    },
+
     /// In-place regex replace in a file.
     ///
     /// The pattern is applied to a normalised (LF-only) view of the file so
-    /// that patterns never need to account for CRLF.  The replacement
-    /// template supports capture-group references ($0, $1, $name).  Use $$
-    /// for a literal $.  The result is written atomically and the original
-    /// is renamed to <file>.bak.
+    /// that patterns never need to account for CRLF.  The result is written
+    /// atomically and the original is renamed to <file>.bak.
+    ///
+    /// Capture-group references ($0, $1, $name, $$) in the replacement are
+    /// expanded only when the pattern has at least one capturing group.  For
+    /// a group-less pattern — including every --fixed-strings search — the
+    /// replacement is written literally, so a bare $ (e.g. $5.00) is
+    /// preserved rather than consumed.  Add a capturing group and use $1 if
+    /// you need a back-reference.
     ///
     /// By default the replacement string is interpreted with C-style
     /// backslash escapes (`\n` → newline, `\t` → tab, `\r` → CR, `\\` →
     /// backslash, `\0` → NUL, `\xHH` → raw byte, `\uXXXX` / `\UXXXXXXXX` →
     /// Unicode scalar).  Pass `--literal-replacement` to disable escape
-    /// decoding and use the replacement bytes verbatim.  Capture-group
-    /// references (`$0`, `$1`, `$name`, `$$`) are processed in either mode.
+    /// decoding and use the replacement bytes verbatim.
     Replace {
         /// File to modify in place.
         file: PathBuf,
@@ -336,10 +389,11 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         pattern: String,
 
-        /// Replacement template.  Capture groups: $0/$1/$name.  Literal $: $$.
-        /// By default backslash escapes (`\n`, `\t`, `\r`, `\\`, `\0`, `\xHH`,
-        /// `\uXXXX`, `\UXXXXXXXX`) are decoded into their corresponding
-        /// bytes; pass `--literal-replacement` to disable.
+        /// Replacement template.  Capture groups ($0/$1/$name, literal $ via
+        /// $$) are expanded only when the pattern has a capturing group;
+        /// otherwise $ is literal.  By default backslash escapes (`\n`, `\t`,
+        /// `\r`, `\\`, `\0`, `\xHH`, `\uXXXX`, `\UXXXXXXXX`) are decoded into
+        /// their corresponding bytes; pass `--literal-replacement` to disable.
         #[arg(allow_hyphen_values = true)]
         replacement: String,
 
@@ -353,8 +407,8 @@ enum Commands {
         /// backslash escapes such as `\n`, `\t`, `\\`, `\xHH`, `\uXXXX`.
         /// Without this flag the replacement is decoded using `tpu`'s
         /// standard escape codec so that, for example, `\n` produces a
-        /// newline.  Capture-group references (`$1`, `$name`, `$$`) are
-        /// processed regardless of this flag.
+        /// newline.  Capture-group references (`$1`, `$name`, `$$`) are still
+        /// only expanded when the pattern has a capturing group.
         #[arg(long, short = 'L')]
         literal_replacement: bool,
 
@@ -972,6 +1026,21 @@ enum Commands {
 }
 
 fn main() {
+    // clap's argument parsing and debug-time validation are stack-heavy for a
+    // command tree this large; in debug builds that can overflow Windows'
+    // small (1 MiB) main-thread stack.  Run everything on a worker thread with
+    // a generous stack so the tool stays robust as more subcommands are added.
+    let worker = std::thread::Builder::new()
+        .stack_size(16 * 1024 * 1024)
+        .spawn(real_main)
+        .expect("spawn tpu worker thread");
+    if worker.join().is_err() {
+        // The worker panicked; its message was already printed to stderr.
+        std::process::exit(101);
+    }
+}
+
+fn real_main() {
     let argv: Vec<String> = std::env::args().collect();
     let cli = if let Some(rsp_path) = rsp::try_rsp_path(&argv) {
         // @file invocation: read and tokenise the response file, then
@@ -1262,16 +1331,65 @@ fn run(
             Ok(())
         }
 
+        Commands::Create {
+            file,
+            utf8,
+            bom,
+            data,
+            line_ending,
+            allow_mojibake,
+        } => {
+            // Accept content from the positional arg or from stdin.
+            // tpu-mcp passes content via stdin (no positional arg).
+            let text = match data {
+                Some(s) => s,
+                None => {
+                    use std::io::Read;
+                    let mut s = String::new();
+                    io::stdin()
+                        .read_to_string(&mut s)
+                        .map_err(|e| format!("create: reading stdin: {e}"))?;
+                    s
+                }
+            };
+            let output_encoding = if utf8 {
+                OutputEncoding::Utf8
+            } else {
+                OutputEncoding::Preserve
+            };
+            let bom_policy = bom.unwrap_or_default();
+            let le_override = resolve_write_line_ending(
+                line_ending.as_deref(),
+                &file,
+                cli.git_root.as_deref(),
+                eol_normalize,
+            )?;
+            cmd::create::run(
+                &file,
+                &text,
+                output_encoding,
+                bom_policy,
+                le_override,
+                IoMode::Mmap,
+                if allow_mojibake {
+                    mojibake::WritePolicy::permissive()
+                } else {
+                    mojibake::WritePolicy::default()
+                },
+            )?;
+            Ok(())
+        }
+
         Commands::Replace {
             file,
             pattern,
             replacement,
-            fixed_strings,
             literal_replacement,
             multiline,
             diff,
             count,
             dry_run,
+            fixed_strings,
             line_ending,
             allow_mojibake,
         } => {
