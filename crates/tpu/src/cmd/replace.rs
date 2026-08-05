@@ -25,18 +25,34 @@
 //! `--literal-replacement`.  By the time bytes reach [`run`] they should
 //! already contain real LF/TAB/etc. bytes for any escapes the user wrote.
 //!
+//! ## Regex is opt-in
+//!
+//! By default `pattern` is treated as a fixed literal string (every regex
+//! metacharacter is escaped via [`regex::escape`]) — there is no implicit
+//! regex interpretation.  Pass `--regex`/`-E` (CLI) or `"regex": true` (MCP)
+//! to interpret `pattern` as a `regex::bytes` pattern instead.  This exists
+//! because ambiguous capture-group syntax (see below) is easy to get wrong
+//! by accident when regex parsing kicks in for what was meant to be a plain
+//! literal search/replace.
+//!
 //! ## Capture-group expansion vs. literal `$`
 //!
 //! Capture-group references (`$0`, `$1`, `$name`, `$$`) are expanded by the
 //! regex engine via [`regex::bytes::Captures::expand`] **only when the pattern
 //! actually contains at least one explicit capture group**.  When the pattern
-//! has no groups — every `fixed_strings` search, and any regex without `( … )`
-//! — the replacement bytes are written verbatim, so a literal `$` (prices like
-//! `$5.00`, shell variables, `${TOKEN}` placeholders) is preserved instead of
-//! being silently consumed as a group reference.  This means `$0` is *not*
-//! interpreted as "the whole match" for a group-less pattern; add a capturing
-//! group (e.g. wrap the pattern in `( … )` and use `$1`) if you need a
-//! back-reference.
+//! has no groups — every non-regex (literal) search, and any regex without
+//! `( … )` — the replacement bytes are written verbatim, so a literal `$`
+//! (prices like `$5.00`, shell variables, `${TOKEN}` placeholders) is
+//! preserved instead of being silently consumed as a group reference.  This
+//! means `$0` is *not* interpreted as "the whole match" for a group-less
+//! pattern; add a capturing group (e.g. wrap the pattern in `( … )` and use
+//! `$1`) if you need a back-reference.
+//!
+//! When you *do* opt into regex with capture groups, disambiguate a numbered
+//! reference from following literal text with braces: `${1}token`, not
+//! `$1token` — the latter is parsed as a reference to a group *named*
+//! `1token`, which almost never exists, silently dropping both the group
+//! substitution and the literal suffix.
 //!
 //! ## Write-time mojibake guard
 //!
@@ -122,13 +138,15 @@ pub fn decode_replacement(s: &str, literal: bool) -> Result<Vec<u8>, String> {
 /// the check.
 /// Options for [`run`], bundling the many positional flags so that call
 /// sites name each field and cannot accidentally transpose the bare
-/// booleans (`multiline` / `fixed_strings` / `count_only` / `dry_run`).
+/// booleans (`multiline` / `regex` / `count_only` / `dry_run`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReplaceOptions {
     /// Prepend `(?m)` to the pattern so `^` / `$` match at LF boundaries.
     pub multiline: bool,
-    /// Treat the pattern as a literal fixed string (regex-escaped).
-    pub fixed_strings: bool,
+    /// Interpret `pattern` as a `regex::bytes` pattern.  When `false` (the
+    /// default), `pattern` is treated as a fixed literal string (every regex
+    /// metacharacter is escaped) — regex is opt-in, never implicit.
+    pub regex: bool,
     /// Override the output line ending; `None` preserves the file's.
     pub line_ending_override: Option<LineEnding>,
     /// Count matches without modifying the file.
@@ -155,17 +173,17 @@ pub fn run(
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let ReplaceOptions {
         multiline,
-        fixed_strings,
+        regex,
         line_ending_override,
         count_only,
         dry_run,
         io_mode,
         policy,
     } = opts;
-    let escaped = if fixed_strings {
-        regex::escape(pattern)
-    } else {
+    let escaped = if regex {
         pattern.to_owned()
+    } else {
+        regex::escape(pattern)
     };
     let effective_pattern = if multiline {
         format!("(?m){escaped}")
@@ -190,9 +208,9 @@ pub fn run(
     // cannot reference anything useful, so we treat the replacement bytes as a
     // literal string rather than a capture-group template.  This keeps `$`
     // (e.g. prices like `$5.00`, shell variables, template placeholders)
-    // intact instead of silently consuming it as a group reference.  Fixed-
-    // string patterns (`fixed_strings`) always land here, so a literal search
-    // implies a literal replacement.  `captures_len()` counts the implicit
+    // intact instead of silently consuming it as a group reference.  Non-
+    // regex (literal) patterns always land here, so a literal search implies
+    // a literal replacement.  `captures_len()` counts the implicit
     // whole-match group 0, so `> 1` means at least one explicit group exists.
     let has_capture_groups = re.captures_len() > 1;
 
@@ -454,7 +472,7 @@ mod tests {
         pattern: &str,
         replacement: &[u8],
         multiline: bool,
-        fixed_strings: bool,
+        regex: bool,
         line_ending_override: Option<LineEnding>,
         diff_out: Option<&mut dyn Write>,
         count: bool,
@@ -467,7 +485,7 @@ mod tests {
             diff_out,
             ReplaceOptions {
                 multiline,
-                fixed_strings,
+                regex,
                 line_ending_override,
                 count_only: count,
                 dry_run,
@@ -506,7 +524,7 @@ mod tests {
             pattern,
             replacement,
             multiline,
-            false,
+            true,
             None,
             diff_out,
             false,
@@ -637,7 +655,7 @@ mod tests {
             pattern,
             replacement,
             false,
-            false,
+            true,
             line_ending_override,
             None,
             false,
@@ -725,8 +743,8 @@ mod tests {
     }
 
     #[test]
-    fn replace_fixed_string_keeps_dollar_literal() {
-        // A fixed-string search never has a capturing group, so its
+    fn replace_literal_pattern_keeps_dollar_literal() {
+        // A literal (non-regex) search never has a capturing group, so its
         // replacement is always literal.
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(b"COST here\n").unwrap();
@@ -735,7 +753,7 @@ mod tests {
         drop(f);
         fs::write(&path, b"COST here\n").unwrap();
         run_test(
-            &path, "COST", b"$9.99", false, true, None, None, false, false,
+            &path, "COST", b"$9.99", false, false, None, None, false, false,
         )
         .unwrap();
         let out = fs::read(&path).unwrap();
@@ -758,7 +776,7 @@ mod tests {
             "original",
             b"replaced",
             false,
-            false,
+            true,
             None,
             None,
             false,
@@ -808,7 +826,7 @@ mod tests {
             "old",
             b"new",
             false,
-            false,
+            true,
             None,
             Some(&mut diff_buf),
             false,

@@ -53,26 +53,27 @@ pub struct FindResult {
 
 // ── Pattern compilation ───────────────────────────────────────────────────────
 
-/// Compile one `Regex` per pattern string, applying `fixed_string` and
+/// Compile one `Regex` per pattern string, applying `regex` and
 /// `multiline` transformations.
 ///
-/// `fixed_string = true` applies [`regex::escape`] so every metacharacter is
-/// literal.  `multiline = true` prepends `(?m)` so `^`/`$` match at LF
+/// `regex = false` (the default) applies [`regex::escape`] so every
+/// metacharacter is literal — regex is opt-in, never implicit.
+/// `multiline = true` prepends `(?m)` so `^`/`$` match at LF
 /// boundaries within each decoded line.  `ignore_case = true` prepends `(?i)`
 /// for case-insensitive matching.
 fn build_patterns(
     patterns: &[&str],
-    fixed_string: bool,
+    regex: bool,
     multiline: bool,
     ignore_case: bool,
 ) -> Result<Vec<Regex>, Box<dyn std::error::Error>> {
     patterns
         .iter()
         .map(|p| {
-            let escaped = if fixed_string {
-                regex::escape(p)
-            } else {
+            let escaped = if regex {
                 p.to_string()
+            } else {
+                regex::escape(p)
             };
             // Build the flag prefix: flags are composable inline modifiers.
             let flags = match (ignore_case, multiline) {
@@ -483,11 +484,13 @@ fn run_single_file(
 
 /// Options for [`run`] / [`run_with_policy`], bundling the many search flags
 /// so call sites name each field and cannot transpose the bare booleans
-/// (`fixed_string` / `multiline` / `ignore_case` / `all_match` / `invert`).
+/// (`regex` / `multiline` / `ignore_case` / `all_match` / `invert`).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FindOptions {
-    /// Treat each pattern as a literal fixed string rather than a regex.
-    pub fixed_string: bool,
+    /// Interpret each pattern as a regex.  When `false` (the default),
+    /// patterns are treated as fixed literal strings — regex is opt-in,
+    /// never implicit.
+    pub regex: bool,
     /// Prepend `(?m)` so `^` / `$` match at LF boundaries.
     pub multiline: bool,
     /// Case-insensitive matching.
@@ -548,7 +551,7 @@ pub fn run_with_policy(
     warnings_out: &mut Vec<String>,
 ) -> Result<FindResult, Box<dyn std::error::Error>> {
     let FindOptions {
-        fixed_string,
+        regex,
         multiline,
         ignore_case,
         all_match,
@@ -559,7 +562,7 @@ pub fn run_with_policy(
         numbers,
         io_mode,
     } = opts;
-    let regexes = build_patterns(patterns, fixed_string, multiline, ignore_case)?;
+    let regexes = build_patterns(patterns, regex, multiline, ignore_case)?;
     let files = expand_paths_with_policy(path_specs, glob, on_error, warnings_out)?;
     let multi_file = files.len() > 1;
 
@@ -666,7 +669,7 @@ mod tests {
     fn search_bytes(
         content: &[u8],
         patterns: &[&str],
-        fixed_string: bool,
+        regex: bool,
         multiline: bool,
         all_match: bool,
         invert: bool,
@@ -677,7 +680,7 @@ mod tests {
     ) -> (String, usize) {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), content).unwrap();
-        let regexes = build_patterns(patterns, fixed_string, multiline, false).unwrap();
+        let regexes = build_patterns(patterns, regex, multiline, false).unwrap();
         let mut buf: Vec<u8> = Vec::new();
         let count = run_single_file(
             tmp.path(),
@@ -712,7 +715,7 @@ mod tests {
         let (out, count) = search_bytes(
             &content,
             &["line"],
-            false,
+            true,
             false,
             false,
             false,
@@ -730,7 +733,7 @@ mod tests {
         let (out, count) = search_bytes(
             &ten_line_file(),
             &["line 5"],
-            false,
+            true,
             false,
             false,
             false,
@@ -748,7 +751,7 @@ mod tests {
         let (out, _) = search_bytes(
             &ten_line_file(),
             &["line 7"],
-            false,
+            true,
             false,
             false,
             false,
@@ -765,7 +768,7 @@ mod tests {
         let (out, count) = search_bytes(
             &ten_line_file(),
             &["line"],
-            false,
+            true,
             false,
             false,
             false,
@@ -783,7 +786,7 @@ mod tests {
         let (out, count) = search_bytes(
             &ten_line_file(),
             &["line 5"],
-            false,
+            true,
             false,
             false,
             true,
@@ -797,13 +800,13 @@ mod tests {
     }
 
     #[test]
-    fn fixed_strings_treats_metacharacters_as_literals() {
-        // "line 5." with fixed_string should match "line 5." literally, not "line 50"
+    fn literal_pattern_treats_metacharacters_as_literals() {
+        // "line 5." without opting into regex should match "line 5." literally, not "line 50"
         let content = b"line 5.\nline 50\n";
         let (out, count) = search_bytes(
             content,
             &["line 5."],
-            true,
+            false,
             false,
             false,
             false,
@@ -822,7 +825,7 @@ mod tests {
         let (out, count) = search_bytes(
             &ten_line_file(),
             &["NOMATCH"],
-            false,
+            true,
             false,
             false,
             false,
@@ -840,7 +843,7 @@ mod tests {
         let (out, _) = search_bytes(
             &ten_line_file(),
             &["line 3"],
-            false,
+            true,
             false,
             false,
             false,
@@ -860,7 +863,7 @@ mod tests {
         let (out, _) = search_bytes(
             &ten_line_file(),
             &["line 3"],
-            false,
+            true,
             false,
             false,
             false,
@@ -882,7 +885,7 @@ mod tests {
         let (_, count) = search_bytes(
             content,
             &["^world$"],
-            false,
+            true,
             true,
             false,
             false,
@@ -899,7 +902,7 @@ mod tests {
         let (_, count) = search_bytes(
             &ten_line_file(),
             &["line 1$", "line 2$"],
-            false,
+            true,
             true,
             false,
             false,
@@ -920,7 +923,7 @@ mod tests {
         let (out, count) = search_bytes(
             &ten_line_file(),
             &["line", "5"],
-            false,
+            true,
             false,
             true,
             false,
@@ -940,7 +943,7 @@ mod tests {
         let (out, count) = search_bytes(
             b"",
             &["anything"],
-            false,
+            true,
             false,
             false,
             false,
@@ -955,7 +958,7 @@ mod tests {
 
     #[test]
     fn empty_file_count_mode_emits_zero() {
-        let (out, count) = search_bytes(b"", &["x"], false, false, false, false, 0, 0, true, false);
+        let (out, count) = search_bytes(b"", &["x"], true, false, false, false, 0, 0, true, false);
         assert_eq!(count, 0);
         assert_eq!(out.trim(), "0");
     }
@@ -966,7 +969,7 @@ mod tests {
         let (out, count) = search_bytes(
             &ten_line_file(),
             &["NOMATCH"],
-            false,
+            true,
             false,
             false,
             true,
@@ -987,7 +990,7 @@ mod tests {
         let (out, _) = search_bytes(
             content,
             &["^c$|^e$"],
-            false,
+            true,
             true,
             false,
             false,
@@ -1013,7 +1016,7 @@ mod tests {
         let (out, _) = search_bytes(
             &content,
             &["line 2$|line 8$"],
-            false,
+            true,
             true,
             false,
             false,
@@ -1036,7 +1039,7 @@ mod tests {
         let (_, count) = search_bytes(
             &ten_line_file(),
             &["line", "5"],
-            false,
+            true,
             false,
             true,
             true,
@@ -1054,7 +1057,7 @@ mod tests {
         let (out, count) = search_bytes(
             b"hello",
             &["hello"],
-            false,
+            true,
             false,
             false,
             false,
@@ -1073,7 +1076,7 @@ mod tests {
         let (out, _) = search_bytes(
             &ten_line_file(),
             &["line 1$"],
-            false,
+            true,
             true,
             false,
             false,
@@ -1092,7 +1095,7 @@ mod tests {
         let (out, _) = search_bytes(
             &ten_line_file(),
             &["line 10"],
-            false,
+            true,
             false,
             false,
             false,
@@ -1111,7 +1114,7 @@ mod tests {
         let (out, _) = search_bytes(
             &ten_line_file(),
             &["line 5"],
-            false,
+            true,
             false,
             false,
             false,

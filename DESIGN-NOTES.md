@@ -241,7 +241,7 @@ path pushes the raw bytes and the `--diff` preview path uses `regex::bytes::NoEx
 Historically the replacement was always run through `expand`, so a `$` that the user
 intended literally (prices like `$5.00`, shell variables like `$HOME`, `${TOKEN}`
 placeholders) was silently consumed as a group reference and lost — most painfully for
-`--fixed-strings` searches, where a capturing group is impossible by construction.  Tying
+literal (non-regex) searches, where a capturing group is impossible by construction.  Tying
 expansion to group presence makes the common "literal search, literal replace" case
 behave as written while preserving back-references for patterns that opt into them.
 
@@ -633,11 +633,14 @@ for patterns or paths is a hard CLI error (exit 2); there is no stdin fallback.
 
 ### Pattern syntax
 
-Patterns use the `regex` crate.  Syntax reference:
-<https://docs.rs/regex/latest/regex/#syntax>
+Patterns use the `regex` crate, but only when opted into. By default every pattern
+is a fixed literal string; pass `--regex` (short: `-E`) to interpret patterns using
+regex syntax instead: <https://docs.rs/regex/latest/regex/#syntax>
 
-`--fixed-strings` (short: `-F`) applies `regex::escape` to every pattern before
-compilation, making all metacharacters literal.  It is the inverse of the syntax above.
+Regex is opt-in (not the default) so that an accidental metacharacter in a literal
+search target never silently changes what gets matched. Without `--regex`, every
+metacharacter (`{`, `(`, `.`, `*`, `+`, `?`, …) is matched literally via
+`regex::escape`.
 
 ### Multiple patterns — OR vs AND
 

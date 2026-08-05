@@ -364,26 +364,31 @@ pub fn list() -> Value {
         {
             "name": "tpu_replace_in_file",
             "description":
-                "Perform an in-place regex substitution on a file. The pattern is matched \
-                 against a LF-normalised view so CRLF is transparent — \\n in the pattern \
-                 always means line feed. Uses Rust regex::bytes syntax. Capture groups: \
-                 $0 (whole match), $1/$2/…, $name. Use $$ for a literal dollar sign. \
+                "Perform an in-place substitution on a file. By default `pattern` is a \
+                 fixed literal string — regex is opt-in, never implicit. Pass regex:true \
+                 to interpret `pattern` as a Rust regex::bytes pattern applied to a \
+                 LF-normalised view (CRLF is transparent — \\n in the pattern always means \
+                 line feed). Capture groups (regex mode only): $0 (whole match), $1/$2/…, \
+                 $name. Use $$ for a literal dollar sign. \
                  The original file is backed up to <file>.bak before writing. \
                  Use count:true to count matches without modifying the file. \
                  Use dry_run:true to preview changes as a unified diff without writing.\n\n\
-                 ESCAPING — RECOMMENDED DEFAULT: when the search target is literal text \
-                 (code, JSON, structured data, anything containing . ( ) [ ] { } * + ? | ^ $ \\), \
-                 set fixed_strings:true and send the unescaped text. This avoids regex \
-                 escaping entirely and is almost always what you want.\n\n\
-                 ESCAPING — 'pattern' (regex mode, fixed_strings:false): escape ONLY \
-                 regex metacharacters. Do NOT add an extra layer for JSON; the transport \
-                 already handles that.\n\n\
+                 ESCAPING — RECOMMENDED DEFAULT: leave regex unset (or false) and send the \
+                 search target as unescaped literal text (code, JSON, structured data, \
+                 anything containing . ( ) [ ] { } * + ? | ^ $ \\). This is almost always \
+                 what you want and avoids regex escaping entirely.\n\n\
+                 ESCAPING — 'pattern' (regex:true only): escape ONLY regex metacharacters. \
+                 Do NOT add an extra layer for JSON; the transport already handles that.\n\n\
                  ESCAPING — 'replacement': capture refs ($1, $name, $$) are honoured ONLY \
-                 when the pattern has at least one capturing group. When the pattern has \
-                 no groups — every fixed_strings search, and any regex without ( … ) — the \
+                 when regex:true AND the pattern has at least one capturing group. \
+                 Otherwise — the default literal mode, and any regex without ( … ) — the \
                  replacement is written literally, so a bare $ (e.g. $5.00, $HOME, \
                  ${TOKEN}) is preserved rather than consumed. Add a capturing group and \
-                 use $1 if you need a back-reference. \
+                 use $1 if you need a back-reference, and disambiguate a numbered \
+                 reference from following literal text with braces: ${1}token, NOT \
+                 $1token — the latter is parsed as a reference to a group *named* \
+                 '1token', silently dropping both the substitution and the literal \
+                 suffix. \
                  The sequences \\n, \\r, \\t, \\\\ are always expanded to LF / CR / TAB / \\ \
                  before substitution; all other \\X pass through unchanged. Either a \
                  real newline in the JSON string OR the two characters backslash+n will \
@@ -398,24 +403,26 @@ pub fn list() -> Value {
                     "pattern": {
                         "type": "string",
                         "description":
-                            "Regex pattern in regex::bytes syntax applied to the LF-normalised \
-                             content. Use (?s) for dot-all (match across lines). \
-                             If the search target contains regex metacharacters such as \
-                             `{`, `}`, `(`, `)`, `[`, `.`, `*`, `+`, or `?` \
-                             (common in code, JSON, or structured text), set \
-                             fixed_strings:true instead of manually escaping them."
+                            "Search target. By default this is a fixed literal string — \
+                             every character, including `{`, `}`, `(`, `)`, `[`, `.`, `*`, \
+                             `+`, `?`, is matched literally. Set regex:true to interpret \
+                             this as a Rust regex::bytes pattern applied to the \
+                             LF-normalised content instead (use (?s) for dot-all)."
                     },
                     "replacement": {
                         "type": "string",
                         "description":
                             "Replacement template. Capture-group references are honoured \
-                             ONLY when the pattern has at least one capturing group: then \
-                             $0 is the whole match, $1/$name are numbered/named groups, and \
-                             $$ is a literal dollar sign. When the pattern has no groups \
-                             (every fixed_strings search, and any regex without ( … )) the \
-                             replacement is taken literally, so $ is written as-is (prices \
-                             like $5.00, variables like $HOME, or ${TOKEN} placeholders are \
-                             preserved). \
+                             ONLY when regex:true AND the pattern has at least one \
+                             capturing group: then $0 is the whole match, $1/$name are \
+                             numbered/named groups, and $$ is a literal dollar sign. \
+                             Otherwise (the default literal mode, and any regex without \
+                             ( … )) the replacement is taken literally, so $ is written \
+                             as-is (prices like $5.00, variables like $HOME, or ${TOKEN} \
+                             placeholders are preserved). When you do use a numbered \
+                             capture reference followed by literal text, disambiguate with \
+                             braces: ${1}token, NOT $1token — the latter is parsed as a \
+                             reference to a group *named* '1token'. \
                              Any CRLF or bare CR in the replacement text is normalized \
                              to LF before substitution. \
                              Standard C-style backslash escapes are expanded before the \
@@ -467,14 +474,15 @@ pub fn list() -> Value {
                              diff without modifying the file. Returns non-zero when changes \
                              would be made. Mutually exclusive with count. Default: false."
                     },
-                    "fixed_strings": {
+                    "regex": {
                         "type": "boolean",
                         "description":
-                            "Treat `pattern` as a fixed literal string; disable all regex \
-                             metacharacters. Use whenever the search target contains `{`, \
-                             `}`, `(`, `)`, `[`, `.`, `*`, `+`, or `?` � for example \
-                             when replacing an exact code block, a function call, or any \
-                             structured text. Equivalent to -F in grep."
+                            "If true, interpret `pattern` as a Rust regex::bytes pattern \
+                             instead of a fixed literal string. Default: false. Regex is \
+                             opt-in so an accidental metacharacter, or an ambiguous \
+                             capture-group reference in `replacement` (e.g. $1token being \
+                             parsed as group name '1token'), never silently changes what \
+                             gets matched or replaced."
                     },
                     "allow_mojibake": {
                         "type": "boolean",
@@ -500,8 +508,8 @@ pub fn list() -> Value {
                  number you trust — the edit is atomic, encoding-preserving, and backed \
                  by the same .bak / mojibake-guard machinery as tpu_write_file. \
                  When the target text is unique and you have just read it, prefer \
-                 tpu_replace_in_file with fixed_strings:true instead, because line \
-                 numbers can shift between reads.\n\n\
+                 tpu_replace_in_file instead (its default literal-string matching needs \
+                 no escaping), because line numbers can shift between reads.\n\n\
                  All operation positions reference the original file; multiple ops in one \
                  call are applied without interference. The original file is backed up \
                  to <file>.bak before writing.\n\n\
@@ -1040,7 +1048,9 @@ pub fn list() -> Value {
             "name": "tpu_find",
             "description":
                 "Search one or more files (or glob patterns) for lines matching one \
-                 or more regex (or fixed-string) patterns.  Files are decoded with \
+                 or more patterns. By default each pattern is a fixed literal string — \
+                 regex is opt-in, never implicit; set regex:true to interpret patterns \
+                 as Rust regexes instead. Files are decoded with \
                  encoding and line-ending normalisation (same rules as tpu_read_file). \
                  Matched lines are emitted as UTF-8 to stdout with optional context \
                  lines (-A/-B), line-number prefixes, or a match count. \
@@ -1054,12 +1064,12 @@ pub fn list() -> Value {
                     "pattern": {
                         "type": "string",
                         "description":
-                            "Primary regex (or fixed-string) pattern to search for. \
-                             At least one of 'pattern' or 'patterns' must be supplied. \
-                             If the search target contains regex metacharacters such as \
-                             `{`, `}`, `(`, `)`, `[`, `.`, `*`, `+`, or `?` \
-                             (common in code, JSON, or structured text), set \
-                             fixed_strings:true instead of manually escaping them."
+                            "Primary pattern to search for. By default this is a fixed \
+                             literal string — every character, including `{`, `}`, `(`, \
+                             `)`, `[`, `.`, `*`, `+`, `?`, is matched literally. Set \
+                             regex:true to interpret every pattern as a Rust regex \
+                             instead. At least one of 'pattern' or 'patterns' must be \
+                             supplied."
                     },
                     "patterns": {
                         "type": "array",
@@ -1075,7 +1085,8 @@ pub fn list() -> Value {
                             "Absolute path to a file, directory, or wax glob to \
                              search. A directory must be paired with `glob` to \
                              select which files under it to search. At least one \
-                             of 'path' or 'paths' must be supplied."
+                             of 'path', 'paths', 'file', or 'files' must be supplied. \
+                             'file' is accepted as an alias for this field."
                     },
                     "paths": {
                         "type": "array",
@@ -1083,7 +1094,17 @@ pub fn list() -> Value {
                             "Additional file paths, directories, or wax globs. \
                              Combined with 'path' (if present). When `glob` is \
                              supplied it applies to every directory entry in \
-                             `path`/`paths`; literal file entries are searched as-is.",
+                             `path`/`paths`; literal file entries are searched as-is. \
+                             'files' is accepted as an alias for this field.",
+                        "items": { "type": "string" }
+                    },
+                    "file": {
+                        "type": "string",
+                        "description": "Alias for 'path'. Absolute path to a single file to search."
+                    },
+                    "files": {
+                        "type": "array",
+                        "description": "Alias for 'paths'. Additional file paths to search.",
                         "items": { "type": "string" }
                     },
                     "glob": {
@@ -1105,11 +1126,13 @@ pub fn list() -> Value {
                             "When true, a line must match ALL supplied patterns to be \
                              emitted (AND mode).  Default false (OR mode)."
                     },
-                    "fixed_strings": {
+                    "regex": {
                         "type": "boolean",
                         "description":
-                            "Treat every pattern as a fixed literal string rather than \
-                             a regex.  Equivalent to -F in grep."
+                            "If true, interpret every pattern as a Rust regex instead of \
+                             a fixed literal string. Default: false. Equivalent to the \
+                             inverse of -F in grep (grep defaults to basic regex; here \
+                             regex is opt-in)."
                     },
                     "ignore_case": {
                         "type": "boolean",
@@ -1699,10 +1722,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             .get("multiline")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let fixed_strings = args
-            .get("fixed_strings")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
         let le_override = eol_write_override(args, &file, config)?;
         let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
         let count = args.get("count").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1725,7 +1745,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             diff_out,
             tpu::cmd::replace::ReplaceOptions {
                 multiline,
-                fixed_strings,
+                regex,
                 line_ending_override: le_override,
                 count_only: count,
                 dry_run,
@@ -2334,15 +2354,23 @@ fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
             }
         }
 
-        // Collect paths: primary "path" + optional "paths" array; normalise URIs.
+        // Collect paths: primary "path"/"file" + optional "paths"/"files"
+        // array; normalise URIs. "file"/"files" are accepted as aliases of
+        // "path"/"paths" since every other tool in this server takes a
+        // singular "file" argument and callers routinely reach for that name
+        // here too.
         let mut all_paths: Vec<String> = Vec::new();
-        if let Some(p) = args.get("path").and_then(|v| v.as_str()) {
-            all_paths.push(normalize_file_path(p));
+        for key in ["path", "file"] {
+            if let Some(p) = args.get(key).and_then(|v| v.as_str()) {
+                all_paths.push(normalize_file_path(p));
+            }
         }
-        if let Some(arr) = args.get("paths").and_then(|v| v.as_array()) {
-            for p in arr {
-                if let Some(s) = p.as_str() {
-                    all_paths.push(normalize_file_path(s));
+        for key in ["paths", "files"] {
+            if let Some(arr) = args.get(key).and_then(|v| v.as_array()) {
+                for p in arr {
+                    if let Some(s) = p.as_str() {
+                        all_paths.push(normalize_file_path(s));
+                    }
                 }
             }
         }
@@ -2354,10 +2382,7 @@ fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
             return Err("find: at least one path is required".into());
         }
 
-        let fixed_strings = args
-            .get("fixed_strings")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
         let multiline = args
             .get("multiline")
             .and_then(|v| v.as_bool())
@@ -2414,7 +2439,7 @@ fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
             &pattern_refs,
             glob.as_deref(),
             tpu::cmd::find::FindOptions {
-                fixed_string: fixed_strings,
+                regex,
                 multiline,
                 ignore_case,
                 all_match,
@@ -4084,7 +4109,6 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "hello world",
             "replacement": "hello\r\nworld",
-            "fixed_strings": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -4114,7 +4138,6 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "alpha beta",
             "replacement": "alpha\r\nbeta",
-            "fixed_strings": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -4257,7 +4280,6 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "placeholder",
             "replacement": "--header-value",
-            "fixed_strings": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -4311,7 +4333,6 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "hello world",
             "replacement": "hello\\nworld",
-            "fixed_strings": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -4342,7 +4363,6 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "key: value",
             "replacement": "key:\\tvalue",
-            "fixed_strings": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -4366,7 +4386,6 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "path: here",
             "replacement": "path:\\\\value",
-            "fixed_strings": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -4391,6 +4410,7 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "(fn foo)",
             "replacement": "\\n$1",
+            "regex": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -4438,7 +4458,6 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "foo",
             "replacement": "bar",
-            "fixed_strings": true,
         });
 
         let result = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");

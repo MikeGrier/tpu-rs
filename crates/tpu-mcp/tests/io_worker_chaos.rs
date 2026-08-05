@@ -450,6 +450,7 @@ fn chaos_mixed_operations_under_killer() {
                     "file": path_s,
                     "pattern": format!(r"seed-{i}(?:-r\d+)*"),
                     "replacement": format!("seed-{i}-r{round}"),
+                    "regex": true,
                 }),
             );
         }

@@ -363,18 +363,23 @@ enum Commands {
         allow_mojibake: bool,
     },
 
-    /// In-place regex replace in a file.
+    /// In-place substitution in a file.
     ///
-    /// The pattern is applied to a normalised (LF-only) view of the file so
-    /// that patterns never need to account for CRLF.  The result is written
-    /// atomically and the original is renamed to <file>.bak.
+    /// By default `pattern` is treated as a fixed literal string (regex is
+    /// opt-in — pass `--regex`/`-E` to interpret `pattern` as a
+    /// `regex::bytes` pattern). The pattern is applied to a normalised
+    /// (LF-only) view of the file so that patterns never need to account for
+    /// CRLF.  The result is written atomically and the original is renamed
+    /// to <file>.bak.
     ///
     /// Capture-group references ($0, $1, $name, $$) in the replacement are
     /// expanded only when the pattern has at least one capturing group.  For
-    /// a group-less pattern — including every --fixed-strings search — the
-    /// replacement is written literally, so a bare $ (e.g. $5.00) is
+    /// a group-less pattern — including every non-regex (literal) search —
+    /// the replacement is written literally, so a bare $ (e.g. $5.00) is
     /// preserved rather than consumed.  Add a capturing group and use $1 if
-    /// you need a back-reference.
+    /// you need a back-reference; disambiguate a numbered reference from
+    /// following literal text with braces (`${1}token`, not `$1token` — the
+    /// latter is parsed as a reference to a group *named* `1token`).
     ///
     /// By default the replacement string is interpreted with C-style
     /// backslash escapes (`\n` → newline, `\t` → tab, `\r` → CR, `\\` →
@@ -385,7 +390,8 @@ enum Commands {
         /// File to modify in place.
         file: PathBuf,
 
-        /// Regex pattern (regex::bytes syntax, applied to LF-normalised view).
+        /// Pattern to search for. Treated as a fixed literal string unless
+        /// --regex is passed.
         #[arg(allow_hyphen_values = true)]
         pattern: String,
 
@@ -397,11 +403,14 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         replacement: String,
 
-        /// Treat `pattern` as a fixed literal string; disable all regex metacharacters.
-        /// Use this when the search target contains characters such as `{`, `(`, `.`,
-        /// `*`, or `+` that would otherwise be interpreted as regex syntax.
-        #[arg(long, short = 'F')]
-        fixed_strings: bool,
+        /// Interpret `pattern` as a regex (regex::bytes syntax, applied to the
+        /// LF-normalised view). Without this flag `pattern` is a fixed literal
+        /// string and every regex metacharacter (`{`, `(`, `.`, `*`, `+`, …) is
+        /// matched literally. Regex is opt-in so an accidental metacharacter
+        /// or an ambiguous capture-group reference never silently changes
+        /// what gets matched or replaced.
+        #[arg(long, short = 'E')]
+        regex: bool,
 
         /// Treat the replacement string as raw bytes — do not interpret
         /// backslash escapes such as `\n`, `\t`, `\\`, `\xHH`, `\uXXXX`.
@@ -793,6 +802,9 @@ enum Commands {
     /// Windows-1252, and other encodings are transparently decoded.  Matched
     /// lines are emitted as UTF-8/LF to stdout.
     ///
+    /// By default each pattern is a fixed literal string; pass `--regex`/`-E`
+    /// to interpret patterns as regexes instead.
+    ///
     /// Simple:   `tpu find <PATTERN> <PATH>`
     /// Advanced: `tpu find --pattern P1 --pattern P2 --path G1 --path G2 [flags]`
     ///
@@ -808,8 +820,9 @@ enum Commands {
         /// select which files under it to search.
         path: Option<String>,
 
-        /// Pattern(s) to search for (Rust regex syntax).  Repeatable.
-        /// Multiple patterns are OR'd by default; use --all-match for AND.
+        /// Pattern(s) to search for. Treated as fixed literal strings unless
+        /// --regex is passed. Repeatable. Multiple patterns are OR'd by
+        /// default; use --all-match for AND.
         #[arg(long = "pattern", value_name = "PATTERN", action = clap::ArgAction::Append)]
         patterns: Vec<String>,
 
@@ -832,9 +845,12 @@ enum Commands {
         #[arg(long)]
         all_match: bool,
 
-        /// Treat each pattern as a fixed string; disable regex metacharacters.
-        #[arg(long, short = 'F')]
-        fixed_strings: bool,
+        /// Interpret each pattern as a regex (Rust regex syntax). Without
+        /// this flag every pattern is a fixed literal string — regex is
+        /// opt-in so an accidental metacharacter never silently changes
+        /// what gets matched.
+        #[arg(long, short = 'E')]
+        regex: bool,
 
         /// Match case-insensitively (equivalent to prefixing every pattern
         /// with `(?i)`).
@@ -1389,7 +1405,7 @@ fn run(
             diff,
             count,
             dry_run,
-            fixed_strings,
+            regex,
             line_ending,
             allow_mojibake,
         } => {
@@ -1418,7 +1434,7 @@ fn run(
                 diff_out,
                 cmd::replace::ReplaceOptions {
                     multiline,
-                    fixed_strings,
+                    regex,
                     line_ending_override: le_override,
                     count_only: count,
                     dry_run,
@@ -1938,7 +1954,7 @@ fn run(
             paths,
             glob,
             all_match,
-            fixed_strings,
+            regex,
             ignore_case,
             numbers,
             count,
@@ -1982,7 +1998,7 @@ fn run(
                 &pattern_refs,
                 glob.as_deref(),
                 cmd::find::FindOptions {
-                    fixed_string: fixed_strings,
+                    regex,
                     multiline,
                     ignore_case,
                     all_match,

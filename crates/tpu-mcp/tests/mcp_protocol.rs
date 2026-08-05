@@ -360,7 +360,6 @@ fn mcp_it_3_replace_basic() {
             "file": f.to_str().unwrap(),
             "pattern": "world",
             "replacement": "earth",
-            "fixed_strings": true,
         }),
     );
     let stamp = last_json_line(&out);
@@ -396,7 +395,6 @@ fn mcp_it_4_replace_backslash_n_expands_to_newline() {
             "file": f.to_str().unwrap(),
             "pattern": "line two",
             "replacement": "second\\nthird injected",
-            "fixed_strings": true,
         }),
     );
 
@@ -528,6 +526,28 @@ fn mcp_it_7_find_matches_and_no_match() {
         content_lines.is_empty(),
         "no-match result must have no content lines; got: {no_match:?}"
     );
+}
+
+/// MCP-IT-7b: `tpu_find` accepts `file` as an alias for `path` (agents
+/// routinely reach for `file` since every other tool uses that name).
+#[test]
+fn mcp_it_7b_find_accepts_file_alias_for_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("find_alias_target.txt");
+    std::fs::write(&f, "alpha fox here\nbeta bar there\n").unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let out = s.call_tool(
+        "tpu_find",
+        json!({
+            "pattern": "fox",
+            "file": f.to_str().unwrap(),
+        }),
+    );
+    assert_has("find hit via file alias", &out, "alpha fox here");
+    assert_lacks("non-matching line excluded", &out, "beta bar there");
 }
 
 /// MCP-IT-8: `tpu_copy_file` copies a file; result JSON includes counts.
