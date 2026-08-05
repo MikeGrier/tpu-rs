@@ -10006,7 +10006,7 @@ fn hv_write_read_roundtrip_dash_content() {
 
 /// FS-IT-1: default literal matching matches a literal `{` without a regex error.
 #[test]
-fn fs_replace_fixed_strings_curly_brace_matches() {
+fn fs_replace_default_literal_curly_brace_matches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs1.txt");
     fs::write(&path, b"fn foo() { return 1; }\n").unwrap();
@@ -10040,7 +10040,7 @@ fn fs_replace_regex_bare_curly_brace_without_flag_errors() {
 
 /// FS-IT-3: default literal matching matches a literal `(` without a regex error.
 #[test]
-fn fs_replace_fixed_strings_paren_matches() {
+fn fs_replace_default_literal_paren_matches() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs3.txt");
     fs::write(&path, b"assert_eq!(a, b);\n").unwrap();
@@ -10061,7 +10061,7 @@ fn fs_replace_fixed_strings_paren_matches() {
 
 /// FS-IT-4: default literal matching treats `.` as a literal character, not any-char.
 #[test]
-fn fs_replace_fixed_strings_dot_is_literal() {
+fn fs_replace_default_literal_dot_is_literal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs4.txt");
     // "v1.0" should match; "v1X0" (where dot-as-wildcard would match) must not.
@@ -10083,7 +10083,7 @@ fn fs_replace_fixed_strings_dot_is_literal() {
 
 /// FS-IT-5: default literal matching treats `*` as a literal character.
 #[test]
-fn fs_replace_fixed_strings_star_is_literal() {
+fn fs_replace_default_literal_star_is_literal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs5.txt");
     fs::write(&path, b"use foo::*;\nuse bar::baz;\n").unwrap();
@@ -10108,7 +10108,7 @@ fn fs_replace_fixed_strings_star_is_literal() {
 
 /// FS-IT-6: default literal matching treats `+` as a literal.
 #[test]
-fn fs_replace_fixed_strings_plus_is_literal() {
+fn fs_replace_default_literal_plus_is_literal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs6.txt");
     fs::write(&path, b"score: +100\nscore: 100\n").unwrap();
@@ -10129,7 +10129,7 @@ fn fs_replace_fixed_strings_plus_is_literal() {
 
 /// FS-IT-7: default literal matching treats `?` as a literal.
 #[test]
-fn fs_replace_fixed_strings_question_mark_is_literal() {
+fn fs_replace_default_literal_question_mark_is_literal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs7.txt");
     fs::write(&path, b"is it done? yes\nis it done  yes\n").unwrap();
@@ -10151,7 +10151,7 @@ fn fs_replace_fixed_strings_question_mark_is_literal() {
 
 /// FS-IT-8: default literal matching replaces all occurrences of a literal pattern.
 #[test]
-fn fs_replace_fixed_strings_replaces_all_occurrences() {
+fn fs_replace_default_literal_replaces_all_occurrences() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs8.txt");
     // Three occurrences of "a.b" (literal dot).
@@ -10170,7 +10170,7 @@ fn fs_replace_fixed_strings_replaces_all_occurrences() {
 
 /// FS-IT-9: default literal matching with a bracket expression pattern.
 #[test]
-fn fs_replace_fixed_strings_with_bracket_expression() {
+fn fs_replace_default_literal_with_bracket_expression() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs9.txt");
     // "[cfg(test)]" — square brackets and parens are both metacharacters.
@@ -10193,7 +10193,7 @@ fn fs_replace_fixed_strings_with_bracket_expression() {
 /// FS-IT-10: `-E` (short form of `--regex`) is accepted and enables regex
 /// interpretation of the pattern.
 #[test]
-fn fs_replace_short_flag_f_accepted() {
+fn fs_replace_short_flag_e_accepted() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs10.txt");
     fs::write(&path, b"value = (x + y)\n").unwrap();
@@ -10215,7 +10215,7 @@ fn fs_replace_short_flag_f_accepted() {
 
 /// FS-IT-11: default literal matching, zero-match case still creates `.bak` and exits 0.
 #[test]
-fn fs_replace_fixed_strings_zero_match_exits_ok() {
+fn fs_replace_default_literal_zero_match_exits_ok() {
     let (dir, f) = cp("singleline.txt");
     // Pattern contains regex metacharacters but is not present in the file.
     ok(tpu()
@@ -10232,7 +10232,7 @@ fn fs_replace_fixed_strings_zero_match_exits_ok() {
 
 /// FS-IT-12: `--count` with default literal matching counts literal occurrences.
 #[test]
-fn fs_replace_fixed_strings_count_counts_literal_occurrences() {
+fn fs_replace_default_literal_count_counts_literal_occurrences() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs12.txt");
     // Four occurrences of the literal "x.y" (dot must not match 'X', 'Y', etc.)

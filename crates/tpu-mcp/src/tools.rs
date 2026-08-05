@@ -1711,6 +1711,7 @@ fn call_create_file(args: &Value, config: &ServerConfig) -> ToolResult {
 fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_replace_in_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
+        reject_removed_fixed_strings_arg(args)?;
         let file = resolve_file_arg(args)?;
         let pattern = require_str(args, "pattern")?;
         let replacement_raw = require_str(args, "replacement")?;
@@ -2341,6 +2342,7 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
 fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_find", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
+        reject_removed_fixed_strings_arg(args)?;
         // Collect patterns: primary "pattern" + optional "patterns" array.
         let mut all_patterns: Vec<String> = Vec::new();
         if let Some(p) = args.get("pattern").and_then(|v| v.as_str()) {
@@ -2379,7 +2381,11 @@ fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
             return Err("find: at least one pattern is required".into());
         }
         if all_paths.is_empty() {
-            return Err("find: at least one path is required".into());
+            return Err(
+                "find: at least one path is required ('path'/'paths', or the \
+                 'file'/'files' aliases)"
+                    .into(),
+            );
         }
 
         let regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -3315,6 +3321,22 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, Box<dyn std::e
     args.get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("missing required argument '{key}'").into())
+}
+
+/// Reject the removed `fixed_strings` argument with a migration error instead
+/// of silently ignoring it (ad-hoc JSON arg parsing otherwise drops unknown
+/// keys, which would flip a caller's intended `fixed_strings:false` regex
+/// search into today's literal-by-default matching without any signal).
+fn reject_removed_fixed_strings_arg(args: &Value) -> Result<(), Box<dyn std::error::Error>> {
+    if args.get("fixed_strings").is_some() {
+        return Err(
+            "the 'fixed_strings' argument was removed: matching is now literal \
+             by default, and regex is opt-in via 'regex': true (the inverse of the old \
+             'fixed_strings' meaning)"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Build a [`tpu::mojibake::WritePolicy`] from a tool-call's JSON args.

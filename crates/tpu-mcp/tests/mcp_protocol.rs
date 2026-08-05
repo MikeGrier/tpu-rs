@@ -550,6 +550,54 @@ fn mcp_it_7b_find_accepts_file_alias_for_path() {
     assert_lacks("non-matching line excluded", &out, "beta bar there");
 }
 
+/// MCP-IT-7c: `tpu_find`/`tpu_replace_in_file` reject the removed
+/// `fixed_strings` argument with a clear migration error instead of
+/// silently ignoring it.
+#[test]
+fn mcp_it_7c_removed_fixed_strings_arg_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("fixed_strings_rejected.txt");
+    std::fs::write(&f, "hello world\n").unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let find_result = s.rpc(
+        "tools/call",
+        json!({
+            "name": "tpu_find",
+            "arguments": {
+                "pattern": "world",
+                "file": f.to_str().unwrap(),
+                "fixed_strings": true,
+            },
+        }),
+    );
+    assert_eq!(
+        find_result.get("isError").and_then(|v| v.as_bool()),
+        Some(true),
+        "tpu_find with 'fixed_strings' must surface isError=true; got: {find_result}"
+    );
+
+    let replace_result = s.rpc(
+        "tools/call",
+        json!({
+            "name": "tpu_replace_in_file",
+            "arguments": {
+                "file": f.to_str().unwrap(),
+                "pattern": "world",
+                "replacement": "earth",
+                "fixed_strings": true,
+            },
+        }),
+    );
+    assert_eq!(
+        replace_result.get("isError").and_then(|v| v.as_bool()),
+        Some(true),
+        "tpu_replace_in_file with 'fixed_strings' must surface isError=true; got: {replace_result}"
+    );
+}
+
 /// MCP-IT-8: `tpu_copy_file` copies a file; result JSON includes counts.
 /// Overwriting an existing destination with `overwrite=true` replaces it.
 #[test]
