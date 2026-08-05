@@ -61,7 +61,6 @@ fn replace_rejects_replacement_that_introduces_mojibake() {
         replacement_bytes,
         None, // diff_out
         tpu::cmd::replace::ReplaceOptions {
-            fixed_strings: true,
             io_mode: tpu::IoMode::Buffered,
             policy: WritePolicy::default(),
             ..Default::default()
@@ -103,7 +102,6 @@ fn replace_with_allow_mojibake_flag_succeeds() {
         replacement_bytes,
         None,
         tpu::cmd::replace::ReplaceOptions {
-            fixed_strings: true,
             io_mode: tpu::IoMode::Buffered,
             policy: WritePolicy::permissive(),
             ..Default::default()

@@ -575,7 +575,12 @@ macro_rules! replace_suite {
             #[test]
             fn match_exits_ok() {
                 let (dir, f) = tc();
-                let o = ok(tpu().arg("replace").arg(&f).arg("[a-zA-Z0-9]").arg("_"));
+                let o = ok(tpu()
+                    .arg("replace")
+                    .arg("--regex")
+                    .arg(&f)
+                    .arg("[a-zA-Z0-9]")
+                    .arg("_"));
                 let s = String::from_utf8_lossy(&o.stderr);
                 assert!(
                     s.contains("replacement"),
@@ -587,7 +592,12 @@ macro_rules! replace_suite {
             #[test]
             fn match_creates_bak() {
                 let (dir, f) = tc();
-                ok(tpu().arg("replace").arg(&f).arg("[a-zA-Z0-9]").arg("_"));
+                ok(tpu()
+                    .arg("replace")
+                    .arg("--regex")
+                    .arg(&f)
+                    .arg("[a-zA-Z0-9]")
+                    .arg("_"));
                 assert!(
                     bak(&f).exists(),
                     ".bak should be created at {}",
@@ -613,6 +623,7 @@ macro_rules! replace_suite {
                 let (dir, f) = tc();
                 ok(tpu()
                     .arg("replace")
+                    .arg("--regex")
                     .arg("--diff")
                     .arg(&f)
                     .arg("[a-zA-Z0-9]")
@@ -623,7 +634,12 @@ macro_rules! replace_suite {
             #[test]
             fn bad_regex_exits_err() {
                 let (dir, f) = tc();
-                err(tpu().arg("replace").arg(&f).arg("[invalid").arg("Z"));
+                err(tpu()
+                    .arg("replace")
+                    .arg("--regex")
+                    .arg(&f)
+                    .arg("[invalid")
+                    .arg("Z"));
                 drop(dir);
             }
         }
@@ -1488,7 +1504,12 @@ fn replace_missing_file_exits_err() {
 #[test]
 fn replace_bad_regex_exits_err_general() {
     let (dir, f) = cp("singleline.txt");
-    err(tpu().arg("replace").arg(&f).arg("[unclosed").arg("Z"));
+    err(tpu()
+        .arg("replace")
+        .arg("--regex")
+        .arg(&f)
+        .arg("[unclosed")
+        .arg("Z"));
     drop(dir);
 }
 
@@ -1516,7 +1537,12 @@ fn replace_stderr_contains_filename() {
 fn replace_capture_group_substitution() {
     let (dir, f) = cp("singleline.txt");
     // Pattern: capture "hello", replace with "[hello]".
-    ok(tpu().arg("replace").arg(&f).arg("(hello)").arg("[$1]"));
+    ok(tpu()
+        .arg("replace")
+        .arg("--regex")
+        .arg(&f)
+        .arg("(hello)")
+        .arg("[$1]"));
     let content = fs::read_to_string(&f).unwrap();
     assert!(
         content.contains("[hello]"),
@@ -1668,7 +1694,12 @@ fn replace_default_capture_group_with_newline_escape() {
     // so users can write things like `$1\n$2` to inject a newline between
     // captures.
     let (dir, f) = cp("singleline.txt");
-    ok(tpu().arg("replace").arg(&f).arg("(hel)(lo)").arg("$1\\n$2"));
+    ok(tpu()
+        .arg("replace")
+        .arg("--regex")
+        .arg(&f)
+        .arg("(hel)(lo)")
+        .arg("$1\\n$2"));
     let content = fs::read(&f).unwrap();
     assert!(
         content.windows(6).any(|w| w == b"hel\nlo"),
@@ -1683,6 +1714,7 @@ fn replace_multiline_caret_matches_line_starts() {
     let (dir, f) = cp("multiline_lf.txt");
     let o = ok(tpu()
         .arg("replace")
+        .arg("--regex")
         .arg("--multiline")
         .arg(&f)
         .arg("^line")
@@ -2580,6 +2612,7 @@ fn json_replace_bad_regex_emits_error_and_finished_false() {
     let o = err(tpu()
         .arg("--message-format=json")
         .arg("replace")
+        .arg("--regex")
         .arg(&f)
         .arg("[invalid")
         .arg("Z"));
@@ -5802,6 +5835,7 @@ fn replace_line_ending_lf_on_crlf_file() {
     // Apply a regex substitution AND change line endings to LF.
     ok(tpu()
         .arg("replace")
+        .arg("--regex")
         .arg("--line-ending=lf")
         .arg(&dst)
         .arg("[aeiou]")
@@ -5826,6 +5860,7 @@ fn replace_line_ending_crlf_on_lf_file() {
     let (_dir, dst) = cp("multiline_lf.txt");
     ok(tpu()
         .arg("replace")
+        .arg("--regex")
         .arg("--line-ending=crlf")
         .arg(&dst)
         .arg("[aeiou]")
@@ -5920,6 +5955,7 @@ fn replace_line_ending_crlf_bad_regex_exits_nonzero() {
     let original = fs::read(&dst).unwrap();
     err(tpu()
         .arg("replace")
+        .arg("--regex")
         .arg("--line-ending=crlf")
         .arg(&dst)
         .arg("[invalid")
@@ -6111,6 +6147,7 @@ fn replace_whole_line_content_ten_lines_bak_and_count() {
     // (a) 10 replacements reported.
     let o = ok(tpu()
         .arg("replace")
+        .arg("--regex")
         .arg("--multiline")
         .arg(&f)
         .arg(pattern)
@@ -6220,6 +6257,7 @@ fn replace_capture_groups_no_cross_contamination() {
     // ── Pass 1: indexed capture group $1 ─────────────────────────────────────
     let o1 = ok(tpu()
         .arg("replace")
+        .arg("--regex")
         .arg(&f)
         .arg(r"line (\d+):")
         .arg(r"[L$1]:"));
@@ -6248,6 +6286,7 @@ fn replace_capture_groups_no_cross_contamination() {
     // ── Pass 2: named capture group $n ───────────────────────────────────────
     let o2 = ok(tpu()
         .arg("replace")
+        .arg("--regex")
         .arg(&f)
         .arg(r"\[L(?P<n>\d+)\]:")
         .arg(r"{N$n}:"));
@@ -8747,6 +8786,7 @@ fn rc_replace_count_multiline_flag_counts_correctly() {
     let o = ok(tpu()
         .arg("replace")
         .arg("--count")
+        .arg("--regex")
         .arg("--multiline")
         .arg(&path)
         .arg("^start")
@@ -9283,18 +9323,18 @@ fn find_numbers_prefixes_line_numbers() {
     );
 }
 
-// ─── FN-IT-7: --fixed-strings treats the dot as a literal ────────────────────
+// ─── FN-IT-7: literal matching (the default) treats the dot as a literal ────
 
 #[test]
-fn find_fixed_strings_literal_dot() {
+fn find_default_literal_dot() {
     // A file with "line 5." (literal dot) and "line 5X" (any-char in regex).
-    // --fixed-strings makes the dot literal, so only "line 5." matches.
+    // Literal matching (the default, no --regex) makes the dot literal, so
+    // only "line 5." matches.
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("dots.txt");
     fs::write(&f, b"line 5.\nline 5X\nline 5:\n").unwrap();
     let o = ok(tpu()
         .arg("find")
-        .arg("--fixed-strings")
         .arg("--pattern")
         .arg("line 5.")
         .arg("--path")
@@ -9307,7 +9347,7 @@ fn find_fixed_strings_literal_dot() {
     assert_eq!(
         lines.len(),
         1,
-        "--fixed-strings should match only the literal 'line 5.'"
+        "default literal matching should match only the literal 'line 5.'"
     );
     let text = String::from_utf8_lossy(lines[0]);
     assert!(
@@ -9316,7 +9356,7 @@ fn find_fixed_strings_literal_dot() {
     );
     assert!(
         !text.contains("line 5X"),
-        "must not match 'line 5X' with fixed-strings dot"
+        "must not match 'line 5X' with a literal dot"
     );
 }
 
@@ -9413,6 +9453,7 @@ fn find_count_invert_nomatch_counts_all() {
 fn find_bad_regex_exits_two() {
     let mut cmd = tpu();
     cmd.arg("find")
+        .arg("--regex")
         .arg("[invalid_regex")
         .arg(asset("ascii_10lines.txt"));
     let o = cmd.output().expect("failed to run tpu");
@@ -9687,6 +9728,7 @@ fn find_multiline_caret_anchors_at_line_start() {
     // whole decoded chunk and would not work per-line.
     let o = ok(tpu()
         .arg("find")
+        .arg("--regex")
         .arg("--multiline")
         .arg("^line 5:")
         .arg(asset("ascii_10lines.txt")));
@@ -9826,12 +9868,7 @@ fn hv_replace_numeric_dash_pattern() {
     let path = dir.path().join("hv4.txt");
     fs::write(&path, b"score: -1 points\n").unwrap();
 
-    ok(tpu()
-        .arg("replace")
-        .arg(&path)
-        .arg("--fixed-strings")
-        .arg("-1")
-        .arg("0"));
+    ok(tpu().arg("replace").arg(&path).arg("-1").arg("0"));
 
     let content = fs::read_to_string(&path).unwrap();
     assert!(
@@ -9959,14 +9996,15 @@ fn hv_write_read_roundtrip_dash_content() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// SECTION — FS: fixed_strings for tpu replace (FS-IT-1 … FS-IT-12)
+// SECTION — FS: literal matching for `tpu replace` (FS-IT-1 … FS-IT-12)
 //
-// Verifies that --fixed-strings/-F causes all regex metacharacters in the
-// pattern to be treated as literals so that Copilot can safely pass code
-// snippets as patterns without escaping them.
+// Verifies that the default (regex is opt-in, off unless --regex/-E is
+// passed) treats every regex metacharacter in the pattern as a literal so
+// that Copilot can safely pass code snippets as patterns without escaping
+// them.
 // ═══════════════════════════════════════════════════════════════════════════════
 
-/// FS-IT-1: `--fixed-strings` matches a literal `{` without a regex error.
+/// FS-IT-1: default literal matching matches a literal `{` without a regex error.
 #[test]
 fn fs_replace_fixed_strings_curly_brace_matches() {
     let dir = tempfile::tempdir().unwrap();
@@ -9975,7 +10013,6 @@ fn fs_replace_fixed_strings_curly_brace_matches() {
 
     ok(tpu()
         .arg("replace")
-        .arg("--fixed-strings")
         .arg(&path)
         .arg("{ return 1; }")
         .arg("{ return 2; }"));
@@ -9988,15 +10025,20 @@ fn fs_replace_fixed_strings_curly_brace_matches() {
     drop(dir);
 }
 
-/// FS-IT-2: without `--fixed-strings`, a bare `{` in the pattern causes an error.
+/// FS-IT-2: with `--regex`, a bare unbalanced `{` in the pattern causes an error.
 #[test]
-fn fs_replace_bare_curly_brace_without_flag_errors() {
+fn fs_replace_regex_bare_curly_brace_without_flag_errors() {
     let (dir, f) = cp("singleline.txt");
-    err(tpu().arg("replace").arg(&f).arg("{unclosed").arg("X"));
+    err(tpu()
+        .arg("replace")
+        .arg("--regex")
+        .arg(&f)
+        .arg("{unclosed")
+        .arg("X"));
     drop(dir);
 }
 
-/// FS-IT-3: `--fixed-strings` matches a literal `(` without a regex error.
+/// FS-IT-3: default literal matching matches a literal `(` without a regex error.
 #[test]
 fn fs_replace_fixed_strings_paren_matches() {
     let dir = tempfile::tempdir().unwrap();
@@ -10005,7 +10047,6 @@ fn fs_replace_fixed_strings_paren_matches() {
 
     ok(tpu()
         .arg("replace")
-        .arg("-F")
         .arg(&path)
         .arg("assert_eq!(a, b)")
         .arg("assert_eq!(a, c)"));
@@ -10018,7 +10059,7 @@ fn fs_replace_fixed_strings_paren_matches() {
     drop(dir);
 }
 
-/// FS-IT-4: `--fixed-strings` treats `.` as a literal character, not any-char.
+/// FS-IT-4: default literal matching treats `.` as a literal character, not any-char.
 #[test]
 fn fs_replace_fixed_strings_dot_is_literal() {
     let dir = tempfile::tempdir().unwrap();
@@ -10026,12 +10067,7 @@ fn fs_replace_fixed_strings_dot_is_literal() {
     // "v1.0" should match; "v1X0" (where dot-as-wildcard would match) must not.
     fs::write(&path, b"version: v1.0\nversion: v1X0\n").unwrap();
 
-    ok(tpu()
-        .arg("replace")
-        .arg("--fixed-strings")
-        .arg(&path)
-        .arg("v1.0")
-        .arg("v2.0"));
+    ok(tpu().arg("replace").arg(&path).arg("v1.0").arg("v2.0"));
 
     let content = fs::read_to_string(&path).unwrap();
     assert!(
@@ -10045,7 +10081,7 @@ fn fs_replace_fixed_strings_dot_is_literal() {
     drop(dir);
 }
 
-/// FS-IT-5: `--fixed-strings` treats `*` as a literal character.
+/// FS-IT-5: default literal matching treats `*` as a literal character.
 #[test]
 fn fs_replace_fixed_strings_star_is_literal() {
     let dir = tempfile::tempdir().unwrap();
@@ -10054,7 +10090,6 @@ fn fs_replace_fixed_strings_star_is_literal() {
 
     ok(tpu()
         .arg("replace")
-        .arg("--fixed-strings")
         .arg(&path)
         .arg("foo::*")
         .arg("foo::specific"));
@@ -10071,19 +10106,14 @@ fn fs_replace_fixed_strings_star_is_literal() {
     drop(dir);
 }
 
-/// FS-IT-6: `--fixed-strings` treats `+` as a literal.
+/// FS-IT-6: default literal matching treats `+` as a literal.
 #[test]
 fn fs_replace_fixed_strings_plus_is_literal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs6.txt");
     fs::write(&path, b"score: +100\nscore: 100\n").unwrap();
 
-    ok(tpu()
-        .arg("replace")
-        .arg("--fixed-strings")
-        .arg(&path)
-        .arg("+100")
-        .arg("+200"));
+    ok(tpu().arg("replace").arg(&path).arg("+100").arg("+200"));
 
     let content = fs::read_to_string(&path).unwrap();
     assert!(
@@ -10097,19 +10127,14 @@ fn fs_replace_fixed_strings_plus_is_literal() {
     drop(dir);
 }
 
-/// FS-IT-7: `--fixed-strings` treats `?` as a literal.
+/// FS-IT-7: default literal matching treats `?` as a literal.
 #[test]
 fn fs_replace_fixed_strings_question_mark_is_literal() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("fs7.txt");
     fs::write(&path, b"is it done? yes\nis it done  yes\n").unwrap();
 
-    ok(tpu()
-        .arg("replace")
-        .arg("--fixed-strings")
-        .arg(&path)
-        .arg("done?")
-        .arg("done!"));
+    ok(tpu().arg("replace").arg(&path).arg("done?").arg("done!"));
 
     let content = fs::read_to_string(&path).unwrap();
     assert!(
@@ -10124,7 +10149,7 @@ fn fs_replace_fixed_strings_question_mark_is_literal() {
     drop(dir);
 }
 
-/// FS-IT-8: `--fixed-strings` replaces all occurrences of a literal pattern.
+/// FS-IT-8: default literal matching replaces all occurrences of a literal pattern.
 #[test]
 fn fs_replace_fixed_strings_replaces_all_occurrences() {
     let dir = tempfile::tempdir().unwrap();
@@ -10132,12 +10157,7 @@ fn fs_replace_fixed_strings_replaces_all_occurrences() {
     // Three occurrences of "a.b" (literal dot).
     fs::write(&path, b"a.b + a.b = a.b\n").unwrap();
 
-    ok(tpu()
-        .arg("replace")
-        .arg("--fixed-strings")
-        .arg(&path)
-        .arg("a.b")
-        .arg("X"));
+    ok(tpu().arg("replace").arg(&path).arg("a.b").arg("X"));
 
     let content = fs::read_to_string(&path).unwrap();
     assert_eq!(
@@ -10148,7 +10168,7 @@ fn fs_replace_fixed_strings_replaces_all_occurrences() {
     drop(dir);
 }
 
-/// FS-IT-9: `--fixed-strings` with a multi-line pattern (newline in search text).
+/// FS-IT-9: default literal matching with a bracket expression pattern.
 #[test]
 fn fs_replace_fixed_strings_with_bracket_expression() {
     let dir = tempfile::tempdir().unwrap();
@@ -10158,7 +10178,6 @@ fn fs_replace_fixed_strings_with_bracket_expression() {
 
     ok(tpu()
         .arg("replace")
-        .arg("--fixed-strings")
         .arg(&path)
         .arg("[cfg(test)]")
         .arg("[cfg(all(test, debug_assertions))]"));
@@ -10171,7 +10190,8 @@ fn fs_replace_fixed_strings_with_bracket_expression() {
     drop(dir);
 }
 
-/// FS-IT-10: `-F` (short form) is accepted and works identically to `--fixed-strings`.
+/// FS-IT-10: `-E` (short form of `--regex`) is accepted and enables regex
+/// interpretation of the pattern.
 #[test]
 fn fs_replace_short_flag_f_accepted() {
     let dir = tempfile::tempdir().unwrap();
@@ -10180,27 +10200,26 @@ fn fs_replace_short_flag_f_accepted() {
 
     ok(tpu()
         .arg("replace")
-        .arg("-F")
+        .arg("-E")
         .arg(&path)
-        .arg("(x + y)")
+        .arg(r"\(x \+ y\)")
         .arg("(a + b)"));
 
     let content = fs::read_to_string(&path).unwrap();
     assert!(
         content.contains("(a + b)"),
-        "short flag -F must work; got: {content:?}"
+        "short flag -E must enable regex interpretation; got: {content:?}"
     );
     drop(dir);
 }
 
-/// FS-IT-11: `--fixed-strings` zero-match case still creates `.bak` and exits 0.
+/// FS-IT-11: default literal matching, zero-match case still creates `.bak` and exits 0.
 #[test]
 fn fs_replace_fixed_strings_zero_match_exits_ok() {
     let (dir, f) = cp("singleline.txt");
     // Pattern contains regex metacharacters but is not present in the file.
     ok(tpu()
         .arg("replace")
-        .arg("--fixed-strings")
         .arg(&f)
         .arg("no.such.text{here}")
         .arg("Z"));
@@ -10211,7 +10230,7 @@ fn fs_replace_fixed_strings_zero_match_exits_ok() {
     drop(dir);
 }
 
-/// FS-IT-12: `--count` with `--fixed-strings` counts literal occurrences.
+/// FS-IT-12: `--count` with default literal matching counts literal occurrences.
 #[test]
 fn fs_replace_fixed_strings_count_counts_literal_occurrences() {
     let dir = tempfile::tempdir().unwrap();
@@ -10221,7 +10240,6 @@ fn fs_replace_fixed_strings_count_counts_literal_occurrences() {
 
     let o = ok(tpu()
         .arg("replace")
-        .arg("--fixed-strings")
         .arg("--count")
         .arg(&path)
         .arg("x.y")
@@ -10230,7 +10248,7 @@ fn fs_replace_fixed_strings_count_counts_literal_occurrences() {
     assert_eq!(
         stdout.trim(),
         "4",
-        "--count with --fixed-strings must report 4 literal matches; got: {stdout:?}"
+        "--count with default literal matching must report 4 literal matches; got: {stdout:?}"
     );
     drop(dir);
 }

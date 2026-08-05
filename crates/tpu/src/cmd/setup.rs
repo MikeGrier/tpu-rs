@@ -72,7 +72,7 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 | `tpu_read_file_escaped` | reading text as a single 7-bit-clean escaped line |
 | `tpu_write_file` | replacing a text file's full contents |
 | `tpu_append_file` | appending text to an existing file |
-| `tpu_replace_in_file` | regex / fixed-string substitution (use `fixed_strings: true` for literal targets) |
+| `tpu_replace_in_file` | literal (default) or regex substitution — pass `regex: true` to opt into regex matching |
 | `tpu_edit_file` | targeted insert/delete/splice at known line numbers |
 | `tpu_validate_file` | pre-flight assertion that a file is in the expected state |
 | `tpu_count_file` | line / word / char / byte / pattern counts |
@@ -87,10 +87,10 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 
 - **Reads** — always use `tpu_read_file`. Never use PowerShell `Get-Content`
   for code review or content inspection.
-- **Edits** — prefer `tpu_replace_in_file` with `fixed_strings: true` over
-  `tpu_edit_file` when the target text is unique, because line numbers can
-  shift between reads. Use `tpu_edit_file` when you have just read the file
-  and know exact line offsets.
+- **Edits** — prefer `tpu_replace_in_file` (literal matching by default,
+  no escaping needed) over `tpu_edit_file` when the target text is unique,
+  because line numbers can shift between reads. Use `tpu_edit_file` when
+  you have just read the file and know exact line offsets.
 - **Writes that should be guarded** — pass `validate: [{ "selector":
   "line-contains:N", "value": "..." }]` to refuse the write if the file is
   not in the expected state.

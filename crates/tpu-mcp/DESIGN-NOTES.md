@@ -34,16 +34,24 @@ All other `\X` sequences are passed through unchanged so that capture-group synt
 any `\r` or `\r\n` introduced by the escape expansion is folded to LF before the
 normalised tpu view sees it.
 
-### Capture-group `$` expansion is conditional
+### Capture-group `$` expansion is conditional, and regex is opt-in
 
 The `$`-reference expansion itself happens in the `tpu` library, not here, and only
-fires when the pattern has an explicit capturing group (see the "Replacement
-Capture-Group Expansion" section of the top-level design notes).  For a group-less
-pattern — every `fixed_strings` search, and any regex without `( … )` — the replacement
-is written literally, so a bare `$` (e.g. `$5.00`, `$HOME`, `${TOKEN}`) survives.  This
-is complementary to the backslash-escape handling above: `unescape_replacement` still
-runs regardless of group presence, because `\n`/`\t`/etc. are transport ergonomics, not
-capture syntax.  The `tpu_replace_in_file` schema documents both behaviours.
+fires when `regex:true` is set AND the pattern has an explicit capturing group (see the
+"Replacement Capture-Group Expansion" section of the top-level design notes).  For a
+group-less pattern — the default literal search, and any regex without `( … )` — the
+replacement is written literally, so a bare `$` (e.g. `$5.00`, `$HOME`, `${TOKEN}`)
+survives.  This is complementary to the backslash-escape handling above:
+`unescape_replacement` still runs regardless of group presence, because `\n`/`\t`/etc.
+are transport ergonomics, not capture syntax.  The `tpu_replace_in_file` schema
+documents both behaviours.
+
+Regex is opt-in (`regex:true`) rather than the default because ambiguous
+capture-group syntax is easy to trigger by accident: `${1}token` is a group-1
+reference followed by literal text, but `$1token` is parsed as a reference to a
+group *named* `1token` (almost never present), silently dropping both the
+substitution and the suffix. Defaulting to literal matching means this class of
+bug can only occur when an agent has deliberately opted into regex mode.
 
 ---
 
