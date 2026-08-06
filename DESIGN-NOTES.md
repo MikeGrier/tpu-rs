@@ -692,10 +692,11 @@ This matches the grep convention.
 ### Relation to `search.rs`
 
 A substantial `search.rs` module already exists in `src/tools/tpu/src/cmd/` with a
-working `run()` function (context lines, `--count`, `--fixed-strings`, `--multiline`)
-but is dead code (not wired to any CLI command).  `tpu find` will promote and extend
-this module rather than start from scratch: it will be renamed/moved to `find.rs` and
-extended to support multiple patterns, multiple files, and glob expansion.
+working `run()` function (context lines, `--count`, a fixed-string matching option,
+`--multiline`) but is dead code (not wired to any CLI command).  `tpu find` will
+promote and extend this module rather than start from scratch: it will be
+renamed/moved to `find.rs` and extended to support multiple patterns, multiple
+files, and glob expansion.
 
 ---
 
