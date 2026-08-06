@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.0.0](https://github.com/MikeGrier/tpu-rs/compare/v0.6.0...v1.0.0) (2026-08-06)
+
+
+### ⚠ BREAKING CHANGES
+
+* **tpu:** `--fixed-strings`/`-F` (CLI) and `fixed_strings` (MCP) have been removed from `find` and `replace`. `pattern` is now matched literally by default; pass `--regex`/`-E` or `"regex": true` to opt into regex matching. Existing scripts/tool calls that relied on implicit regex matching (capture groups, anchors, character classes, alternation, etc.) must add `--regex`/`-E` or `"regex": true`.
+
+### Features
+
+* **tpu:** make regex opt-in for `find`/`replace` (was implicit default) ([c0ee92b](https://github.com/MikeGrier/tpu-rs/commit/c0ee92b6c749bc6dccbfc445e3a2bf8cbb532624))
+
+
+### Bug Fixes
+
+* **tpu-mcp:** qualify conditional \$\$ dollar-sign wording; add \ ambiguity regression tests ([67d4ac9](https://github.com/MikeGrier/tpu-rs/commit/67d4ac9dc85a222096dc365966645aff03b10292))
+* **tpu-mcp:** use actual JSON syntax in the fixed_strings migration error message ([e00df51](https://github.com/MikeGrier/tpu-rs/commit/e00df513f5f191bb319a55cf416e454b59dc2963))
+* **tpu:** reject removed fixed_strings arg, rename FS-IT tests, clarify find path-required error ([90ee1f5](https://github.com/MikeGrier/tpu-rs/commit/90ee1f5a73a7535ccf9df0e2b8d7b91155954004))
+
 ## [0.6.0](https://github.com/MikeGrier/tpu-rs/compare/v0.5.1...v0.6.0) (2026-08-03)
 
 
