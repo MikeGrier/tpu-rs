@@ -3331,7 +3331,7 @@ fn reject_removed_fixed_strings_arg(args: &Value) -> Result<(), Box<dyn std::err
     if args.get("fixed_strings").is_some() {
         return Err(
             "the 'fixed_strings' argument was removed: matching is now literal \
-             by default, and regex is opt-in via 'regex': true (the inverse of the old \
+             by default, and regex is opt-in via \"regex\": true (the inverse of the old \
              'fixed_strings' meaning)"
                 .into(),
         );
