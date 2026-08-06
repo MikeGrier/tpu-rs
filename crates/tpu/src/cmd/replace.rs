@@ -497,6 +497,11 @@ mod tests {
 
     /// Write `content` to a temp file, run `replace::run`, and return the
     /// resulting file bytes.  `diff` output is captured and returned separately.
+    ///
+    /// Always exercises regex mode (`regex: true`) internally — most of this
+    /// suite's patterns rely on regex features (anchors, groups, character
+    /// classes). Tests that specifically need default *literal* matching
+    /// call `run_test` directly with `regex: false` instead.
     fn replace_file(
         content: &[u8],
         pattern: &str,
