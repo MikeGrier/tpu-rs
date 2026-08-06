@@ -368,8 +368,10 @@ pub fn list() -> Value {
                  fixed literal string — regex is opt-in, never implicit. Pass regex:true \
                  to interpret `pattern` as a Rust regex::bytes pattern applied to a \
                  LF-normalised view (CRLF is transparent — \\n in the pattern always means \
-                 line feed). Capture groups (regex mode only): $0 (whole match), $1/$2/…, \
-                 $name. Use $$ for a literal dollar sign. \
+                 line feed). Capture groups (regex mode only, and only when the pattern \
+                 has an explicit group): $0 (whole match), $1/$2/…, $name, $$ for a \
+                 literal dollar sign — see the 'replacement' ESCAPING note below for when \
+                 this applies. \
                  The original file is backed up to <file>.bak before writing. \
                  Use count:true to count matches without modifying the file. \
                  Use dry_run:true to preview changes as a unified diff without writing.\n\n\

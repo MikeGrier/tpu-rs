@@ -1551,6 +1551,51 @@ fn replace_capture_group_substitution() {
     drop(dir);
 }
 
+/// `$1token` is ambiguous: the regex crate greedily reads `1token` as a
+/// single capture-group *name*, which does not exist, so the whole
+/// reference expands to nothing — silently dropping both the intended
+/// back-reference and the literal "token" suffix.
+#[test]
+fn replace_ambiguous_dollar_capture_ref_without_braces_drops_suffix() {
+    let (dir, f) = cp("singleline.txt");
+    ok(tpu()
+        .arg("replace")
+        .arg("--regex")
+        .arg(&f)
+        .arg("(hello)")
+        .arg("$1token"));
+    let content = fs::read_to_string(&f).unwrap();
+    assert!(
+        !content.contains("hellotoken"),
+        "\"$1token\" must NOT resolve to 'hellotoken'; got: {content:?}"
+    );
+    assert!(
+        !content.contains("hello"),
+        "the unresolved group-named-'1token' reference must expand to nothing, \
+         dropping the original match too; got: {content:?}"
+    );
+    drop(dir);
+}
+
+/// Braces disambiguate the numbered reference from the following literal
+/// text: `${1}token` resolves group 1 and appends "token" literally.
+#[test]
+fn replace_braced_dollar_capture_ref_disambiguates_suffix() {
+    let (dir, f) = cp("singleline.txt");
+    ok(tpu()
+        .arg("replace")
+        .arg("--regex")
+        .arg(&f)
+        .arg("(hello)")
+        .arg("${1}token"));
+    let content = fs::read_to_string(&f).unwrap();
+    assert!(
+        content.contains("hellotoken"),
+        "\"${{1}}token\" must resolve to 'hellotoken'; got: {content:?}"
+    );
+    drop(dir);
+}
+
 // ─── replacement-string escape decoding ──────────────────────────────────────
 //
 // By default the replacement passed on the command line is decoded with the
