@@ -7772,8 +7772,8 @@ fn cn_count_single_line_no_trailing_newline() {
     );
 }
 
-/// CN-IT-11: `--pattern "[0-9]+"` on a file with 7 digit runs — emits count 7;
-/// label defaults to the pattern string.
+/// CN-IT-11: `--regex --pattern "[0-9]+"` on a file with 7 digit runs — emits
+/// count 7; label defaults to the pattern string.
 #[test]
 fn cn_count_pattern_default_label() {
     let dir = tempfile::tempdir().unwrap();
@@ -7782,7 +7782,12 @@ fn cn_count_pattern_default_label() {
     let content = "abc 123 def 456 ghi 789 jkl 012 mno 345 pqr 678 stu 901\n";
     fs::write(&path, content.as_bytes()).unwrap();
 
-    let o = ok(tpu().arg("count").arg("--pattern").arg("[0-9]+").arg(&path));
+    let o = ok(tpu()
+        .arg("count")
+        .arg("--regex")
+        .arg("--pattern")
+        .arg("[0-9]+")
+        .arg(&path));
     let out = String::from_utf8(o.stdout).unwrap();
 
     // Default label is the pattern string itself
@@ -7792,8 +7797,50 @@ fn cn_count_pattern_default_label() {
     );
 }
 
-/// CN-IT-12: `--pattern "[0-9]+" --label digits` — emits `digits: 7`; the
-/// pattern string must not appear as a label in the output.
+/// CN-IT-11b: without `--regex`, `--pattern "[0-9]+"` is a fixed literal
+/// string — it never matches the digit runs, so the count is 0. Regression
+/// for the missed regex-opt-in migration of `tpu count`.
+#[test]
+fn cn_count_pattern_literal_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cn11b.txt");
+    let content = "abc 123 def 456 ghi 789 jkl 012 mno 345 pqr 678 stu 901\n";
+    fs::write(&path, content.as_bytes()).unwrap();
+
+    let o = ok(tpu().arg("count").arg("--pattern").arg("[0-9]+").arg(&path));
+    let out = String::from_utf8(o.stdout).unwrap();
+
+    assert!(
+        out.contains("[0-9]+: 0"),
+        "expected '[0-9]+: 0' (literal pattern, no literal match); got: {out:?}"
+    );
+}
+
+/// CN-IT-11c: without `--regex`, a bracket-heavy literal pattern that would
+/// be an invalid regex character class (e.g. `[CHECKLIST-...]`) is matched
+/// literally instead of erroring.
+#[test]
+fn cn_count_pattern_literal_bracket_pattern_does_not_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("cn11c.txt");
+    let content = "see [CHECKLIST-...] for details\n";
+    fs::write(&path, content.as_bytes()).unwrap();
+
+    let o = ok(tpu()
+        .arg("count")
+        .arg("--pattern")
+        .arg("[CHECKLIST-...]")
+        .arg(&path));
+    let out = String::from_utf8(o.stdout).unwrap();
+
+    assert!(
+        out.contains("[CHECKLIST-...]: 1"),
+        "expected literal bracket pattern to match once; got: {out:?}"
+    );
+}
+
+/// CN-IT-12: `--regex --pattern "[0-9]+" --label digits` — emits `digits: 7`;
+/// the pattern string must not appear as a label in the output.
 #[test]
 fn cn_count_pattern_custom_label() {
     let dir = tempfile::tempdir().unwrap();
@@ -7803,6 +7850,7 @@ fn cn_count_pattern_custom_label() {
 
     let o = ok(tpu()
         .arg("count")
+        .arg("--regex")
         .arg("--pattern")
         .arg("[0-9]+")
         .arg("--label")
@@ -7892,8 +7940,8 @@ fn cn_count_pattern_combined_with_lines_flag() {
     );
 }
 
-/// CN-IT-15: Invalid regex in `--pattern` — exits non-zero with a descriptive
-/// error on stderr; no output on stdout.
+/// CN-IT-15: Invalid regex in `--regex --pattern` — exits non-zero with a
+/// descriptive error on stderr; no output on stdout.
 #[test]
 fn cn_count_invalid_pattern_exits_nonzero() {
     let dir = tempfile::tempdir().unwrap();
@@ -7902,6 +7950,7 @@ fn cn_count_invalid_pattern_exits_nonzero() {
 
     let o = err(tpu()
         .arg("count")
+        .arg("--regex")
         .arg("--pattern")
         .arg("[invalid")
         .arg(&path));

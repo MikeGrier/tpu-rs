@@ -877,12 +877,15 @@ pub fn list() -> Value {
         {
             "name": "tpu_count_file",
             "description":
-                "Count lines, words, characters, bytes, and/or regex pattern matches in a \
+                "Count lines, words, characters, bytes, and/or pattern matches in a \
                  file. Prefer this over PowerShell `Measure-Object` / `(Get-Content).Count` \
                  or shell `wc` — counts are computed against the encoding-decoded view, \
                  so multi-byte UTF-8 characters and UTF-16 files give correct results. \
                  The file is decoded with encoding/line-ending normalisation before \
                  counting (same rules as tpu_read_file). \n\n\
+                 By default each pattern is a fixed literal string — regex is opt-in, \
+                 never implicit; set regex:true to interpret every pattern as a Rust \
+                 regex instead. \n\n\
                  When none of lines/words/chars/bytes is set, all four standard metrics are \
                  reported. Pattern matches are always reported when patterns are supplied. \n\n\
                  File metadata (encoding name, BOM presence, line-ending style) is always \
@@ -919,16 +922,20 @@ pub fn list() -> Value {
                     "patterns": {
                         "type": "array",
                         "description":
-                            "Zero or more regex patterns to count in the file. Each entry \
-                             must have a 'pattern' field (regex string) and an optional \
-                             'label' field (display name). Match counts are always included \
+                            "Zero or more patterns to count in the file. Each entry \
+                             must have a 'pattern' field and an optional 'label' field \
+                             (display name). By default 'pattern' is a fixed literal \
+                             string; set regex:true to interpret every entry's 'pattern' \
+                             as a Rust regex instead. Match counts are always included \
                              regardless of the lines/words/chars/bytes flags.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "pattern": {
                                     "type": "string",
-                                    "description": "Regex pattern to match."
+                                    "description":
+                                        "Pattern to match. Fixed literal string unless \
+                                         regex:true is set."
                                 },
                                 "label": {
                                     "type": "string",
@@ -937,6 +944,12 @@ pub fn list() -> Value {
                             },
                             "required": ["pattern"]
                         }
+                    },
+                    "regex": {
+                        "type": "boolean",
+                        "description":
+                            "If true, interpret every entry in 'patterns' as a Rust regex \
+                             instead of a fixed literal string. Default: false."
                     },
                     "stats": {
                         "type": "boolean",
@@ -2141,6 +2154,7 @@ fn call_count_file(args: &Value) -> ToolResult {
         let words = args.get("words").and_then(|v| v.as_bool()).unwrap_or(false);
         let chars = args.get("chars").and_then(|v| v.as_bool()).unwrap_or(false);
         let bytes = args.get("bytes").and_then(|v| v.as_bool()).unwrap_or(false);
+        let regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
         // Stats (encoding/bom/line_ending) are always emitted by the MCP tool
         // regardless of the caller-supplied flag, matching the advertised contract.
         let stats = true;
@@ -2216,6 +2230,7 @@ fn call_count_file(args: &Value) -> ToolResult {
             bytes,
             &patterns,
             &labels,
+            regex,
             stats,
             out.as_mut(),
             tpu::IoMode::Buffered,
@@ -4738,6 +4753,55 @@ mod integration_tests {
                 "'{key}' must be present with no stats arg; got: {result:?}"
             );
         }
+
+        drop(dir);
+    }
+
+    /// CF-IT-5: `tpu_count_file` patterns are fixed literal strings by
+    /// default — regex is opt-in. Regression for the missed regex-opt-in
+    /// migration of `count`: `[CHECKLIST-...]` must match literally (count
+    /// 1) rather than erroring as an invalid regex character class.
+    #[test]
+    fn cf_it_5_count_file_pattern_literal_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_literal.txt");
+        fs::write(&f, "see [CHECKLIST-...] for details\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "patterns": [{ "pattern": "[CHECKLIST-...]" }],
+        });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+        let result = ndjson_result_line(&out);
+        assert_eq!(
+            result["patterns"]["[CHECKLIST-...]"].as_u64().unwrap(),
+            1,
+            "literal bracket pattern must match once; got: {result:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// CF-IT-6: `tpu_count_file` with `regex: true` interprets patterns as
+    /// Rust regexes, matching `tpu_find`/`tpu_replace_in_file`'s opt-in model.
+    #[test]
+    fn cf_it_6_count_file_regex_true_interprets_pattern_as_regex() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_regex.txt");
+        fs::write(&f, "abc 123 def 456 ghi 789\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "regex": true,
+            "patterns": [{ "pattern": "[0-9]+", "label": "digits" }],
+        });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+        let result = ndjson_result_line(&out);
+        assert_eq!(
+            result["patterns"]["digits"].as_u64().unwrap(),
+            3,
+            "regex:true pattern must count 3 digit runs; got: {result:?}"
+        );
 
         drop(dir);
     }

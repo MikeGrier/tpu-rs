@@ -744,11 +744,14 @@ enum Commands {
         allow_mojibake: bool,
     },
 
-    /// Count lines, words, characters, bytes, or regex pattern occurrences in a file.
+    /// Count lines, words, characters, bytes, or pattern occurrences in a file.
     ///
     /// When no metric flag is given, all four standard metrics (lines, words,
     /// chars, bytes) are reported.  Each --pattern adds an additional named
     /// count.  Results are emitted one per line in declaration order.
+    ///
+    /// By default each --pattern is a fixed literal string; pass `--regex`/`-E`
+    /// to interpret patterns as regexes instead.
     ///
     /// Human output format (one entry per line):
     ///   <label>: <count>
@@ -777,8 +780,9 @@ enum Commands {
         #[arg(long, short = 'b')]
         bytes: bool,
 
-        /// Count non-overlapping occurrences of PATTERN (Rust regex) in the
-        /// decoded text.  Repeatable; each instance adds one count entry.
+        /// Count non-overlapping occurrences of PATTERN in the decoded text.
+        /// Treated as a fixed literal string unless --regex is passed.
+        /// Repeatable; each instance adds one count entry.
         #[arg(long, value_name = "PATTERN", action = clap::ArgAction::Append)]
         pattern: Vec<String>,
 
@@ -787,6 +791,12 @@ enum Commands {
         /// patterns is an error; missing labels default to the pattern string.
         #[arg(long, value_name = "LABEL", action = clap::ArgAction::Append)]
         label: Vec<String>,
+
+        /// Interpret every --pattern as a Rust regex. Without this flag every
+        /// pattern is a fixed literal string — regex is opt-in so an
+        /// accidental metacharacter never silently changes what's counted.
+        #[arg(long, short = 'E')]
+        regex: bool,
 
         /// Emit file metadata (encoding name, BOM presence, line-ending style)
         /// before the metric counts.  When combined with no other flags the
@@ -1928,6 +1938,7 @@ fn run(
             bytes,
             pattern,
             label,
+            regex,
             stats,
         } => {
             // Stats are always emitted in JSON mode so JSON consumers can
@@ -1941,6 +1952,7 @@ fn run(
                 bytes,
                 &pattern,
                 &label,
+                regex,
                 effective_stats,
                 out,
                 IoMode::Mmap,

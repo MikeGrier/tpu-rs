@@ -1,10 +1,18 @@
 // Copyright (c) 2026, Michael Grier
 
-//! `tpu count` — count lines, words, chars, bytes, and regex pattern occurrences.
+//! `tpu count` — count lines, words, chars, bytes, and pattern occurrences.
 //!
 //! When no metric flag is set all four standard metrics (lines, words, chars,
 //! bytes) are reported.  Each `--pattern` value adds an additional named count,
 //! emitted after the standard metrics in declaration order.
+//!
+//! ## Regex is opt-in
+//!
+//! By default each `--pattern` is treated as a fixed literal string (every
+//! regex metacharacter is escaped via [`regex::escape`]) — there is no
+//! implicit regex interpretation.  Pass `--regex`/`-E` (CLI) or `"regex":
+//! true` (MCP) to interpret every `--pattern` as a `regex` pattern instead.
+//! This matches the opt-in model used by `tpu find`/`tpu replace`.
 //!
 //! When `stats` is true (from `--stats` or JSON mode), encoding metadata is
 //! emitted first: the WHATWG encoding name, BOM presence, and line-ending style.
@@ -27,10 +35,15 @@ use crate::{IoMode, output::Output};
 /// * `words`    — count whitespace-delimited tokens in the decoded text
 /// * `chars`    — count Unicode scalar values in the decoded text
 /// * `bytes`    — count raw bytes (file size on disk)
-/// * `patterns` — zero or more Rust regex strings; each produces one count
+/// * `patterns` — zero or more patterns; each produces one count.  Treated as
+///   fixed literal strings unless `regex` is `true`, in which case every
+///   pattern is compiled as a Rust regex.
 /// * `labels`   — human-readable label for each pattern (positionally aligned;
 ///   missing labels default to the pattern string; surplus labels
 ///   are an error)
+/// * `regex`    — interpret every pattern in `patterns` as a Rust regex.
+///   When `false` (the default), every pattern is a fixed literal string
+///   (every regex metacharacter is escaped) — regex is opt-in, never implicit.
 /// * `stats`    — emit encoding name, BOM presence, and line-ending style
 ///   before the metric counts; always true in JSON mode
 /// * `out`      — output sink (human or JSON, driven by `--message-format`)
@@ -43,6 +56,7 @@ pub fn run(
     bytes: bool,
     patterns: &[String],
     labels: &[String],
+    regex: bool,
     stats: bool,
     out: &mut dyn Output,
     io_mode: IoMode,
@@ -198,7 +212,13 @@ pub fn run(
     // ── Pattern counts ────────────────────────────────────────────────────────
     for (i, pat) in patterns.iter().enumerate() {
         let label = labels.get(i).map(String::as_str).unwrap_or(pat.as_str());
-        let re = Regex::new(pat).map_err(|e| format!("count: invalid pattern {pat:?}: {e}"))?;
+        let effective_pattern = if regex {
+            pat.to_owned()
+        } else {
+            regex::escape(pat)
+        };
+        let re = Regex::new(&effective_pattern)
+            .map_err(|e| format!("count: invalid pattern {pat:?}: {e}"))?;
         let count = re.find_iter(&text).count();
         emit_metric(label, count as u64);
     }
