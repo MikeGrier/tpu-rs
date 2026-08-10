@@ -159,16 +159,43 @@ pub struct ReplaceOptions {
     pub policy: WritePolicy,
 }
 
+/// A single contiguous region changed by one match/replacement, used to
+/// build a compact "changed region" echo without paying for a whole-file
+/// diff.  Line numbers refer to the ORIGINAL (pre-edit) file; `new_text` is
+/// the LF-normalised text that now replaces that span.
+///
+/// Deliberately cheap to produce: computed from data already resident in
+/// memory for the substitution itself (the matched span and the expanded
+/// replacement), never from a full-file clone or a whole-file diff.
+#[derive(Debug, Clone)]
+pub struct ChangedRegion {
+    /// 1-based inclusive starting line of the matched span in the original file.
+    pub start_line: usize,
+    /// 1-based inclusive ending line of the matched span in the original file
+    /// (equal to `start_line` for a single-line match).
+    pub end_line: usize,
+    /// Number of lines in `new_text` (0 for an empty replacement).
+    pub new_line_count: usize,
+    /// LF-normalised replacement text for this region.
+    pub new_text: String,
+}
+
 /// Apply a regex (or fixed-string) replacement to `file` in place.
 ///
 /// All boolean and policy knobs are bundled into [`ReplaceOptions`]; see its
 /// fields for the per-flag behaviour.  `diff_out`, when `Some`, receives a
 /// unified text diff (in normalised/LF space) after a successful write.
+///
+/// `regions_out`, when `Some`, is populated with one [`ChangedRegion`] per
+/// match — cheap to compute regardless of file size, so callers can build a
+/// compact "changed region" echo without needing to opt into the full
+/// whole-file diff (which clones the entire normalised file).
 pub fn run(
     file: &Path,
     pattern: &str,
     replacement: &[u8],
     diff_out: Option<&mut dyn Write>,
+    mut regions_out: Option<&mut Vec<ChangedRegion>>,
     opts: ReplaceOptions,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let ReplaceOptions {
@@ -215,7 +242,9 @@ pub fn run(
     let has_capture_groups = re.captures_len() > 1;
 
     // Snapshot the normalised old bytes now for diff computation later.
-    // Only paid when --diff or --dry-run is requested.
+    // Only paid when --diff or --dry-run is requested: this is a full-file
+    // clone, so it must stay opt-in (see ChangedRegion for the cheap,
+    // always-available alternative used for the default changed-region echo).
     let old_norm: Option<Vec<u8>> = if diff_out.is_some() {
         Some(view.bytes.to_vec())
     } else {
@@ -240,36 +269,72 @@ pub fn run(
         content: Vec<u8>,
     }
 
-    // Collect all matches as source-coordinate splices.
-    let mut splices: Vec<Splice> = re
-        .captures_iter(&view.bytes)
-        .map(|caps| {
-            let m = caps.get(0).unwrap();
-            let source_start =
-                view.byte_range_start() + view.offset_map.to_source(m.start() as u64);
-            let source_end = view.byte_range_start() + view.offset_map.to_source(m.end() as u64);
-            let source_len = source_end - source_start;
+    // Collect all matches as source-coordinate splices.  Matches are visited
+    // in left-to-right order (regex::bytes::Captures::iter guarantees this),
+    // so `line_no`/`scanned_to` track cumulative line position incrementally:
+    // each match only counts newlines in the *unscanned* gap since the last
+    // match, never rescanning from the start of the file. Total newline-
+    // counting work across all matches is therefore a single linear pass
+    // over the file, the same order as reading it once for matching.
+    let mut line_no: usize = 1;
+    let mut scanned_to: usize = 0;
+    let mut splices: Vec<Splice> = Vec::new();
+    for caps in re.captures_iter(&view.bytes) {
+        let m = caps.get(0).unwrap();
+        let source_start = view.byte_range_start() + view.offset_map.to_source(m.start() as u64);
+        let source_end = view.byte_range_start() + view.offset_map.to_source(m.end() as u64);
+        let source_len = source_end - source_start;
 
-            // Expand capture-group back-references in normalised space.  When
-            // the pattern has no explicit groups the replacement is taken
-            // verbatim, so `$` survives instead of being read as a reference.
-            let mut norm_repl: Vec<u8> = Vec::new();
-            if has_capture_groups {
-                caps.expand(replacement, &mut norm_repl);
+        // Expand capture-group back-references in normalised space.  When
+        // the pattern has no explicit groups the replacement is taken
+        // verbatim, so `$` survives instead of being read as a reference.
+        let mut norm_repl: Vec<u8> = Vec::new();
+        if has_capture_groups {
+            caps.expand(replacement, &mut norm_repl);
+        } else {
+            norm_repl.extend_from_slice(replacement);
+        }
+
+        if let Some(regions) = regions_out.as_deref_mut() {
+            line_no += view.bytes[scanned_to..m.start()]
+                .iter()
+                .filter(|&&b| b == b'\n')
+                .count();
+            let start_line = line_no;
+            // A newline that is the LAST byte of the match only terminates
+            // the match's own last line -- it doesn't pull in any content
+            // from the following line, so it must not extend end_line.
+            let match_span = &view.bytes[m.start()..m.end()];
+            let counted_span = match match_span.last() {
+                Some(b'\n') => &match_span[..match_span.len() - 1],
+                _ => match_span,
+            };
+            let lines_in_match = counted_span.iter().filter(|&&b| b == b'\n').count();
+            let end_line = start_line + lines_in_match;
+            let new_line_count = if norm_repl.is_empty() {
+                0
             } else {
-                norm_repl.extend_from_slice(replacement);
-            }
+                1 + norm_repl.iter().filter(|&&b| b == b'\n').count()
+            };
+            regions.push(ChangedRegion {
+                start_line,
+                end_line,
+                new_line_count,
+                new_text: String::from_utf8_lossy(&norm_repl).into_owned(),
+            });
+            line_no = end_line;
+            scanned_to = m.end();
+        }
 
-            // Denormalise: restore the file's dominant line terminator.
-            let content = denormalize_bytes(&norm_repl, line_ending);
+        // Denormalise: restore the file's dominant line terminator.
+        let content = denormalize_bytes(&norm_repl, line_ending);
 
-            Splice {
-                source_start,
-                source_len,
-                content,
-            }
-        })
-        .collect();
+        splices.push(Splice {
+            source_start,
+            source_len,
+            content,
+        });
+    }
 
     let replacement_count = splices.len();
 
@@ -483,6 +548,7 @@ mod tests {
             pattern,
             replacement,
             diff_out,
+            None,
             ReplaceOptions {
                 multiline,
                 regex,
@@ -544,6 +610,105 @@ mod tests {
         let _ = fs::remove_file(&path);
 
         (result, String::from_utf8_lossy(&diff_buf).into_owned())
+    }
+
+    /// Write `content` to a temp file, run `replace::run` with `regions_out`
+    /// populated, and return the collected [`ChangedRegion`]s (file content
+    /// itself is not needed by these tests).
+    fn replace_file_regions(
+        content: &[u8],
+        pattern: &str,
+        replacement: &[u8],
+        regex: bool,
+    ) -> Vec<ChangedRegion> {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content).unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+        drop(f);
+        fs::write(&path, content).unwrap();
+
+        let mut regions: Vec<ChangedRegion> = Vec::new();
+        run(
+            &path,
+            pattern,
+            replacement,
+            None,
+            Some(&mut regions),
+            ReplaceOptions {
+                regex,
+                io_mode: IoMode::Mmap,
+                policy: crate::mojibake::WritePolicy::permissive(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let bak = format!("{}.bak", path.display());
+        let _ = fs::remove_file(&bak);
+        let _ = fs::remove_file(&path);
+        regions
+    }
+
+    // ── ChangedRegion (cheap changed-region echo, no full-file diff) ─────────
+
+    /// A single-line match/replacement produces one region spanning that
+    /// line, with the replacement text and its line count.
+    #[test]
+    fn changed_region_single_line_match() {
+        let regions = replace_file_regions(b"hello world\nsecond line\n", "world", b"there", false);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start_line, 1);
+        assert_eq!(regions[0].end_line, 1);
+        assert_eq!(regions[0].new_line_count, 1);
+        assert_eq!(regions[0].new_text, "there");
+    }
+
+    /// A match spanning multiple original lines reports the correct
+    /// start/end line range, and a multi-line replacement reports the
+    /// correct new_line_count.
+    #[test]
+    fn changed_region_multiline_match_and_replacement() {
+        let content = b"one\ntwo\nthree\nfour\n";
+        // Regex spans lines 2-3 ("two\nthree"); multiline dot-all not needed
+        // since the literal pattern itself contains the newline.
+        let regions = replace_file_regions(content, "two\nthree", b"TWO\nTHREE\nEXTRA", true);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start_line, 2);
+        assert_eq!(regions[0].end_line, 3);
+        assert_eq!(regions[0].new_line_count, 3);
+        assert_eq!(regions[0].new_text, "TWO\nTHREE\nEXTRA");
+    }
+
+    /// Two separate matches later in the file report correctly
+    /// incrementing line numbers (regression for the cumulative,
+    /// single-pass line-counting logic: the second match's start_line must
+    /// not be computed as if it were still at the start of the file).
+    #[test]
+    fn changed_region_multiple_matches_cumulative_line_numbers() {
+        let content = b"a\nfoo\nb\nfoo\nc\n";
+        let regions = replace_file_regions(content, "foo", b"bar", false);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].start_line, 2);
+        assert_eq!(regions[0].end_line, 2);
+        assert_eq!(regions[1].start_line, 4);
+        assert_eq!(regions[1].end_line, 4);
+    }
+
+    /// An empty replacement (pure deletion) reports `new_line_count: 0` and
+    /// empty `new_text`, while still reporting the correct old line span.
+    /// Regression for the trailing-newline boundary case: a match ending
+    /// exactly on a line terminator (`"delete me\n"`) must report
+    /// `end_line == start_line`, not `start_line + 1` -- the terminator
+    /// ends the matched line, it doesn't pull in the next line's content.
+    #[test]
+    fn changed_region_empty_replacement_is_deletion() {
+        let regions = replace_file_regions(b"keep\ndelete me\nkeep2\n", "delete me\n", b"", false);
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].start_line, 2);
+        assert_eq!(regions[0].end_line, 2);
+        assert_eq!(regions[0].new_line_count, 0);
+        assert_eq!(regions[0].new_text, "");
     }
 
     // ── Normal cases ──────────────────────────────────────────────────────────

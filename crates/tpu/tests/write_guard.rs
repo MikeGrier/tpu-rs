@@ -60,6 +60,7 @@ fn replace_rejects_replacement_that_introduces_mojibake() {
         "world",
         replacement_bytes,
         None, // diff_out
+        None, // regions_out
         tpu::cmd::replace::ReplaceOptions {
             io_mode: tpu::IoMode::Buffered,
             policy: WritePolicy::default(),
@@ -100,6 +101,7 @@ fn replace_with_allow_mojibake_flag_succeeds() {
         &path,
         "world",
         replacement_bytes,
+        None,
         None,
         tpu::cmd::replace::ReplaceOptions {
             io_mode: tpu::IoMode::Buffered,
