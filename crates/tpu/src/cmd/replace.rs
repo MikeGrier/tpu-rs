@@ -174,10 +174,29 @@ pub struct ChangedRegion {
     /// 1-based inclusive ending line of the matched span in the original file
     /// (equal to `start_line` for a single-line match).
     pub end_line: usize,
-    /// Number of lines in `new_text` (0 for an empty replacement).
+    /// Number of lines in `new_text` (0 for an empty replacement).  Always
+    /// accurate regardless of [`RegionsRequest::text_budget_lines`], even
+    /// when `new_text` itself was left empty to stay under budget.
     pub new_line_count: usize,
-    /// LF-normalised replacement text for this region.
+    /// LF-normalised replacement text for this region, or empty once
+    /// [`RegionsRequest::text_budget_lines`] has been exhausted (see there).
     pub new_text: String,
+}
+
+/// Request to collect [`ChangedRegion`]s during [`run`], with an optional
+/// memory bound on how much replacement text is retained.
+pub struct RegionsRequest<'a> {
+    /// Regions are appended here, one per match, in file order.
+    pub regions_out: &'a mut Vec<ChangedRegion>,
+    /// Once the running total of `new_line_count` already collected reaches
+    /// this many lines, subsequent regions still report accurate
+    /// `start_line`/`end_line`/`new_line_count` but leave `new_text` empty
+    /// — this bounds retained text to roughly this many lines' worth
+    /// rather than the full size of every match's replacement, which
+    /// matters when there are many (or very large) matches whose combined
+    /// echo will never actually be shown (see `tpu_replace_in_file`'s
+    /// `echo_max_lines`). `None` means no limit: always materialise text.
+    pub text_budget_lines: Option<usize>,
 }
 
 /// Apply a regex (or fixed-string) replacement to `file` in place.
@@ -186,7 +205,7 @@ pub struct ChangedRegion {
 /// fields for the per-flag behaviour.  `diff_out`, when `Some`, receives a
 /// unified text diff (in normalised/LF space) after a successful write.
 ///
-/// `regions_out`, when `Some`, is populated with one [`ChangedRegion`] per
+/// `regions`, when `Some`, is populated with one [`ChangedRegion`] per
 /// match — cheap to compute regardless of file size, so callers can build a
 /// compact "changed region" echo without needing to opt into the full
 /// whole-file diff (which clones the entire normalised file).
@@ -195,7 +214,7 @@ pub fn run(
     pattern: &str,
     replacement: &[u8],
     diff_out: Option<&mut dyn Write>,
-    mut regions_out: Option<&mut Vec<ChangedRegion>>,
+    mut regions: Option<RegionsRequest<'_>>,
     opts: ReplaceOptions,
 ) -> Result<usize, Box<dyn std::error::Error>> {
     let ReplaceOptions {
@@ -278,6 +297,7 @@ pub fn run(
     // over the file, the same order as reading it once for matching.
     let mut line_no: usize = 1;
     let mut scanned_to: usize = 0;
+    let mut text_materialized: usize = 0;
     let mut splices: Vec<Splice> = Vec::new();
     for caps in re.captures_iter(&view.bytes) {
         let m = caps.get(0).unwrap();
@@ -295,7 +315,7 @@ pub fn run(
             norm_repl.extend_from_slice(replacement);
         }
 
-        if let Some(regions) = regions_out.as_deref_mut() {
+        if let Some(req) = regions.as_mut() {
             line_no += view.bytes[scanned_to..m.start()]
                 .iter()
                 .filter(|&&b| b == b'\n')
@@ -311,16 +331,38 @@ pub fn run(
             };
             let lines_in_match = counted_span.iter().filter(|&&b| b == b'\n').count();
             let end_line = start_line + lines_in_match;
+            // Mirrors render_changed_regions' line splitting: a trailing
+            // '\n' terminates the last line rather than starting a new
+            // (empty) one, so it must not be counted as an extra line.
             let new_line_count = if norm_repl.is_empty() {
                 0
             } else {
-                1 + norm_repl.iter().filter(|&&b| b == b'\n').count()
+                let newline_count = norm_repl.iter().filter(|&&b| b == b'\n').count();
+                if norm_repl.last() == Some(&b'\n') {
+                    newline_count
+                } else {
+                    newline_count + 1
+                }
             };
-            regions.push(ChangedRegion {
+            // Bound retained text to roughly `text_budget_lines` lines total
+            // (see RegionsRequest doc) rather than the full size of every
+            // match's replacement -- line-span numbers stay accurate either
+            // way, only `new_text` is left empty once over budget.
+            let under_budget = match req.text_budget_lines {
+                None => true,
+                Some(budget) => text_materialized < budget,
+            };
+            let new_text = if under_budget {
+                text_materialized += new_line_count;
+                String::from_utf8_lossy(&norm_repl).into_owned()
+            } else {
+                String::new()
+            };
+            req.regions_out.push(ChangedRegion {
                 start_line,
                 end_line,
                 new_line_count,
-                new_text: String::from_utf8_lossy(&norm_repl).into_owned(),
+                new_text,
             });
             line_no = end_line;
             scanned_to = m.end();
@@ -612,14 +654,15 @@ mod tests {
         (result, String::from_utf8_lossy(&diff_buf).into_owned())
     }
 
-    /// Write `content` to a temp file, run `replace::run` with `regions_out`
-    /// populated, and return the collected [`ChangedRegion`]s (file content
-    /// itself is not needed by these tests).
+    /// Write `content` to a temp file, run `replace::run` with regions
+    /// collection enabled, and return the collected [`ChangedRegion`]s
+    /// (file content itself is not needed by these tests).
     fn replace_file_regions(
         content: &[u8],
         pattern: &str,
         replacement: &[u8],
         regex: bool,
+        text_budget_lines: Option<usize>,
     ) -> Vec<ChangedRegion> {
         let mut f = NamedTempFile::new().unwrap();
         f.write_all(content).unwrap();
@@ -634,7 +677,10 @@ mod tests {
             pattern,
             replacement,
             None,
-            Some(&mut regions),
+            Some(RegionsRequest {
+                regions_out: &mut regions,
+                text_budget_lines,
+            }),
             ReplaceOptions {
                 regex,
                 io_mode: IoMode::Mmap,
@@ -656,7 +702,13 @@ mod tests {
     /// line, with the replacement text and its line count.
     #[test]
     fn changed_region_single_line_match() {
-        let regions = replace_file_regions(b"hello world\nsecond line\n", "world", b"there", false);
+        let regions = replace_file_regions(
+            b"hello world\nsecond line\n",
+            "world",
+            b"there",
+            false,
+            None,
+        );
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].start_line, 1);
         assert_eq!(regions[0].end_line, 1);
@@ -672,12 +724,34 @@ mod tests {
         let content = b"one\ntwo\nthree\nfour\n";
         // Regex spans lines 2-3 ("two\nthree"); multiline dot-all not needed
         // since the literal pattern itself contains the newline.
-        let regions = replace_file_regions(content, "two\nthree", b"TWO\nTHREE\nEXTRA", true);
+        let regions = replace_file_regions(content, "two\nthree", b"TWO\nTHREE\nEXTRA", true, None);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].start_line, 2);
         assert_eq!(regions[0].end_line, 3);
         assert_eq!(regions[0].new_line_count, 3);
         assert_eq!(regions[0].new_text, "TWO\nTHREE\nEXTRA");
+    }
+
+    /// Regression for issue review feedback: a replacement ending in a
+    /// trailing `\n` must not be over-counted as an extra empty line --
+    /// `new_line_count` must match how `render_changed_regions` actually
+    /// splits/renders `new_text` (which drops the spurious trailing empty
+    /// element produced by `str::split('\n')` on a trailing separator).
+    #[test]
+    fn changed_region_replacement_with_trailing_newline() {
+        let regions = replace_file_regions(
+            b"hello world\n",
+            "world",
+            b"line one\nline two\n",
+            false,
+            None,
+        );
+        assert_eq!(regions.len(), 1);
+        assert_eq!(
+            regions[0].new_line_count, 2,
+            "trailing \\n must not count as a third (empty) line"
+        );
+        assert_eq!(regions[0].new_text, "line one\nline two\n");
     }
 
     /// Two separate matches later in the file report correctly
@@ -687,7 +761,7 @@ mod tests {
     #[test]
     fn changed_region_multiple_matches_cumulative_line_numbers() {
         let content = b"a\nfoo\nb\nfoo\nc\n";
-        let regions = replace_file_regions(content, "foo", b"bar", false);
+        let regions = replace_file_regions(content, "foo", b"bar", false, None);
         assert_eq!(regions.len(), 2);
         assert_eq!(regions[0].start_line, 2);
         assert_eq!(regions[0].end_line, 2);
@@ -703,12 +777,37 @@ mod tests {
     /// ends the matched line, it doesn't pull in the next line's content.
     #[test]
     fn changed_region_empty_replacement_is_deletion() {
-        let regions = replace_file_regions(b"keep\ndelete me\nkeep2\n", "delete me\n", b"", false);
+        let regions =
+            replace_file_regions(b"keep\ndelete me\nkeep2\n", "delete me\n", b"", false, None);
         assert_eq!(regions.len(), 1);
         assert_eq!(regions[0].start_line, 2);
         assert_eq!(regions[0].end_line, 2);
         assert_eq!(regions[0].new_line_count, 0);
         assert_eq!(regions[0].new_text, "");
+    }
+
+    /// `text_budget_lines` bounds retained `new_text` without affecting the
+    /// accuracy of `new_line_count`/`start_line`/`end_line`: once the
+    /// running total of materialised lines reaches the budget, later
+    /// regions still report correct sizes but leave `new_text` empty.
+    #[test]
+    fn changed_region_text_budget_bounds_retained_text() {
+        let content = b"a\nfoo\nb\nfoo\nc\nfoo\nd\n";
+        // Three matches, each a 1-line replacement; budget covers only the
+        // first match's line.
+        let regions = replace_file_regions(content, "foo", b"bar", false, Some(1));
+        assert_eq!(regions.len(), 3);
+        // First region is under budget (0 < 1): text materialised.
+        assert_eq!(regions[0].new_text, "bar");
+        assert_eq!(regions[0].new_line_count, 1);
+        // Second and third regions are over budget: sizes stay accurate,
+        // text is left empty.
+        assert_eq!(regions[1].new_text, "");
+        assert_eq!(regions[1].new_line_count, 1);
+        assert_eq!(regions[1].start_line, 4);
+        assert_eq!(regions[2].new_text, "");
+        assert_eq!(regions[2].new_line_count, 1);
+        assert_eq!(regions[2].start_line, 6);
     }
 
     // ── Normal cases ──────────────────────────────────────────────────────────

@@ -1891,15 +1891,31 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
         } else {
             None
         };
+        let echo_max_lines = args
+            .get("echo_max_lines")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as usize;
         let mut regions: Vec<tpu::cmd::replace::ChangedRegion> = Vec::new();
-        let regions_out = if count { None } else { Some(&mut regions) };
+        let regions_req = if count {
+            None
+        } else {
+            Some(tpu::cmd::replace::RegionsRequest {
+                regions_out: &mut regions,
+                // diff:true always renders from diff_buf (see below), not
+                // `regions`, so no text needs to be retained in that case;
+                // otherwise bound retained text to the same threshold that
+                // gates whether it's ever shown, rather than the full size
+                // of every match's replacement.
+                text_budget_lines: Some(if diff { 0 } else { echo_max_lines }),
+            })
+        };
 
         let n = tpu::cmd::replace::run(
             path,
             &pattern,
             replacement.as_bytes(),
             diff_out,
-            regions_out,
+            regions_req,
             tpu::cmd::replace::ReplaceOptions {
                 multiline,
                 regex,
@@ -1938,10 +1954,6 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             .iter()
             .map(|r| (r.end_line - r.start_line + 1) + r.new_line_count)
             .sum();
-        let echo_max_lines = args
-            .get("echo_max_lines")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(5) as usize;
         // Explicit diff:true always shows the full diff regardless of size;
         // otherwise, echo automatically only when the change is small enough
         // to be a cheap, high-value safety net rather than a wall of text.
