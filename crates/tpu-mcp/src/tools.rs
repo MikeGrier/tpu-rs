@@ -216,7 +216,15 @@ pub fn list() -> Value {
                  (encoded by JSON as \\n on the wire). To insert the two literal \
                  characters backslash + n, send a literal backslash followed by 'n' \
                  (encoded by JSON as \\\\n). When in doubt, treat 'content' as if you \
-                 were typing directly into the file.",
+                 were typing directly into the file.\n\n\
+                 ESCAPE-HAZARD WARNING: a single stray backslash in the JSON you send \
+                 (e.g. writing \\n when \\\\n was meant) is decoded to a real control \
+                 character before this tool ever runs — the tool cannot tell that from \
+                 an intentional newline, so this class of mistake is silent. When \
+                 'content' contains backslash escapes, embedded quotes, or anything you \
+                 are not fully confident is escaped correctly for JSON, set \
+                 content_format:\"base64\" and send the exact bytes base64-encoded — \
+                 this removes the escaping decision entirely. See 'content_format' below.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -230,7 +238,27 @@ pub fn list() -> Value {
                             "Full UTF-8 text content to write. Any CRLF or bare CR line \
                              endings are normalized to LF before processing. \
                              Line endings are then converted to match the target \
-                             file's existing convention unless line_ending is specified."
+                             file's existing convention unless line_ending is specified. \
+                             When content_format is set, this is the encoded payload \
+                             (e.g. a base64 string) instead of literal text — see \
+                             content_format."
+                    },
+                    "content_format": {
+                        "type": "string",
+                        "enum": ["hex", "base64", "encoded"],
+                        "description":
+                            "If set, 'content' is decoded from this format instead of \
+                             being used as literal JSON-string text, bypassing JSON's \
+                             escape-sequence ambiguity entirely (see the ESCAPE-HAZARD \
+                             warning above). Recommended: \"base64\" — its alphabet \
+                             contains no backslashes, so there is no escaping decision \
+                             to get wrong; the decoded bytes are used exactly as sent \
+                             (after validating they are UTF-8 and normalising CRLF/CR to \
+                             LF, same as the plain-text path). \"hex\" behaves the same. \
+                             \"encoded\" applies tpu's own backslash-escape codec \
+                             (\\n, \\t, \\r, \\\\, \\xHH, \\uXXXX) and therefore does NOT \
+                             remove the JSON-escaping hazard — prefer base64 or hex. \
+                             Omit for plain literal text (default, unchanged behaviour).",
                     },
                     "line_ending": {
                         "type": "string",
@@ -309,7 +337,14 @@ pub fn list() -> Value {
                  created as needed.\n\n\
                  ESCAPING: 'content' is the LITERAL text to write. The JSON-RPC transport \
                  already handles JSON string escaping; do not add a second layer. To \
-                 insert a newline put a real newline in the JSON string.",
+                 insert a newline put a real newline in the JSON string.\n\n\
+                 ESCAPE-HAZARD WARNING: a stray single backslash in the JSON you send \
+                 (e.g. \\n where \\\\n was meant) is decoded to a real control character \
+                 before this tool ever runs, and cannot be distinguished from an \
+                 intentional newline. When 'content' contains backslash escapes, embedded \
+                 quotes, or anything you are not fully confident is JSON-escaped \
+                 correctly, set content_format:\"base64\" and send the exact bytes \
+                 base64-encoded instead — see content_format.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -325,7 +360,20 @@ pub fn list() -> Value {
                             "Full UTF-8 text content for the new file. Any CRLF or bare CR \
                              line endings are normalized to LF before processing, then \
                              written as LF unless line_ending (or git_root normalisation) \
-                             specifies otherwise."
+                             specifies otherwise. When content_format is set, this is the \
+                             encoded payload instead of literal text — see content_format."
+                    },
+                    "content_format": {
+                        "type": "string",
+                        "enum": ["hex", "base64", "encoded"],
+                        "description":
+                            "If set, 'content' is decoded from this format instead of \
+                             being used as literal JSON-string text (see the \
+                             ESCAPE-HAZARD warning above). Recommended: \"base64\" — no \
+                             backslashes in its alphabet, so no escaping decision to get \
+                             wrong. \"hex\" behaves the same. \"encoded\" applies tpu's own \
+                             backslash-escape codec and does NOT remove the JSON-escaping \
+                             hazard. Omit for plain literal text (default)."
                     },
                     "line_ending": {
                         "type": "string",
@@ -394,7 +442,16 @@ pub fn list() -> Value {
                  The sequences \\n, \\r, \\t, \\\\ are always expanded to LF / CR / TAB / \\ \
                  before substitution; all other \\X pass through unchanged. Either a \
                  real newline in the JSON string OR the two characters backslash+n will \
-                 produce a newline in the output — both are accepted.",
+                 produce a newline in the output — both are accepted.\n\n\
+                 ESCAPE-HAZARD WARNING: because of the above, a stray single backslash in \
+                 the JSON you send (e.g. \\n where \\\\n was meant) becomes a real newline \
+                 before this tool ever runs — there is no way for the tool to tell that \
+                 apart from an intentional one. When 'pattern' or 'replacement' contains \
+                 backslash escapes, embedded quotes, or anything you are not fully \
+                 confident is JSON-escaped correctly, set pattern_format:\"base64\" and/or \
+                 replacement_format:\"base64\" and send the exact bytes base64-encoded — \
+                 this removes the escaping decision entirely. See 'pattern_format' and \
+                 'replacement_format' below.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -409,7 +466,21 @@ pub fn list() -> Value {
                              every character, including `{`, `}`, `(`, `)`, `[`, `.`, `*`, \
                              `+`, `?`, is matched literally. Set regex:true to interpret \
                              this as a Rust regex::bytes pattern applied to the \
-                             LF-normalised content instead (use (?s) for dot-all)."
+                             LF-normalised content instead (use (?s) for dot-all). When \
+                             pattern_format is set, this is the encoded payload instead of \
+                             literal text — see pattern_format."
+                    },
+                    "pattern_format": {
+                        "type": "string",
+                        "enum": ["hex", "base64", "encoded"],
+                        "description":
+                            "If set, 'pattern' is decoded from this format instead of \
+                             being used as literal JSON-string text (see the \
+                             ESCAPE-HAZARD warning above). Recommended: \"base64\" — no \
+                             backslashes in its alphabet, so no escaping decision to get \
+                             wrong. \"hex\" behaves the same. \"encoded\" applies tpu's own \
+                             backslash-escape codec and does NOT remove the JSON-escaping \
+                             hazard. Omit for plain literal text (default)."
                     },
                     "replacement": {
                         "type": "string",
@@ -430,7 +501,24 @@ pub fn list() -> Value {
                              Standard C-style backslash escapes are expanded before the \
                              regex engine sees the replacement: \\n becomes a newline, \
                              \\t a tab, \\r a carriage return, \\\\ a single backslash. \
-                             All other \\X sequences are passed through unchanged."
+                             All other \\X sequences are passed through unchanged. When \
+                             replacement_format is set, this is the encoded payload \
+                             instead — none of the above backslash-escape decoding applies; \
+                             see replacement_format."
+                    },
+                    "replacement_format": {
+                        "type": "string",
+                        "enum": ["hex", "base64", "encoded"],
+                        "description":
+                            "If set, 'replacement' is decoded from this format and used \
+                             exactly as decoded — tpu's own backslash-escape convenience \
+                             decoding (\\n, \\t, \\r, \\\\) is skipped, since the whole point \
+                             of this channel is that the caller already specified the \
+                             exact bytes (see the ESCAPE-HAZARD warning above). \
+                             Recommended: \"base64\". \"hex\" behaves the same. \"encoded\" \
+                             applies tpu's own backslash-escape codec and does NOT remove \
+                             the JSON-escaping hazard. Omit for plain literal text \
+                             (default)."
                     },
                     "multiline": {
                         "type": "boolean",
@@ -519,14 +607,23 @@ pub fn list() -> Value {
                  transport already handles escaping; do not add a second layer. Put a \
                  real newline in the JSON string for a newline in the file. CRLF/CR in \
                  'data' is normalised to LF before the edit, then re-encoded to match \
-                 the file's line-ending convention. In binary mode, 'data' is raw bytes \
-                 (or hex/base64 if data_format is set) with no escaping or normalisation.\n\n\
+                 the file's line-ending convention.\n\n\
+                 ESCAPE-HAZARD WARNING: a stray single backslash in the JSON you send \
+                 (e.g. \\n where \\\\n was meant) is decoded to a real control character \
+                 before this tool ever runs, indistinguishable from an intentional \
+                 newline. 'data_format' works in both text and binary mode: when an op's \
+                 'data' contains backslash escapes, embedded quotes, or anything you are \
+                 not fully confident is JSON-escaped correctly, set that op's \
+                 data_format:\"base64\" and send the exact bytes base64-encoded — this \
+                 removes the escaping decision entirely (in text mode the decoded bytes \
+                 still get the usual CRLF/CR → LF normalisation).\n\n\
                  Each entry in 'ops' must have:\n\
                    op          — 'delete', 'insert', or 'splice'\n\
                    range       — 'N' or 'N-M' (required for delete/splice)\n\
                    offset      — 'N' (required for insert; position to insert before)\n\
                    data        — text or encoded bytes (required for insert/splice)\n\
-                   data_format — 'hex', 'base64', or 'encoded' (binary mode only, optional)\n\n\
+                   data_format — 'hex', 'base64', or 'encoded' (optional; works in both \
+                                 text and binary mode)\n\n\
                  Text mode (binary: false, default):\n\
                    Positions are 1-based line numbers. Data is UTF-8 text with LF endings.\n\n\
                  Binary mode (binary: true):\n\
@@ -544,7 +641,7 @@ pub fn list() -> Value {
                             "List of edit operations. Each operation is an object with \
                              fields: op ('delete'|'insert'|'splice'), range (for delete/splice), \
                              offset (for insert), data (for insert/splice), \
-                             data_format (optional, binary mode only).",
+                             data_format (optional; works in both text and binary mode).",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -569,7 +666,10 @@ pub fn list() -> Value {
                                 "data_format": {
                                     "type": "string",
                                     "enum": ["hex", "base64", "encoded"],
-                                    "description": "Encoding of data (binary mode only)."
+                                    "description": "Encoding of data. Works in both text \
+                                     and binary mode; recommended (\"base64\") whenever \
+                                     'data' contains backslash escapes or embedded quotes \
+                                     you're not confident are JSON-escaped correctly."
                                 }
                             },
                             "required": ["op"]
@@ -973,7 +1073,14 @@ pub fn list() -> Value {
                  a newline, put a real newline in the JSON string. Note that the file's \
                  last line may or may not already end in a newline — if you need a clean \
                  separation between the existing content and your appended text, prepend \
-                 a newline to 'content' yourself.",
+                 a newline to 'content' yourself.\n\n\
+                 ESCAPE-HAZARD WARNING: a stray single backslash in the JSON you send \
+                 (e.g. \\n where \\\\n was meant) is decoded to a real control character \
+                 before this tool ever runs, and cannot be distinguished from an \
+                 intentional newline. When 'content' contains backslash escapes, embedded \
+                 quotes, or anything you are not fully confident is JSON-escaped \
+                 correctly, set content_format:\"base64\" and send the exact bytes \
+                 base64-encoded instead — see content_format.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -987,7 +1094,21 @@ pub fn list() -> Value {
                             "UTF-8 text to append. Any CRLF or bare CR line endings \
                              are normalized to LF before processing. Line endings are \
                              then converted to match the target file's convention \
-                             unless line_ending is specified."
+                             unless line_ending is specified. When content_format is set, \
+                             this is the encoded payload instead of literal text — see \
+                             content_format."
+                    },
+                    "content_format": {
+                        "type": "string",
+                        "enum": ["hex", "base64", "encoded"],
+                        "description":
+                            "If set, 'content' is decoded from this format instead of \
+                             being used as literal JSON-string text (see the \
+                             ESCAPE-HAZARD warning above). Recommended: \"base64\" — no \
+                             backslashes in its alphabet, so no escaping decision to get \
+                             wrong. \"hex\" behaves the same. \"encoded\" applies tpu's own \
+                             backslash-escape codec and does NOT remove the JSON-escaping \
+                             hazard. Omit for plain literal text (default)."
                     },
                     "line_ending": {
                         "type": "string",
@@ -1628,8 +1749,7 @@ fn call_write_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_write_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
-        let content_raw = require_str(args, "content")?;
-        let content = normalize_to_lf(content_raw);
+        let content = decode_content_arg(args, "content")?;
         let path = std::path::Path::new(&file);
 
         let le_override = eol_write_override(args, &file, config)?;
@@ -1681,8 +1801,7 @@ fn call_create_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_create_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
-        let content_raw = require_str(args, "content")?;
-        let content = normalize_to_lf(content_raw);
+        let content = decode_content_arg(args, "content")?;
         let path = std::path::Path::new(&file);
 
         let le_override = eol_write_override(args, &file, config)?;
@@ -1715,10 +1834,8 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         reject_removed_fixed_strings_arg(args)?;
         let file = resolve_file_arg(args)?;
-        let pattern = require_str(args, "pattern")?;
-        let replacement_raw = require_str(args, "replacement")?;
-        let replacement_unescaped = unescape_replacement(replacement_raw);
-        let replacement = normalize_to_lf(&replacement_unescaped);
+        let pattern = decode_pattern_arg(args, "pattern")?;
+        let replacement = decode_replacement_arg(args)?;
         let path = std::path::Path::new(&file);
 
         let multiline = args
@@ -1743,7 +1860,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
 
         let n = tpu::cmd::replace::run(
             path,
-            pattern,
+            &pattern,
             replacement.as_bytes(),
             diff_out,
             tpu::cmd::replace::ReplaceOptions {
@@ -2282,8 +2399,7 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_append_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
-        let content_raw = require_str(args, "content")?;
-        let content = normalize_to_lf(content_raw);
+        let content = decode_content_arg(args, "content")?;
         let path = std::path::Path::new(&file);
 
         let le_override = eol_write_override(args, &file, config)?;
@@ -3199,12 +3315,12 @@ fn normalize_to_lf(s: &str) -> std::borrow::Cow<'_, str> {
 /// Expand C-style backslash escape sequences in a regex replacement template.
 ///
 /// Recognised sequences and their expansions:
-///   - `\n`  ? LF   (`0x0A`)
-///   - `\r`  ? CR   (`0x0D`)
-///   - `\t`  ? TAB  (`0x09`)
-///   - `\\` ? `\`
+///   - `\n`  → LF   (`0x0A`)
+///   - `\r`  → CR   (`0x0D`)
+///   - `\t`  → TAB  (`0x09`)
+///   - `\\` → `\`
 ///
-/// All other `\X` sequences are passed through unchanged � both the backslash
+/// All other `\X` sequences are passed through unchanged — both the backslash
 /// and the following character are preserved as-is.  This is intentional:
 /// `$1`, `$name`, and `$$` reference syntax used by `regex::bytes::Captures::
 /// expand()` must reach the regex engine unaltered.
@@ -3217,7 +3333,7 @@ fn normalize_to_lf(s: &str) -> std::borrow::Cow<'_, str> {
 /// before the normalised tpu view sees them.
 fn unescape_replacement(s: &str) -> String {
     if !s.contains('\\') {
-        // Fast path � no backslashes at all; nothing to do.
+        // Fast path — no backslashes at all; nothing to do.
         return s.to_owned();
     }
     let mut out = String::with_capacity(s.len());
@@ -3297,6 +3413,84 @@ fn parse_data_format(s: &str) -> Result<tpu::data_format::DataFormat, Box<dyn st
             "unrecognised data_format value {other:?}; expected hex, base64, or encoded"
         )
         .into()),
+    }
+}
+
+/// Resolve a text payload argument, honouring an optional `{key}_format`
+/// escape-hazard-free channel (see issue #53).
+///
+/// JSON string transport means a literal `\n` (single backslash) an agent
+/// intends to land as two bytes in the file is indistinguishable, once
+/// decoded, from an agent-intended real newline — the ambiguity is resolved
+/// (wrongly, from the caller's point of view) before tpu ever sees the
+/// string. `{key}_format: "base64"` (or `"hex"`) sidesteps this: the wire
+/// value contains no backslashes at all, so JSON decoding cannot introduce
+/// or remove escape sequences, and the decoded bytes are exactly what the
+/// caller intended, byte for byte.
+///
+/// When `{key}_format` is absent, falls back to the plain JSON-string value
+/// (unchanged behaviour). Either way, CRLF/CR occurring in the resolved text
+/// is normalised to LF, matching every other text-content argument.
+fn decode_content_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let format_key = format!("{key}_format");
+    let text = match args.get(&format_key).and_then(|v| v.as_str()) {
+        Some(fmt_str) => {
+            let fmt = parse_data_format(fmt_str)?;
+            let raw = require_str(args, key)?;
+            let bytes =
+                tpu::data_format::decode(&fmt, raw).map_err(|e| format!("{format_key}: {e}"))?;
+            String::from_utf8(bytes)
+                .map_err(|e| format!("{format_key}: decoded bytes are not valid UTF-8: {e}"))?
+        }
+        None => require_str(args, key)?.to_owned(),
+    };
+    Ok(normalize_to_lf(&text).into_owned())
+}
+
+/// Resolve `tpu_replace_in_file`'s `pattern` argument, honouring the optional
+/// `pattern_format` escape-hazard-free channel (see [`decode_content_arg`]).
+/// Unlike content/replacement, `pattern` is never LF-normalised here — it is
+/// matched against the file's already LF-normalised view exactly as today.
+fn decode_pattern_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let format_key = format!("{key}_format");
+    match args.get(&format_key).and_then(|v| v.as_str()) {
+        Some(fmt_str) => {
+            let fmt = parse_data_format(fmt_str)?;
+            let raw = require_str(args, key)?;
+            let bytes =
+                tpu::data_format::decode(&fmt, raw).map_err(|e| format!("{format_key}: {e}"))?;
+            String::from_utf8(bytes)
+                .map_err(|e| format!("{format_key}: decoded bytes are not valid UTF-8: {e}").into())
+        }
+        None => Ok(require_str(args, key)?.to_owned()),
+    }
+}
+
+/// Resolve `tpu_replace_in_file`'s `replacement` argument.
+///
+/// When `replacement_format` is set, the decoded bytes are taken literally:
+/// this is the whole point of the escape-hazard-free channel, so tpu's own
+/// backslash-escape convenience decoding ([`unescape_replacement`]) is
+/// skipped — it would otherwise reinterpret bytes the caller has already
+/// specified exactly. Without `replacement_format`, behaviour is unchanged:
+/// the plain JSON string is backslash-unescaped, then LF-normalised.
+fn decode_replacement_arg(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    match args.get("replacement_format").and_then(|v| v.as_str()) {
+        Some(fmt_str) => {
+            let fmt = parse_data_format(fmt_str)?;
+            let raw = require_str(args, "replacement")?;
+            let bytes = tpu::data_format::decode(&fmt, raw)
+                .map_err(|e| format!("replacement_format: {e}"))?;
+            let text = String::from_utf8(bytes).map_err(|e| {
+                format!("replacement_format: decoded bytes are not valid UTF-8: {e}")
+            })?;
+            Ok(normalize_to_lf(&text).into_owned())
+        }
+        None => {
+            let replacement_raw = require_str(args, "replacement")?;
+            let replacement_unescaped = unescape_replacement(replacement_raw);
+            Ok(normalize_to_lf(&replacement_unescaped).into_owned())
+        }
     }
 }
 
@@ -3819,7 +4013,7 @@ mod tests {
 
     #[test]
     fn unescape_no_backslashes_fast_path() {
-        // No backslash at all � fast path returns owned copy unchanged.
+        // No backslash at all — fast path returns owned copy unchanged.
         let input = "hello $1 world";
         assert_eq!(ur(input), input);
     }
@@ -3856,7 +4050,7 @@ mod tests {
 
     #[test]
     fn unescape_capture_group_passthrough() {
-        // $1 and $name must survive unmodified � no backslash involved.
+        // $1 and $name must survive unmodified — no backslash involved.
         assert_eq!(ur("prefix $1 suffix"), "prefix $1 suffix");
         assert_eq!(ur("$name"), "$name");
         assert_eq!(ur("$$"), "$$");
@@ -3882,7 +4076,7 @@ mod tests {
 
     #[test]
     fn unescape_unknown_escape_preserved() {
-        // \x, \$, \q etc. are not recognised � both chars pass through.
+        // \x, \$, \q etc. are not recognised — both chars pass through.
         assert_eq!(ur("\\x41"), "\\x41");
         assert_eq!(ur("\\$1"), "\\$1");
         assert_eq!(ur("\\q"), "\\q");
@@ -4338,6 +4532,184 @@ mod integration_tests {
             "CRLF file must not contain double-CR after append; got: {text:?}"
         );
         assert_eq!(text, "line1\r\nline2\r\nline3\r\n");
+
+        drop(dir);
+    }
+
+    // -- escape-hazard *_format channel (issue #53) -----------------------------
+
+    /// EH-IT-1: `tpu_write_file` with `content_format: "base64"` writes the
+    /// exact decoded bytes, bypassing JSON-escape ambiguity entirely.
+    /// Regression for issue #53: a literal two-character `\n` (backslash + n)
+    /// must survive verbatim rather than being decoded to a real newline.
+    #[test]
+    fn eh_it_1_write_file_content_format_base64_literal_backslash_n() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("content_format_base64.txt");
+
+        // Intended file content: the literal two characters \ and n (not a newline).
+        let intended = "line one\\nline two";
+        let encoded = tpu::data_format::encode_base64(intended.as_bytes());
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": encoded,
+            "content_format": "base64",
+        });
+        call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+
+        let written = fs::read_to_string(&f).unwrap();
+        assert_eq!(
+            written, intended,
+            "base64 channel must preserve literal backslash+n verbatim; got: {written:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// EH-IT-2: `tpu_append_file` with `content_format: "base64"`.
+    #[test]
+    fn eh_it_2_append_file_content_format_base64() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("append_base64.txt");
+        fs::write(&f, "existing\n").unwrap();
+
+        let intended = "appended\\ttabbed";
+        let encoded = tpu::data_format::encode_base64(intended.as_bytes());
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": encoded,
+            "content_format": "base64",
+        });
+        call("tpu_append_file", &args).expect("tpu_append_file must succeed");
+
+        let written = fs::read_to_string(&f).unwrap();
+        assert_eq!(written, format!("existing\n{intended}"));
+
+        drop(dir);
+    }
+
+    /// EH-IT-3: `tpu_create_file` with `content_format: "base64"`.
+    #[test]
+    fn eh_it_3_create_file_content_format_base64() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("create_base64.txt");
+
+        let intended = "brand new \\n not a newline";
+        let encoded = tpu::data_format::encode_base64(intended.as_bytes());
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": encoded,
+            "content_format": "base64",
+        });
+        call("tpu_create_file", &args).expect("tpu_create_file must succeed");
+
+        let written = fs::read_to_string(&f).unwrap();
+        assert_eq!(written, intended);
+
+        drop(dir);
+    }
+
+    /// EH-IT-4: `tpu_replace_in_file` with `pattern_format: "base64"` finds a
+    /// literal search target containing backslash+n without needing regex or
+    /// JSON double-escaping.
+    #[test]
+    fn eh_it_4_replace_pattern_format_base64_literal_match() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("pattern_base64.txt");
+        fs::write(&f, "prefix line one\\nline two suffix\n").unwrap();
+
+        let pattern = "one\\nline";
+        let encoded = tpu::data_format::encode_base64(pattern.as_bytes());
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": encoded,
+            "pattern_format": "base64",
+            "replacement": "ONE-LINE",
+        });
+        call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        let written = fs::read_to_string(&f).unwrap();
+        assert_eq!(written, "prefix line ONE-LINE two suffix\n");
+
+        drop(dir);
+    }
+
+    /// EH-IT-5: `tpu_replace_in_file` with `replacement_format: "base64"`
+    /// writes the exact decoded bytes verbatim — no backslash-escape
+    /// convenience decoding is applied on top (unlike the plain-text path).
+    #[test]
+    fn eh_it_5_replace_replacement_format_base64_bypasses_unescape() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("replacement_base64.txt");
+        fs::write(&f, "TARGET\n").unwrap();
+
+        // Intended replacement literally contains \n (backslash + n), which
+        // the plain-text path's unescape_replacement would turn into a real
+        // newline. The base64 channel must not apply that decoding.
+        let intended = "before\\nafter";
+        let encoded = tpu::data_format::encode_base64(intended.as_bytes());
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "TARGET",
+            "replacement": encoded,
+            "replacement_format": "base64",
+        });
+        call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        let written = fs::read_to_string(&f).unwrap();
+        assert_eq!(
+            written,
+            format!("{intended}\n"),
+            "replacement_format:base64 must not apply backslash-escape decoding; got: {written:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// EH-IT-6: `tpu_edit_file`'s `data_format` works in TEXT mode (not just
+    /// binary mode), bypassing the same JSON-escape hazard for an op's `data`.
+    #[test]
+    fn eh_it_6_edit_file_data_format_base64_in_text_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("edit_base64.txt");
+        fs::write(&f, "one\ntwo\nthree\n").unwrap();
+
+        let intended = "inserted\\nliteral";
+        let encoded = tpu::data_format::encode_base64(intended.as_bytes());
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [
+                { "op": "insert", "offset": "2", "data": encoded, "data_format": "base64" }
+            ],
+        });
+        call("tpu_edit_file", &args).expect("tpu_edit_file must succeed");
+
+        let written = fs::read_to_string(&f).unwrap();
+        assert!(
+            written.contains(intended),
+            "text-mode edit_file data_format:base64 must preserve literal bytes; got: {written:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// EH-IT-7: an invalid base64 payload in `content_format` produces a
+    /// descriptive error rather than silently writing garbage, and the file
+    /// is not created.
+    #[test]
+    fn eh_it_7_content_format_invalid_base64_errors() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("bad_base64.txt");
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "not valid base64!!!",
+            "content_format": "base64",
+        });
+        let out = call("tpu_write_file", &args);
+        assert!(out.is_err(), "invalid base64 must produce an error result");
+        assert!(!f.exists(), "file must not be created on decode failure");
 
         drop(dir);
     }
