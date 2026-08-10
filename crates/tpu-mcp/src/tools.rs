@@ -422,7 +422,12 @@ pub fn list() -> Value {
                  this applies. \
                  The original file is backed up to <file>.bak before writing. \
                  Use count:true to count matches without modifying the file. \
-                 Use dry_run:true to preview changes as a unified diff without writing.\n\n\
+                 Use dry_run:true to preview changes as a unified diff without writing. \
+                 After a real write, a compact unified diff of the change is included in \
+                 the response BY DEFAULT — no diff:true needed — as long as the change is \
+                 small (see echo_max_lines below); this lets you catch a mistake (e.g. an \
+                 escape-hazard corruption, see the ESCAPE-HAZARD warning) in the same turn \
+                 instead of needing a follow-up tpu_read_file call.\n\n\
                  ESCAPING — RECOMMENDED DEFAULT: leave regex unset (or false) and send the \
                  search target as unescaped literal text (code, JSON, structured data, \
                  anything containing . ( ) [ ] { } * + ? | ^ $ \\). This is almost always \
@@ -573,6 +578,20 @@ pub fn list() -> Value {
                              capture-group reference in `replacement` (e.g. $1token being \
                              parsed as group name '1token'), never silently changes what \
                              gets matched or replaced."
+                    },
+                    "echo_max_lines": {
+                        "type": "integer",
+                        "description":
+                            "Maximum number of changed (added+removed) diff lines for \
+                             which the default changed-region echo is included in the \
+                             response. When the actual change is at most this many lines, \
+                             a compact unified diff is prepended to the response \
+                             automatically (same as diff:true). When it's larger, the diff \
+                             is omitted and the status trailer instead reports \
+                             'changed_lines' (the actual count) and 'diff_omitted':true — \
+                             pass diff:true explicitly to see the full diff regardless of \
+                             size. Has no effect when diff:true is set (always shown then) \
+                             or when count:true/dry_run:true is set. Default: 5."
                     },
                     "allow_mojibake": {
                         "type": "boolean",
@@ -1852,11 +1871,8 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             .unwrap_or(false);
 
         let mut diff_buf: Vec<u8> = Vec::new();
-        let diff_out: Option<&mut dyn std::io::Write> = if diff || dry_run {
-            Some(&mut diff_buf)
-        } else {
-            None
-        };
+        let diff_out: Option<&mut dyn std::io::Write> =
+            if count { None } else { Some(&mut diff_buf) };
 
         let n = tpu::cmd::replace::run(
             path,
@@ -1897,15 +1913,28 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
         // File was modified.
         delete_bak_if_exists(&file);
         let stamp = stamp_and_verify(Path::new(&file), config.verify_delay_ms)?;
-        let status = serde_json::json!({
+        let diff_text = String::from_utf8_lossy(&diff_buf).into_owned();
+        let changed_lines = count_changed_diff_lines(&diff_text);
+        let echo_max_lines = args
+            .get("echo_max_lines")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(5) as usize;
+        // Explicit diff:true always shows the full diff regardless of size;
+        // otherwise, echo automatically only when the change is small enough
+        // to be a cheap, high-value safety net rather than a wall of text.
+        let should_echo = diff || changed_lines <= echo_max_lines;
+        let mut status = serde_json::json!({
             "status": "success",
             "file": file,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
+            "changed_lines": changed_lines,
         });
+        if !should_echo {
+            status["diff_omitted"] = serde_json::json!(true);
+        }
         let status_line = serde_json::to_string(&status)?;
-        if diff && !diff_buf.is_empty() {
-            let diff_text = String::from_utf8_lossy(&diff_buf);
+        if should_echo && !diff_buf.is_empty() {
             let sep = diff_separator(&diff_text);
             Ok(ToolResult::ok(format!(
                 "{header}\n{diff_text}{sep}{status_line}"
@@ -3549,6 +3578,22 @@ fn diff_separator(s: &str) -> &'static str {
     if s.ends_with('\n') { "" } else { "\n" }
 }
 
+/// Count the added/removed body lines in a unified diff (excludes the
+/// `--- a/…` / `+++ b/…` file-header lines and `@@ … @@` hunk headers).
+///
+/// Used to gate `tpu_replace_in_file`'s default changed-region echo (see
+/// issue #53 mitigation 2): small changes are cheap and high-value to show
+/// automatically; large ones are left to an explicit `diff: true` request.
+fn count_changed_diff_lines(diff_text: &str) -> usize {
+    diff_text
+        .lines()
+        .filter(|line| {
+            (line.starts_with('+') && !line.starts_with("+++ "))
+                || (line.starts_with('-') && !line.starts_with("--- "))
+        })
+        .count()
+}
+
 fn mojibake_policy_from_args(args: &Value) -> tpu::mojibake::WritePolicy {
     let allow = args
         .get("allow_mojibake")
@@ -4710,6 +4755,140 @@ mod integration_tests {
         let out = call("tpu_write_file", &args);
         assert!(out.is_err(), "invalid base64 must produce an error result");
         assert!(!f.exists(), "file must not be created on decode failure");
+
+        drop(dir);
+    }
+
+    // -- default changed-region echo (issue #53 mitigation 2) -------------------
+
+    /// ER-IT-1: `tpu_replace_in_file` on a small change (well under
+    /// echo_max_lines) automatically includes a compact unified diff in the
+    /// response, with no `diff:true` needed, plus a `changed_lines` count.
+    #[test]
+    fn er_it_1_replace_small_change_echoed_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("small_change.txt");
+        fs::write(&f, "hello world\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "world",
+            "replacement": "there",
+        });
+        let out = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        assert!(
+            out.contains("@@"),
+            "small change must auto-echo a unified diff hunk; got: {out:?}"
+        );
+        let v = last_json_line(&out);
+        assert_eq!(
+            v["changed_lines"].as_u64().unwrap(),
+            2,
+            "one line replaced -> 1 removed + 1 added; got: {out:?}"
+        );
+        assert!(
+            v.get("diff_omitted").is_none(),
+            "small change must not be marked as omitted; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// ER-IT-2: `tpu_replace_in_file` on a change larger than the default
+    /// `echo_max_lines` (5) omits the diff by default, reporting
+    /// `changed_lines` and `diff_omitted:true` instead.
+    #[test]
+    fn er_it_2_replace_large_change_omitted_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("large_change.txt");
+        let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n";
+        let new = "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\n";
+        fs::write(&f, old).unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": old,
+            "replacement": new,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        assert!(
+            !out.contains("@@"),
+            "large change must not auto-echo a diff by default; got: {out:?}"
+        );
+        let v = last_json_line(&out);
+        let changed_lines = v["changed_lines"].as_u64().unwrap();
+        assert!(
+            changed_lines > 5,
+            "expected more than 5 changed lines; got: {changed_lines} ({out:?})"
+        );
+        assert_eq!(
+            v["diff_omitted"], true,
+            "large change must be marked as omitted; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// ER-IT-3: raising `echo_max_lines` echoes a change that would
+    /// otherwise be omitted under the default threshold.
+    #[test]
+    fn er_it_3_replace_echo_max_lines_override() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("large_change_override.txt");
+        let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n";
+        let new = "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\n";
+        fs::write(&f, old).unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": old,
+            "replacement": new,
+            "echo_max_lines": 30,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        assert!(
+            out.contains("@@"),
+            "raised echo_max_lines must allow the diff to be echoed; got: {out:?}"
+        );
+        let v = last_json_line(&out);
+        assert!(
+            v.get("diff_omitted").is_none(),
+            "diff must not be marked omitted once echo_max_lines covers it; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// ER-IT-4: explicit `diff:true` always shows the full diff regardless
+    /// of size, unaffected by `echo_max_lines`.
+    #[test]
+    fn er_it_4_replace_diff_true_ignores_echo_max_lines() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("large_change_explicit_diff.txt");
+        let old = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\n";
+        let new = "L1\nL2\nL3\nL4\nL5\nL6\nL7\nL8\n";
+        fs::write(&f, old).unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": old,
+            "replacement": new,
+            "diff": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        assert!(
+            out.contains("@@"),
+            "diff:true must show the diff regardless of size; got: {out:?}"
+        );
+        let v = last_json_line(&out);
+        assert!(
+            v.get("diff_omitted").is_none(),
+            "diff:true must never mark the diff as omitted; got: {out:?}"
+        );
 
         drop(dir);
     }
