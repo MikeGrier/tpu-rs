@@ -520,11 +520,14 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["hex", "base64", "encoded"],
                         "description":
-                            "If set, 'replacement' is decoded from this format and used \
-                             exactly as decoded — tpu's own backslash-escape convenience \
-                             decoding (\\n, \\t, \\r, \\\\) is skipped, since the whole point \
-                             of this channel is that the caller already specified the \
-                             exact bytes (see the ESCAPE-HAZARD warning above). \
+                            "If set, 'replacement' is decoded from this format, skipping \
+                             tpu's own backslash-escape convenience decoding (\\n, \\t, \\r, \
+                             \\\\) — the whole point of this channel is that the caller \
+                             already specified the exact bytes (see the ESCAPE-HAZARD \
+                             warning above). The decoded text still goes through the same \
+                             CRLF/bare-CR -> LF normalisation as every other text payload, \
+                             so a literal CR byte does NOT survive this channel — it always \
+                             becomes LF, same as the plain-text path. \
                              Recommended: \"base64\". \"hex\" behaves the same. \"encoded\" \
                              applies tpu's own backslash-escape codec and does NOT remove \
                              the JSON-escaping hazard. Omit for plain literal text \
@@ -592,8 +595,12 @@ pub fn list() -> Value {
                              response. When the actual change is at most this many lines, \
                              a compact preview (unified-diff-style hunk headers, new lines \
                              only — cheap regardless of file size, never a full-file diff) \
-                             is prepended to the response automatically. When it's larger, \
-                             the preview is omitted and the status trailer instead reports \
+                             is prepended to the response automatically. Any individual \
+                             echoed line longer than 500 bytes is itself truncated with a \
+                             marker, so a small number of very long lines (minified JSON, a \
+                             base64 blob, ...) still can't produce an unbounded response. \
+                             When the line count is larger than this limit, the preview is \
+                             omitted entirely and the status trailer instead reports \
                              'changed_lines' (the actual count) and 'diff_omitted':true — \
                              pass diff:true explicitly to see a full old/new unified diff \
                              regardless of size. Has no effect when diff:true is set \
@@ -3623,13 +3630,21 @@ fn diff_separator(s: &str) -> &'static str {
     if s.ends_with('\n') { "" } else { "\n" }
 }
 
+/// Maximum bytes of a single echoed line before it's truncated with a
+/// marker. `echo_max_lines` only bounds the number of lines, so a handful
+/// of individually-huge lines (minified JSON, a base64 blob, ...) could
+/// otherwise still produce a very large response despite passing that gate.
+const MAX_ECHO_LINE_BYTES: usize = 500;
+
 /// Render `tpu_replace_in_file`'s default changed-region echo from cheap
 /// per-match [`tpu::cmd::replace::ChangedRegion`] data (see its doc comment)
 /// -- deliberately NOT a full unified diff, since that would require the
 /// whole-file clone this mechanism exists to avoid. Each region renders as a
 /// unified-diff-style hunk header (for familiar tooling/eyeballs) followed
 /// only by the NEW text -- the old text isn't cheaply available without the
-/// full-file clone, so it isn't shown here; pass diff:true for that.
+/// full-file clone, so it isn't shown here; pass diff:true for that. Any
+/// single rendered line longer than [`MAX_ECHO_LINE_BYTES`] is truncated
+/// with a marker (see that constant's doc comment).
 fn render_changed_regions(regions: &[tpu::cmd::replace::ChangedRegion]) -> String {
     let mut out = String::new();
     for r in regions {
@@ -3647,7 +3662,16 @@ fn render_changed_regions(regions: &[tpu::cmd::replace::ChangedRegion]) -> Strin
             }
             for line in lines {
                 out.push('+');
-                out.push_str(line);
+                if line.len() > MAX_ECHO_LINE_BYTES {
+                    let mut boundary = MAX_ECHO_LINE_BYTES;
+                    while !line.is_char_boundary(boundary) {
+                        boundary -= 1;
+                    }
+                    out.push_str(&line[..boundary]);
+                    out.push_str(&format!("... [truncated, {} bytes total]", line.len()));
+                } else {
+                    out.push_str(line);
+                }
                 out.push('\n');
             }
         }
@@ -4949,6 +4973,47 @@ mod integration_tests {
         assert!(
             v.get("diff_omitted").is_none(),
             "diff:true must never mark the diff as omitted; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// ER-IT-5: a single-line replacement that is itself very long (e.g. a
+    /// minified JSON blob) is truncated with a marker in the default echo,
+    /// even though `changed_lines` (2: one old line + one new line) is well
+    /// under `echo_max_lines` -- the line-count gate alone can't bound an
+    /// individually-huge line.
+    #[test]
+    fn er_it_5_replace_default_echo_truncates_long_single_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("huge_line.txt");
+        fs::write(&f, "TARGET\n").unwrap();
+
+        let huge = "x".repeat(2000);
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "TARGET",
+            "replacement": huge,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        assert!(
+            out.contains("[truncated, 2000 bytes total]"),
+            "a huge single line must be truncated with a marker; got: {} chars",
+            out.len()
+        );
+        assert!(
+            !out.contains(&huge),
+            "the full untruncated huge line must not appear verbatim in the response"
+        );
+        let v = last_json_line(&out);
+        assert_eq!(
+            v["changed_lines"], 2,
+            "changed_lines must still reflect 1 old + 1 new line, not byte count"
+        );
+        assert!(
+            v.get("diff_omitted").is_none(),
+            "small line count must not be marked as omitted just because a line is long"
         );
 
         drop(dir);
