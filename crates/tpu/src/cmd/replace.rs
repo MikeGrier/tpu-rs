@@ -364,7 +364,16 @@ pub fn run(
                 new_line_count,
                 new_text,
             });
-            line_no = end_line;
+            // `line_no` must track the line number of `scanned_to`, which
+            // physically advances past the match's trailing '\n' (if any)
+            // even though that byte was excluded from `end_line` above --
+            // otherwise the next match's gap-count would silently miss
+            // that line-boundary crossing and under-count start_line.
+            line_no = if match_span.last() == Some(&b'\n') {
+                end_line + 1
+            } else {
+                end_line
+            };
             scanned_to = m.end();
         }
 
@@ -808,6 +817,26 @@ mod tests {
         assert_eq!(regions[2].new_text, "");
         assert_eq!(regions[2].new_line_count, 1);
         assert_eq!(regions[2].start_line, 6);
+    }
+
+    /// Regression: `line_no` must track the line number of `scanned_to`,
+    /// not just `end_line` -- a match ending in a trailing `\n` physically
+    /// advances `scanned_to` past that newline even though it's excluded
+    /// from `end_line` (see the deletion test above), so a subsequent
+    /// match's `start_line` would be under-counted by one line if `line_no`
+    /// weren't also advanced past it.
+    #[test]
+    fn changed_region_match_trailing_newline_does_not_undercount_next_match() {
+        let content = b"keep\ndelete me\nkeep2\nfoo\nkeep3\n";
+        let regions = replace_file_regions(content, "delete me\n|foo", b"X", true, None);
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[0].start_line, 2);
+        assert_eq!(regions[0].end_line, 2);
+        assert_eq!(
+            regions[1].start_line, 4,
+            "second match must not be under-counted by the first match's trailing newline"
+        );
+        assert_eq!(regions[1].end_line, 4);
     }
 
     // ── Normal cases ──────────────────────────────────────────────────────────
