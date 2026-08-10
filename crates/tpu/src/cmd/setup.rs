@@ -126,6 +126,11 @@ get wrong — this makes the whole class of bug impossible rather than just
 less likely. `"hex"` works the same way; avoid `"encoded"` for this purpose
 since it is itself a backslash-escape codec and re-introduces the hazard.
 
+**Safety net**: `tpu_replace_in_file` also echoes a compact unified diff of
+every small real write by default (no `diff:true` needed — see
+`echo_max_lines`), so a corruption like this is visible immediately in the
+same turn instead of requiring a follow-up read.
+
 ### Tool output format
 
 Every tool response uses a **mixed format**: a JSON invocation header,
@@ -143,6 +148,10 @@ between the header and trailer.
   `dry_run:true` (replace only): optional diff lines, then `{"status":"success","changed":true|false}`.
   `count:true` (replace only): `{"status":"success","count":N}`.
   `append diff:true`: diff lines when changed, then `{"status":"success","file":"...","changed":true|false}`.
+  `tpu_replace_in_file` on a real write additionally reports `"changed_lines":N` in the status,
+  and — as long as N is at most `echo_max_lines` (default 5) — automatically prepends a
+  compact unified diff even without `diff:true`; a larger change instead adds
+  `"diff_omitted":true` (pass `diff:true` to see it regardless of size).
 - **Structured tools** (count_file, stat_file, copy_file, render_file,
   setup+target, doctor) — result line
   `{"reason":"x-tpu-mcp-result",...}` followed by `{"status":"success"}`.
