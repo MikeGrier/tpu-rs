@@ -423,11 +423,13 @@ pub fn list() -> Value {
                  The original file is backed up to <file>.bak before writing. \
                  Use count:true to count matches without modifying the file. \
                  Use dry_run:true to preview changes as a unified diff without writing. \
-                 After a real write, a compact unified diff of the change is included in \
-                 the response BY DEFAULT — no diff:true needed — as long as the change is \
-                 small (see echo_max_lines below); this lets you catch a mistake (e.g. an \
-                 escape-hazard corruption, see the ESCAPE-HAZARD warning) in the same turn \
-                 instead of needing a follow-up tpu_read_file call.\n\n\
+                 After a real write, a compact changed-region preview (new lines, with \
+                 unified-diff-style hunk headers — cheap regardless of file size) is \
+                 included in the response BY DEFAULT — no diff:true needed — as long as \
+                 the change is small (see echo_max_lines below); this lets you catch a \
+                 mistake (e.g. an escape-hazard corruption, see the ESCAPE-HAZARD warning) \
+                 in the same turn instead of needing a follow-up tpu_read_file call. Pass \
+                 diff:true for a full old/new unified diff instead.\n\n\
                  ESCAPING — RECOMMENDED DEFAULT: leave regex unset (or false) and send the \
                  search target as unescaped literal text (code, JSON, structured data, \
                  anything containing . ( ) [ ] { } * + ? | ^ $ \\). This is almost always \
@@ -444,10 +446,11 @@ pub fn list() -> Value {
                  $1token — the latter is parsed as a reference to a group *named* \
                  '1token', silently dropping both the substitution and the literal \
                  suffix. \
-                 The sequences \\n, \\r, \\t, \\\\ are always expanded to LF / CR / TAB / \\ \
-                 before substitution; all other \\X pass through unchanged. Either a \
-                 real newline in the JSON string OR the two characters backslash+n will \
-                 produce a newline in the output — both are accepted.\n\n\
+                 `\\n` and `\\r` both expand to LF (see the 'replacement' description \
+                 below for why); `\\t` expands to TAB and `\\\\` to a single backslash. \
+                 All other `\\X` pass through unchanged. Either a real newline in the \
+                 JSON string OR the two characters backslash+n will produce a newline in \
+                 the output — both are accepted.\n\n\
                  ESCAPE-HAZARD WARNING: because of the above, a stray single backslash in \
                  the JSON you send (e.g. \\n where \\\\n was meant) becomes a real newline \
                  before this tool ever runs — there is no way for the tool to tell that \
@@ -501,15 +504,17 @@ pub fn list() -> Value {
                              capture reference followed by literal text, disambiguate with \
                              braces: ${1}token, NOT $1token — the latter is parsed as a \
                              reference to a group *named* '1token'. \
-                             Any CRLF or bare CR in the replacement text is normalized \
-                             to LF before substitution. \
-                             Standard C-style backslash escapes are expanded before the \
-                             regex engine sees the replacement: \\n becomes a newline, \
-                             \\t a tab, \\r a carriage return, \\\\ a single backslash. \
-                             All other \\X sequences are passed through unchanged. When \
-                             replacement_format is set, this is the encoded payload \
-                             instead — none of the above backslash-escape decoding applies; \
-                             see replacement_format."
+                             Standard C-style backslash escapes are expanded first: \\n \
+                             and \\r both become LF (see below), \\t becomes TAB, \\\\ \
+                             becomes a single backslash; all other \\X sequences pass \
+                             through unchanged. Any resulting CRLF or bare CR — from an \
+                             escape or from a real CR/CRLF already in the JSON string — is \
+                             then normalized to LF before substitution, which is why \\r \
+                             ends up as LF rather than an actual carriage return: tpu \
+                             never writes a bare CR into the LF-normalised substitution \
+                             space. When replacement_format is set, this is the encoded \
+                             payload instead — none of the above backslash-escape decoding \
+                             applies; see replacement_format."
                     },
                     "replacement_format": {
                         "type": "string",
@@ -582,16 +587,18 @@ pub fn list() -> Value {
                     "echo_max_lines": {
                         "type": "integer",
                         "description":
-                            "Maximum number of changed (added+removed) diff lines for \
-                             which the default changed-region echo is included in the \
+                            "Maximum total changed (old-line-span + new-line-span) size \
+                             for which the default changed-region echo is included in the \
                              response. When the actual change is at most this many lines, \
-                             a compact unified diff is prepended to the response \
-                             automatically (same as diff:true). When it's larger, the diff \
-                             is omitted and the status trailer instead reports \
+                             a compact preview (unified-diff-style hunk headers, new lines \
+                             only — cheap regardless of file size, never a full-file diff) \
+                             is prepended to the response automatically. When it's larger, \
+                             the preview is omitted and the status trailer instead reports \
                              'changed_lines' (the actual count) and 'diff_omitted':true — \
-                             pass diff:true explicitly to see the full diff regardless of \
-                             size. Has no effect when diff:true is set (always shown then) \
-                             or when count:true/dry_run:true is set. Default: 5."
+                             pass diff:true explicitly to see a full old/new unified diff \
+                             regardless of size. Has no effect when diff:true is set \
+                             (always shown then) or when count:true/dry_run:true is set. \
+                             Default: 5."
                     },
                     "allow_mojibake": {
                         "type": "boolean",
@@ -1871,14 +1878,28 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             .unwrap_or(false);
 
         let mut diff_buf: Vec<u8> = Vec::new();
-        let diff_out: Option<&mut dyn std::io::Write> =
-            if count { None } else { Some(&mut diff_buf) };
+        // The full whole-file diff clones the entire normalised file (see
+        // ChangedRegion's doc comment) and stays strictly opt-in: only
+        // requested when explicitly asked for (diff:true) or when
+        // previewing (dry_run:true, which has always shown a preview).
+        // The default changed-region echo below is built from `regions`
+        // instead, which is cheap regardless of file size.
+        let diff_out: Option<&mut dyn std::io::Write> = if count {
+            None
+        } else if diff || dry_run {
+            Some(&mut diff_buf)
+        } else {
+            None
+        };
+        let mut regions: Vec<tpu::cmd::replace::ChangedRegion> = Vec::new();
+        let regions_out = if count { None } else { Some(&mut regions) };
 
         let n = tpu::cmd::replace::run(
             path,
             &pattern,
             replacement.as_bytes(),
             diff_out,
+            regions_out,
             tpu::cmd::replace::ReplaceOptions {
                 multiline,
                 regex,
@@ -1913,8 +1934,10 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
         // File was modified.
         delete_bak_if_exists(&file);
         let stamp = stamp_and_verify(Path::new(&file), config.verify_delay_ms)?;
-        let diff_text = String::from_utf8_lossy(&diff_buf).into_owned();
-        let changed_lines = count_changed_diff_lines(&diff_text);
+        let changed_lines: usize = regions
+            .iter()
+            .map(|r| (r.end_line - r.start_line + 1) + r.new_line_count)
+            .sum();
         let echo_max_lines = args
             .get("echo_max_lines")
             .and_then(|v| v.as_u64())
@@ -1934,14 +1957,24 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             status["diff_omitted"] = serde_json::json!(true);
         }
         let status_line = serde_json::to_string(&status)?;
-        if should_echo && !diff_buf.is_empty() {
-            let sep = diff_separator(&diff_text);
-            Ok(ToolResult::ok(format!(
-                "{header}\n{diff_text}{sep}{status_line}"
-            )))
-        } else {
-            Ok(ToolResult::ok(format!("{header}\n{status_line}")))
+        if !should_echo {
+            return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
         }
+        // Prefer the full unified diff when diff:true was requested (it
+        // populated diff_buf); otherwise render the cheap changed-region
+        // echo built from `regions` -- no full-file clone involved.
+        let echo_text = if diff && !diff_buf.is_empty() {
+            String::from_utf8_lossy(&diff_buf).into_owned()
+        } else {
+            render_changed_regions(&regions)
+        };
+        if echo_text.is_empty() {
+            return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
+        }
+        let sep = diff_separator(&echo_text);
+        Ok(ToolResult::ok(format!(
+            "{header}\n{echo_text}{sep}{status_line}"
+        )))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
@@ -3578,20 +3611,36 @@ fn diff_separator(s: &str) -> &'static str {
     if s.ends_with('\n') { "" } else { "\n" }
 }
 
-/// Count the added/removed body lines in a unified diff (excludes the
-/// `--- a/…` / `+++ b/…` file-header lines and `@@ … @@` hunk headers).
-///
-/// Used to gate `tpu_replace_in_file`'s default changed-region echo (see
-/// issue #53 mitigation 2): small changes are cheap and high-value to show
-/// automatically; large ones are left to an explicit `diff: true` request.
-fn count_changed_diff_lines(diff_text: &str) -> usize {
-    diff_text
-        .lines()
-        .filter(|line| {
-            (line.starts_with('+') && !line.starts_with("+++ "))
-                || (line.starts_with('-') && !line.starts_with("--- "))
-        })
-        .count()
+/// Render `tpu_replace_in_file`'s default changed-region echo from cheap
+/// per-match [`tpu::cmd::replace::ChangedRegion`] data (see its doc comment)
+/// -- deliberately NOT a full unified diff, since that would require the
+/// whole-file clone this mechanism exists to avoid. Each region renders as a
+/// unified-diff-style hunk header (for familiar tooling/eyeballs) followed
+/// only by the NEW text -- the old text isn't cheaply available without the
+/// full-file clone, so it isn't shown here; pass diff:true for that.
+fn render_changed_regions(regions: &[tpu::cmd::replace::ChangedRegion]) -> String {
+    let mut out = String::new();
+    for r in regions {
+        let old_count = r.end_line - r.start_line + 1;
+        out.push_str(&format!(
+            "@@ -{},{} +{},{} @@\n",
+            r.start_line, old_count, r.start_line, r.new_line_count
+        ));
+        if !r.new_text.is_empty() {
+            let mut lines: Vec<&str> = r.new_text.split('\n').collect();
+            // A trailing '\n' in new_text produces one spurious empty
+            // element; drop only that, not any intentional blank lines.
+            if lines.last() == Some(&"") {
+                lines.pop();
+            }
+            for line in lines {
+                out.push('+');
+                out.push_str(line);
+                out.push('\n');
+            }
+        }
+    }
+    out
 }
 
 fn mojibake_policy_from_args(args: &Value) -> tpu::mojibake::WritePolicy {

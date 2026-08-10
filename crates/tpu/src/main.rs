@@ -1432,6 +1432,7 @@ fn run(
                 &pattern,
                 &decoded_replacement,
                 diff_out,
+                None,
                 cmd::replace::ReplaceOptions {
                     multiline,
                     regex,

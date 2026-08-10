@@ -126,10 +126,12 @@ get wrong — this makes the whole class of bug impossible rather than just
 less likely. `"hex"` works the same way; avoid `"encoded"` for this purpose
 since it is itself a backslash-escape codec and re-introduces the hazard.
 
-**Safety net**: `tpu_replace_in_file` also echoes a compact unified diff of
-every small real write by default (no `diff:true` needed — see
+**Safety net**: `tpu_replace_in_file` also echoes a compact changed-region
+preview of every small real write by default (no `diff:true` needed — see
 `echo_max_lines`), so a corruption like this is visible immediately in the
-same turn instead of requiring a follow-up read.
+same turn instead of requiring a follow-up read. This echo is cheap
+regardless of file size (it never clones the whole file); pass `diff:true`
+for a full old/new unified diff instead.
 
 ### Tool output format
 
@@ -150,8 +152,9 @@ between the header and trailer.
   `append diff:true`: diff lines when changed, then `{"status":"success","file":"...","changed":true|false}`.
   `tpu_replace_in_file` on a real write additionally reports `"changed_lines":N` in the status,
   and — as long as N is at most `echo_max_lines` (default 5) — automatically prepends a
-  compact unified diff even without `diff:true`; a larger change instead adds
-  `"diff_omitted":true` (pass `diff:true` to see it regardless of size).
+  compact changed-region preview (unified-diff-style hunk headers, new lines only — no
+  full-file diff) even without `diff:true`; a larger change instead adds
+  `"diff_omitted":true` (pass `diff:true` for a full old/new unified diff regardless of size).
 - **Structured tools** (count_file, stat_file, copy_file, render_file,
   setup+target, doctor) — result line
   `{"reason":"x-tpu-mcp-result",...}` followed by `{"status":"success"}`.
