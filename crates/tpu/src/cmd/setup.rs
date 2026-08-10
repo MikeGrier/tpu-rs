@@ -104,6 +104,28 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 - **Dependency-free templating** — `tpu_render_file` substitutes
   `{{NAME}}`-style tokens. Use `\{{` to emit literal braces.
 
+### Escape-sequence hazard (JSON transport)
+
+MCP arguments travel as JSON strings. In JSON, `\n` **is** a real newline —
+a literal backslash-n in the file requires `\\n` on the wire. Under-escaping
+is easy for an agent to do because it "sees" the target source text, not
+the JSON transport, and the damage is invisible: the string is already
+decoded to a real newline *before* `tpu_write_file` / `tpu_append_file` /
+`tpu_replace_in_file` / `tpu_edit_file` ever runs, so no flag on the tool
+call can distinguish "intended literal `\n`" from "intended real newline" —
+`literal_replacement` and similar options cannot undo a JSON decode that
+already happened.
+
+**The fix**: when a payload (`content`, `pattern`, `replacement`, or an
+edit op's `data`) contains backslash escapes, embedded quotes, or anything
+not certain to be JSON-escaped correctly, set the matching `*_format`
+argument (`content_format`, `pattern_format`, `replacement_format`, or an
+op's `data_format`) to `"base64"` and send the exact bytes base64-encoded.
+Base64's alphabet has no backslashes, so there is no escaping decision to
+get wrong — this makes the whole class of bug impossible rather than just
+less likely. `"hex"` works the same way; avoid `"encoded"` for this purpose
+since it is itself a backslash-escape codec and re-introduces the hazard.
+
 ### Tool output format
 
 Every tool response uses a **mixed format**: a JSON invocation header,
