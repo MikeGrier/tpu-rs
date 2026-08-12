@@ -52,7 +52,13 @@ pub const END_MARKER: &str = "<!-- tpu-mcp:setup:end -->";
 /// `--inject`ed files are upgraded automatically by re-running
 /// `tpu setup --inject`.
 pub fn guidance_body() -> &'static str {
-    r#"## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
+    concat!(
+        "<!-- tpu-mcp:setup:version=",
+        env!("CARGO_PKG_VERSION"),
+        " -->
+
+",
+        r#"## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
 
 This workspace runs the **tpu-mcp** MCP server which exposes encoding-aware
 file primitives as first-class tools. Plain `Get-Content` / `Set-Content` /
@@ -63,6 +69,32 @@ and round-trip the file's native encoding and line endings safely.
 
 **Rule:** when working in any project that has the tpu-mcp server registered,
 ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
+
+### Version check (do this first)
+
+Every `tpu_*` response begins with an `x-tpu-mcp-invocation` header line
+that includes a `tpu_version` field — the version of the running `tpu-mcp`
+binary answering the call. The `<!-- tpu-mcp:setup:version=X.Y.Z -->` HTML
+comment on the very first line of this block records the version of `tpu`
+that wrote this guidance.
+
+**If the two versions differ, stop and report the mismatch to the user
+before performing any file mutation.** Include both versions in the
+message and suggest the remedy:
+
+- **Binary older than guidance** — rebuild / reinstall the `tpu-mcp`
+  extension so its bundled binary matches this guidance, then retry. This
+  is the case that has historically wasted whole sessions: a defect the
+  user reads about as "fixed" is still present in the running binary
+  because the extension's bundled `tpu-mcp.exe` was not updated.
+- **Binary newer than guidance** — re-run `tpu setup --inject
+  <path-to-copilot-instructions.md>` to refresh this block against the
+  newer binary, then retry. Tool descriptions, response shapes, or
+  recommended workflows may have changed.
+
+This check is cheap (one field on one line, checked once per session) and
+catches version-drift bugs before they manifest as silent behavioural
+differences.
 
 | MCP tool | Use it for |
 |---|---|
@@ -236,7 +268,8 @@ When you must fall back to PowerShell, never round-trip non-ASCII files
 through `Get-Content` / `Set-Content` — read and write via
 `[System.IO.File]::ReadAllBytes` / `WriteAllBytes` and validate with
 `tools/check-encoding.ps1` afterwards.
-"#
+"#,
+    )
 }
 
 /// Return the full managed block (markers + body), terminated by a single LF.

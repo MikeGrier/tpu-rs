@@ -102,6 +102,31 @@ A short summary:
 | `tpu_find`, `tpu_count_file`, `tpu_validate_file` | Search, counting, pre-edit validation. |
 | `tpu_stat_file` | Cheap metadata stat for write verification. |
 
+## Bundled binary version + version-check directive
+
+Each release of this extension bundles a specific `tpu-mcp` binary; the
+**tpu-mcp: Show bundled server version** command reports which version
+that is.  The bundled binary reports its own version in every response
+via a `tpu_version` field on the first NDJSON line (the invocation
+header), and the guidance block injected by `tpu setup` records the
+version of `tpu` that wrote it as an HTML comment
+(`<!-- tpu-mcp:setup:version=X.Y.Z -->`) on its first line.  Copilot is
+instructed to compare the two before mutating any file and to stop and
+report a mismatch.
+
+If your Copilot sessions start reporting version drift, the fix is one
+command:
+
+- **Bundled binary older than the guidance** -- reinstall this
+  extension (`code --install-extension MikeGrierTools.tpu-mcp`) and
+  reload the window.  This is the common case: a defect the user reads
+  about as "fixed" is still present in the running binary because the
+  VSIX was not upgraded.
+- **Bundled binary newer than the guidance** -- re-run `tpu setup
+  --inject <path-to-copilot-instructions.md>` (or use the **Open Copilot
+  setup chat** command) so the guidance refreshes against the newer
+  binary.
+
 ## License
 
 MIT -- see [LICENSE](LICENSE).

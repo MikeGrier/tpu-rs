@@ -276,11 +276,83 @@ fn setup_inject_is_idempotent_and_replaces_existing_block() {
 fn setup_inject_appends_when_no_markers_present() {
     let dir = TempDir::new().unwrap();
     let target = dir.path().join("notes.md");
-    write_file(&target, b"original content\n");
+    write_file(
+        &target,
+        b"original content
+",
+    );
     ok(tpu().arg("setup").arg("--inject").arg(&target));
     let after = fs::read_to_string(&target).unwrap();
-    assert!(after.starts_with("original content\n"));
+    assert!(after.starts_with(
+        "original content
+"
+    ));
     assert!(after.contains("<!-- tpu-mcp:setup:begin -->"));
+}
+
+/// M8-5: the injected guidance block records the version of `tpu` that
+/// wrote it as an HTML comment on its first line, so callers can compare
+/// it against the `tpu_version` field emitted in every `tpu_*` response's
+/// invocation header (M8-1) and detect binary/guidance version drift.
+/// Verified on both a fresh inject and a re-inject that replaces a stale
+/// block, and on the plain-print (non-inject) path.
+#[test]
+fn setup_emits_version_marker_matching_cargo_pkg_version() {
+    let expected = format!(
+        "<!-- tpu-mcp:setup:version={} -->",
+        env!("CARGO_PKG_VERSION")
+    );
+
+    // Plain print.
+    let out = String::from_utf8_lossy(&ok(tpu().arg("setup")).stdout).into_owned();
+    assert!(
+        out.contains(&expected),
+        "plain-print setup must include version marker {expected:?}; got:
+{out}"
+    );
+
+    // Fresh inject.
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("fresh.md");
+    ok(tpu().arg("setup").arg("--inject").arg(&target));
+    let fresh = fs::read_to_string(&target).unwrap();
+    assert!(
+        fresh.contains(&expected),
+        "fresh --inject must embed version marker {expected:?}; got:
+{fresh}"
+    );
+
+    // Re-inject over a stale block (with an outdated version marker).
+    let target2 = dir.path().join("stale.md");
+    write_file(
+        &target2,
+        b"# Header
+
+<!-- tpu-mcp:setup:begin -->
+\
+          <!-- tpu-mcp:setup:version=0.0.0-stale -->
+stale body
+\
+          <!-- tpu-mcp:setup:end -->
+trailer
+",
+    );
+    ok(tpu().arg("setup").arg("--inject").arg(&target2));
+    let refreshed = fs::read_to_string(&target2).unwrap();
+    assert!(
+        refreshed.contains(&expected),
+        "re-inject must overwrite the stale version marker; got:
+{refreshed}"
+    );
+    assert!(
+        !refreshed.contains("0.0.0-stale"),
+        "re-inject must remove the stale version marker; got:
+{refreshed}"
+    );
+    assert!(
+        refreshed.contains("trailer"),
+        "trailing content preserved on re-inject"
+    );
 }
 
 // ─── walk-error policy on `find` ─────────────────────────────────────────────

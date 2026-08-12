@@ -589,6 +589,11 @@ macro_rules! replace_suite {
                 drop(dir);
             }
             /// Matching replace always creates a `.bak` of the original file.
+            /// Uses `.` (any non-newline byte) as the pattern so it matches
+            /// every non-empty fixture -- including `json_no_keys.txt`
+            /// which contains only `{}` and no alphanumerics.  Post-M7,
+            /// a fixture-specific zero-match would (correctly) skip the
+            /// `.bak`, so the pattern must be universal.
             #[test]
             fn match_creates_bak() {
                 let (dir, f) = tc();
@@ -596,7 +601,7 @@ macro_rules! replace_suite {
                     .arg("replace")
                     .arg("--regex")
                     .arg(&f)
-                    .arg("[a-zA-Z0-9]")
+                    .arg(".")
                     .arg("_"));
                 assert!(
                     bak(&f).exists(),
@@ -1794,16 +1799,28 @@ fn replace_diff_shows_minus_and_plus_lines() {
 }
 
 #[test]
-fn replace_nomatch_bak_content_equals_original() {
-    // Even with 0 replacements, replace creates a .bak; its content should
-    // equal the original file content.
+fn replace_nomatch_leaves_original_untouched_and_writes_no_bak() {
+    // Per M7-1, a zero-match run is a no-op at the file-system level: the
+    // original file is not rewritten (mtime preserved) and no .bak is
+    // written.  This is how callers distinguish "matched nothing" from a
+    // real edit without needing a follow-up read.
     let orig_content = fs::read(asset("singleline.txt")).unwrap();
     let (dir, f) = cp("singleline.txt");
+    let before_mtime = fs::metadata(&f).unwrap().modified().unwrap();
     ok(tpu().arg("replace").arg(&f).arg("ZZZNOMATCH_99").arg("Z"));
-    let bak_content = fs::read(bak(&f)).unwrap();
+    assert!(
+        !bak(&f).exists(),
+        "zero-match run must not create .bak (M7-1 short-circuit)"
+    );
+    let after_mtime = fs::metadata(&f).unwrap().modified().unwrap();
     assert_eq!(
-        orig_content, bak_content,
-        ".bak should have same content as original even when 0 replacements"
+        before_mtime, after_mtime,
+        "zero-match run must preserve mtime (M7-1 short-circuit)"
+    );
+    let file_content = fs::read(&f).unwrap();
+    assert_eq!(
+        orig_content, file_content,
+        "zero-match run must leave the original file bytes unchanged"
     );
     drop(dir);
 }
@@ -10258,10 +10275,14 @@ fn fs_replace_short_flag_e_accepted() {
     drop(dir);
 }
 
-/// FS-IT-11: default literal matching, zero-match case still creates `.bak` and exits 0.
+/// FS-IT-11: default literal matching, zero-match case exits 0 and (per M7)
+/// does NOT create a `.bak` because the file is not rewritten -- this is
+/// how callers distinguish "matched nothing" from a real edit at the
+/// file-system level.
 #[test]
 fn fs_replace_default_literal_zero_match_exits_ok() {
     let (dir, f) = cp("singleline.txt");
+    let before_mtime = fs::metadata(&f).unwrap().modified().unwrap();
     // Pattern contains regex metacharacters but is not present in the file.
     ok(tpu()
         .arg("replace")
@@ -10269,8 +10290,13 @@ fn fs_replace_default_literal_zero_match_exits_ok() {
         .arg("no.such.text{here}")
         .arg("Z"));
     assert!(
-        bak(&f).exists(),
-        ".bak must be created even when 0 replacements"
+        !bak(&f).exists(),
+        "zero-match run must NOT create .bak (M7-1 short-circuit)"
+    );
+    let after_mtime = fs::metadata(&f).unwrap().modified().unwrap();
+    assert_eq!(
+        before_mtime, after_mtime,
+        "zero-match run must preserve mtime (M7-1 short-circuit)"
     );
     drop(dir);
 }

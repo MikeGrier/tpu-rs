@@ -359,7 +359,7 @@ the tool type (see table below).  Not every line is JSON — read tools and
 
 | Line | Content |
 |---|---|
-| First | `{"reason":"x-tpu-mcp-invocation","tool":"tpu_NAME","args":{...}}` — invocation echo; large text fields replaced with `"<N bytes>"` |
+| First | `{"reason":"x-tpu-mcp-invocation","tool":"tpu_NAME","args":{...},"tpu_version":"X.Y.Z"}` — invocation echo; large text fields replaced with `"<N bytes>"`; `tpu_version` is the running `tpu-mcp` binary's `CARGO_PKG_VERSION` (see [Version-check directive](#version-check-directive) below) |
 | Body (mutating tools — normal write) | Optional unified diff lines, then `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N}` |
 | Body (mutating tools — `dry_run:true`) | Optional diff lines, then `{"status":"success","changed":true\|false}` (replace only; no file written) |
 | Body (mutating tools — `count:true`) | `{"status":"success","count":N}` (replace only; no file written) |
@@ -369,3 +369,30 @@ the tool type (see table below).  Not every line is JSON — read tools and
 | Body (`tpu_read_file_binary` + `hash`) | `{"reason":"x-tpu-mcp-result","encoding":"bytes-base64","content":"<base64>","hashes":[...]}` then `{"status":"success"}` |
 | Body (`tpu_find`) | Matching lines as plain text, then `{"status":"success","warnings":[...]}` trailer |
 | On error | `{"status":"error","message":"..."}` as the final line; `isError: true` in the MCP wrapper |
+
+### Version-check directive
+
+Every `tpu_*` response's first line is an invocation-header JSON object
+that includes a `tpu_version` field — the `CARGO_PKG_VERSION` of the
+`tpu-mcp` binary that answered the call.  In parallel, the `tpu setup`
+command embeds `<!-- tpu-mcp:setup:version=X.Y.Z -->` on the very first
+line of the managed guidance block it injects into your
+`.github/copilot-instructions.md` (or equivalent).  Between them, a
+Copilot session can detect binary/guidance version drift in a single
+comparison — and the injected guidance itself instructs Copilot to do
+exactly that before mutating any file.
+
+Common causes of drift the check catches:
+
+- **Bundled binary out of date** — the VS Code extension VSIX ships a
+  specific `tpu-mcp` binary.  A user who upgrades `tpu` in their PATH
+  without reinstalling the extension will see the extension's older,
+  bundled binary; a defect they read about as fixed may still surface.
+- **Guidance out of date** — a user who upgrades `tpu-mcp` without
+  re-running `tpu setup --inject` will see newer tool descriptions or
+  behaviours than the guidance describes.
+
+The remedy in each case is one command: reinstall the extension (for the
+first) or re-run `tpu setup --inject <path>` (for the second).  See
+[crates/tpu/CHECKLIST.md](../tpu/CHECKLIST.md) milestone 8 for the full
+rationale.

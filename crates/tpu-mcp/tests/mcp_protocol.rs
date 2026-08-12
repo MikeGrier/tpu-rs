@@ -264,6 +264,46 @@ fn mcp_it_1_initialize_and_tools_list() {
     }
 }
 
+/// MCP-IT-1b: every `tpu_*` response's first NDJSON line is an
+/// `x-tpu-mcp-invocation` header that includes a `tpu_version` field
+/// matching the `tpu-mcp` binary's own `CARGO_PKG_VERSION` at compile
+/// time (M8-1 / M8-4). Callers use this to detect binary/guidance
+/// version drift; see the "Version check" section in the guidance
+/// block emitted by `tpu setup`.
+#[test]
+fn mcp_it_1b_invocation_header_includes_tpu_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("version_probe.txt");
+    std::fs::write(
+        &f, "probe
+",
+    )
+    .unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let out = s.call_tool("tpu_read_file", json!({ "file": f.to_str().unwrap() }));
+
+    let first_line = out
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or_else(|| panic!("no lines in response; got: {out:?}"));
+    let header: serde_json::Value = serde_json::from_str(first_line)
+        .unwrap_or_else(|e| panic!("first line must be JSON: {e}; got: {first_line:?}"));
+
+    assert_eq!(
+        header["reason"].as_str(),
+        Some("x-tpu-mcp-invocation"),
+        "first line must be the invocation header; got: {header}"
+    );
+    assert_eq!(
+        header["tpu_version"].as_str(),
+        Some(env!("CARGO_PKG_VERSION")),
+        "tpu_version must match tpu-mcp's CARGO_PKG_VERSION; got: {header}"
+    );
+}
+
 /// MCP-IT-2: tpu_write_file creates a file; response contains mtime+size stamp.
 /// tpu_read_file returns the correct content.
 #[test]
@@ -371,6 +411,78 @@ fn mcp_it_3_replace_basic() {
     let content = std::fs::read_to_string(&f).unwrap();
     assert_has("word replaced", &content, "earth");
     assert_lacks("old word gone", &content, "world");
+}
+
+/// MCP-IT-3b: A zero-match `tpu_replace_in_file` call must (a) return
+/// `count: 0` and `changed_lines: 0` in the status JSON, (b) include a
+/// `warning` field so a caller can't mistake success-with-nothing-changed
+/// for a real edit, and (c) leave the file's mtime untouched (M7-1
+/// short-circuit).  Regression test for CHECKLIST.md milestone 7.
+#[test]
+fn mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("replace_zero.txt");
+    std::fs::write(
+        &f,
+        "hello world
+",
+    )
+    .unwrap();
+    let before_mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+
+    // Sleep so a spurious rewrite would produce a distinguishable mtime.
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let out = s.call_tool(
+        "tpu_replace_in_file",
+        json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "this_pattern_is_not_in_the_file",
+            "replacement": "REPLACEMENT",
+        }),
+    );
+    let stamp = last_json_line(&out);
+    assert_eq!(
+        stamp["status"].as_str(),
+        Some("success"),
+        "zero-match must still report success; got: {out:?}"
+    );
+    assert_eq!(
+        stamp["count"].as_u64(),
+        Some(0),
+        "zero-match must expose count:0 inline; got: {out:?}"
+    );
+    assert_eq!(
+        stamp["changed_lines"].as_u64(),
+        Some(0),
+        "zero-match must expose changed_lines:0; got: {out:?}"
+    );
+    let warning = stamp["warning"]
+        .as_str()
+        .unwrap_or_else(|| panic!("zero-match must include a warning field; got: {out:?}"));
+    assert!(
+        warning.contains("0 times"),
+        "warning must mention zero matches; got: {warning:?}"
+    );
+
+    let after_mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
+    assert_eq!(
+        before_mtime, after_mtime,
+        "zero-match must preserve file mtime; got out={out:?}"
+    );
+    assert!(
+        !f.with_extension("txt.bak").exists(),
+        "zero-match must not leave a .bak"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "hello world
+",
+        "zero-match must leave file bytes untouched"
+    );
 }
 
 /// MCP-IT-4: `\n` in a tpu_replace_in_file replacement string expands to a real

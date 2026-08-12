@@ -329,3 +329,207 @@ didn't help (already `U+FFFD` at first commit).  This confirmed that
 (`tests/doctor.rs`, `tests/end_to_end_corruption_loop.rs`) and
 `tpu-mcp/src/tools.rs` updated.  Full workspace: 2 959 tests, 0 failures
 (2 868 in `tpu`, 91 in `tpu-mcp`).
+
+
+---
+
+## Milestone 7 — `replace` zero-match is silently indistinguishable from success
+
+**Theme:** a `tpu replace` / `tpu_replace_in_file` call whose pattern matches
+zero times currently reports `status: success` with a fresh `mtime`/`size`
+stamp — the same shape a real replacement returns.  The file was rewritten
+to identical content (mtime bumped, `.bak` created and then deleted by the
+MCP wrapper) and the operator has no unambiguous inline signal that nothing
+matched.  Root cause: the reporter's pattern was anchored across a word-wrap
+boundary that didn't exist in the file, and the tool made the resulting
+zero-match invisible.
+
+**Verification against current code (2026-08-12):**
+
+- `crates/tpu/src/cmd/replace.rs::run` unconditionally calls
+  `redwing::materialize` + `crate::atomic_write` even when `splices` is
+  empty, so a zero-match run *does* bump the file's `mtime` and does write
+  (then rename) a `.bak`.  The MCP wrapper cleans up the `.bak` afterwards
+  via `delete_bak_if_exists`, but the mtime bump on the original persists.
+- `crates/tpu-mcp/src/tools.rs::call_replace_in_file` emits
+  `{ status, file, mtime_epoch_ms, size, changed_lines }` on the normal
+  write path.  `changed_lines` *would* be `0` on a zero-match, so the
+  situation is technically observable, but there is no explicit
+  `count`/`changed` field and `changed_lines` (matched-span lines +
+  replacement lines) is a slightly awkward proxy for "did anything match."
+  The reporter's ask for an explicit match count is fair.
+
+- [x] M7-1: `tpu::cmd::replace::run` now short-circuits when
+      `splices.is_empty() && line_ending_override.is_none() &&
+      !count_only && !dry_run`, returning `Ok(0)` before `materialize` /
+      `atomic_write` / mojibake guard -- so a zero-match call preserves
+      the file's `mtime`, does not write a `.bak`, and avoids one wasted
+      full-file rewrite.  The `line_ending_override.is_none()` guard
+      preserves the pre-existing `IT-RLE-3` behaviour where
+      `--line-ending=lf` still normalises endings on a zero-match run
+      (the override is itself a real change to the file).
+- [x] M7-2: `cmd::replace::tests::zero_match_preserves_mtime_and_writes_no_bak`
+      captures mtime before + after a non-matching-pattern run and
+      asserts (a) return value `0`, (b) mtime unchanged, (c) no `.bak`,
+      (d) file bytes untouched.  Also updated two pre-existing tests
+      that encoded the old contract:
+      `fs_replace_default_literal_zero_match_exits_ok` and
+      `replace_nomatch_bak_content_equals_original` (renamed to
+      `replace_nomatch_leaves_original_untouched_and_writes_no_bak`)
+      now assert the new no-op contract; `replace_suite!`'s
+      `match_creates_bak` pattern changed from `[a-zA-Z0-9]` to `.` so
+      it still fires on `json_no_keys.txt` (which contains only `{}`
+      and no alphanumerics).
+- [x] M7-3: `tpu-mcp/src/tools.rs::call_replace_in_file`'s success
+      status JSON now always includes `"count": n` (the return value
+      from `replace::run`).  `"changed_lines"` is kept for back-compat.
+      When `n == 0` it also emits
+      `"warning": "pattern matched 0 times; file not modified
+       (matching is literal by default; pass regex:true for regex)"`
+      so a zero-match is visible inline without a follow-up
+      `count:true` call, and the warning text pre-empts the
+      regex-vs-literal confusion class from the M8-motivating defect
+      reports.
+- [x] M7-4: `mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime`
+      in `crates/tpu-mcp/tests/mcp_protocol.rs` calls
+      `tpu_replace_in_file` with a non-matching pattern and asserts
+      the response's status JSON contains `"status":"success"`,
+      `"count":0`, `"changed_lines":0`, a `"warning"` field mentioning
+      `0 times`, that no `.bak` is created, and that the file's
+      `mtime` is unchanged (with a pre-call 50 ms sleep to defeat
+      same-timestamp false-passes on fast machines).
+- [x] M7-5: Tool description in `tools.rs` updated to note that a
+      zero-match run is a no-op (mtime preserved, no `.bak`, response
+      includes `count:0` + `warning`) and that the success response
+      always includes `count` so no follow-up `count:true` call is
+      needed.  Module doc-comment in `crates/tpu/src/cmd/replace.rs`
+      gained a "Zero-match short-circuit" section describing both the
+      short-circuit and the `line_ending_override.is_none()` guard.
+
+**Status:** ✅ Complete.  Full workspace: 3 055 tests, 0 failures
+(793 tpu lib + 785 tpu bin + 1 316 tpu integration + 94 tpu-mcp lib +
+17 tpu-mcp mcp_protocol + 44 other suites + 1 ignored doc-test).
+`cargo fmt` clean, `cargo clippy --workspace --all-targets` reports
+zero new warnings.
+
+**Explicitly out of scope for this milestone** (revisit only if a caller
+asks):
+
+- Making zero-match a hard error by default — breaks legitimate
+  idempotent-replace workflows (re-running a migration that's already
+  been applied).  Could be added later as an opt-in `require_match: true`
+  argument if needed.
+- Renaming or removing `changed_lines` — back-compat.
+- Adding a `changed` boolean — `count` covers it.
+
+**Original defect report:** filed from a defect report where the
+reporter's anchor pattern was word-wrapped one word off from the file
+and the zero-match success stamp masked the miss.  A second, closely
+related defect report ("`tpu_replace_in_file` treats pattern as regex by
+default") turned out to describe an older build of the tool -- current
+code is literal-by-default and the `reject_removed_fixed_strings_arg`
+migration guard in `tools.rs` confirms the flip already landed -- but
+the same silent-no-op ambiguity was the core symptom in both reports.
+M7's `count` + `warning` fields close that ambiguity for good.
+
+
+---
+
+## Milestone 8 — Tool/setup version pinning + mismatch detection
+
+**Theme:** make version mismatch between the running `tpu-mcp` binary and
+the guidance embedded in `copilot-instructions.md` immediately observable,
+so a Copilot session that's been handed a stale extension-bundled binary
+(or stale guidance) reports the mismatch on its first `tpu_*` call instead
+of silently reproducing bugs that have already been fixed.
+
+**Motivation:** two defect reports in a row (the M7 zero-match report, and
+the follow-up "regex-by-default" report) both described behaviour that does
+not reproduce against the current codebase.  The most likely explanation
+in each case was a stale binary — either the VS Code extension bundled an
+older `tpu-mcp.exe`, or the reporter's session started before a recent
+rebuild.  Neither reporter noticed, and Copilot had no signal to notice on
+its behalf.  A cheap, always-on version echo closes that loop.
+
+**Sources of truth:**
+
+- `crates/tpu-mcp/src/tools.rs::invocation_header` already emits an
+  `x-tpu-mcp-invocation` JSON object as the first NDJSON line of every
+  tool response — the natural place to hang `"tpu_version"`.
+- `crates/tpu/src/cmd/setup.rs::guidance_body` emits the canonical
+  guidance block injected between `<!-- tpu-mcp:setup:begin -->` /
+  `<!-- tpu-mcp:setup:end -->` markers — the natural place to pin the
+  version the guidance was written for.
+- `env!("CARGO_PKG_VERSION")` is already used in
+  `crates/tpu-mcp/src/main.rs` for the startup banner.
+
+- [x] M8-1: `tpu-mcp/src/tools.rs::invocation_header` now emits
+      `"tpu_version": env!("CARGO_PKG_VERSION")` (the `tpu-mcp` binary's
+      own version) as an extra field on the invocation-header JSON.
+      One extra field per response, no per-tool schema change; the
+      function's doc-comment now describes the new field and its
+      intended use.
+- [x] M8-2: `tpu::cmd::setup::guidance_body` now uses `concat!(...)`
+      to prepend `<!-- tpu-mcp:setup:version=<CARGO_PKG_VERSION> -->
+
+`
+      as the first line of the injected body, so re-running
+      `tpu setup --inject` always refreshes the marker to the running
+      `tpu` binary's version.  Full-block round-trip preserves the
+      HTML-comment form so it stays invisible in rendered Markdown.
+- [x] M8-3: A new `### Version check (do this first)` subsection sits
+      immediately after the intro paragraph in the injected guidance
+      body.  It directs Copilot to compare the `tpu_version` field on
+      the first `x-tpu-mcp-invocation` line against the
+      `tpu-mcp:setup:version=` marker at the top of the block and, on
+      mismatch, to stop and report both versions plus the appropriate
+      remedy (reinstall the extension for binary-older-than-guidance;
+      re-run `tpu setup --inject` for binary-newer-than-guidance)
+      before performing any file mutation.
+- [x] M8-4: `mcp_it_1b_invocation_header_includes_tpu_version` in
+      `crates/tpu-mcp/tests/mcp_protocol.rs` calls `tpu_read_file` and
+      asserts the first non-empty line of the response is a JSON object
+      with `reason=="x-tpu-mcp-invocation"` and `tpu_version` equal to
+      `env!("CARGO_PKG_VERSION")` of `tpu-mcp` at test compile time.
+- [x] M8-5: `setup_emits_version_marker_matching_cargo_pkg_version` in
+      `crates/tpu/tests/copy_render_setup.rs` asserts the plain-print
+      output, a fresh `--inject`, and a re-inject over a stale block
+      each contain `<!-- tpu-mcp:setup:version={env!("CARGO_PKG_VERSION")} -->`,
+      and additionally that the re-inject removes the stale
+      `0.0.0-stale` marker while preserving trailing user content.
+- [x] M8-6: `crates/tpu-mcp/README.md` gained a `### Version-check
+      directive` subsection under "Protocol", and its tool-output-format
+      table now shows the `tpu_version` field on the invocation header.
+      `crates/tpu-mcp/extension/README.md` gained a `## Bundled binary
+      version + version-check directive` section tying the pinned
+      bundled `tpu-mcp.exe` to the "Show bundled server version"
+      command and giving the one-command remedy for each drift
+      direction.
+
+**Explicitly out of scope for this milestone** (revisit only if a caller
+asks):
+
+- Enforcing the check server-side (refusing to serve tool calls when
+  versions differ).  Too aggressive — Copilot may legitimately be
+  operating against a checkout where the guidance is intentionally ahead
+  or behind of the currently-running binary during upgrade dance.
+  Reporting-and-let-the-model-decide is enough.
+- Cross-version semver-tolerance logic.  Exact-match reporting is simpler
+  and catches the real defect (stale bundled binary) without needing a
+  compat matrix.  A future minor version bump can add a `>=` tolerance
+  if this proves too noisy.
+- Reconciling the `tpu` vs `tpu-mcp` crate versions.  They may drift
+  independently; the guidance marker records the version of whichever
+  crate ran `tpu setup`, and the invocation header records the version
+  of the `tpu-mcp` binary that answered the call.  Mismatch reporting
+  works correctly either way.
+
+**Status:** ✅ Complete.  Full workspace: 3 057 tests, 0 failures
+(793 tpu lib + 785 tpu bin + 20 copy_render_setup + 1 316 tpu integration +
+94 tpu-mcp lib + 18 tpu-mcp mcp_protocol + 44 other suites + 1 ignored
+doc-test).  `cargo fmt` clean, `cargo clippy --workspace --all-targets`
+introduces zero new lints (the 41 flagged fixes are all pre-existing
+style-only lints in files this milestone did not modify).  Filed after
+two defect reports whose evidence pointed at an older binary being used
+against present-day expectations, without any inline signal that would
+have let Copilot notice.

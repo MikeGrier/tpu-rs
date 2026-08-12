@@ -16,6 +16,20 @@
 //! `--diff` writes a unified text diff of the changes (in normalised/LF space)
 //! to the provided writer after the file has been successfully updated.
 //!
+//! ## Zero-match short-circuit
+//!
+//! When the pattern matches zero times, no `line_ending_override` is set,
+//! and the caller is not asking for a count-only or dry-run preview,
+//! [`run`] returns `Ok(0)` without touching the file: no `materialize`, no
+//! atomic rewrite, no `<file>.bak`, no mtime bump.  This makes an unmatched
+//! pattern observably distinct from a real edit at the file-system level,
+//! and avoids one wasted full-file rewrite per call whose result would have
+//! been byte-identical.
+//!
+//! When `line_ending_override` is set, the short-circuit is skipped: the
+//! override is itself a real change to the file even with zero
+//! substitutions (CRLF -> LF etc.), so the normal write path runs.
+//!
 //! ## Replacement-string escapes
 //!
 //! This module operates on raw `&[u8]` replacement bytes.  Backslash-escape
@@ -392,6 +406,20 @@ pub fn run(
     // --count: return match count without applying any edits.
     if count_only {
         return Ok(replacement_count);
+    }
+
+    // Zero-match short-circuit: no splices means the atomic rewrite would
+    // produce byte-identical content, so skip it entirely -- no mojibake
+    // guard work, no materialize, no atomic_write, no .bak, no mtime bump.
+    // Callers can then distinguish "matched nothing" from "replaced N" at
+    // the file-system level, not just via the returned count.
+    //
+    // Preserved side effect: a caller-supplied `line_ending_override` is
+    // itself a real change to the file even with zero substitutions
+    // (CRLF -> LF etc.), so skip the short-circuit in that case and fall
+    // through to the normal write path.
+    if replacement_count == 0 && line_ending_override.is_none() {
+        return Ok(0);
     }
 
     // Apply splices in reverse source order so earlier-offset splices can
@@ -1084,10 +1112,76 @@ mod tests {
 
         let bak = format!("{}.bak", path.display());
         let bak_bytes = fs::read(&bak).unwrap();
-        assert_eq!(bak_bytes, b"original\n");
+        assert_eq!(
+            bak_bytes,
+            b"original
+"
+        );
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&bak);
+    }
+
+    #[test]
+    fn zero_match_preserves_mtime_and_writes_no_bak() {
+        // Setup: write a file, capture its mtime, ensure any stray .bak
+        // from a prior test in the same tmpdir is gone.
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(
+            b"hello world
+",
+        )
+        .unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+        drop(f);
+        fs::write(
+            &path,
+            b"hello world
+",
+        )
+        .unwrap();
+        let bak = format!("{}.bak", path.display());
+        let _ = fs::remove_file(&bak);
+
+        let before_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Sleep briefly so that if the code path DID rewrite the file, its
+        // mtime would differ from the captured one -- otherwise a fast test
+        // machine could produce a false pass on same-timestamp reads.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let n = run_test(
+            &path,
+            "this_pattern_is_not_in_the_file",
+            b"REPLACEMENT",
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(n, 0, "zero-match run must return 0");
+
+        let after_mtime = fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(
+            before_mtime, after_mtime,
+            "zero-match run must not bump the file's mtime"
+        );
+        assert!(
+            !std::path::Path::new(&bak).exists(),
+            "zero-match run must not create <file>.bak"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"hello world
+",
+            "zero-match run must leave file bytes untouched"
+        );
+
+        let _ = fs::remove_file(&path);
     }
 
     // ── Diff output ───────────────────────────────────────────────────────────

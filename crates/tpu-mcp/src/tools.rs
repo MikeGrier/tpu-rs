@@ -86,6 +86,13 @@ impl ToolResult {
 /// Large text fields (`content`, `replacement`, `template`) are replaced by
 /// a `"<N bytes>"` placeholder so the header stays compact.  All other
 /// arguments pass through as-is.
+///
+/// Always includes a `"tpu_version"` field pinned to the `tpu-mcp` binary's
+/// own `CARGO_PKG_VERSION` at compile time.  A caller can compare it against
+/// the `tpu-mcp:setup:version=` HTML-comment marker embedded in
+/// [`tpu::cmd::setup::guidance_body`]-injected copilot instructions to
+/// detect when the running binary is out of sync with the guidance the
+/// caller is following (M8 in `crates/tpu/CHECKLIST.md`).
 fn invocation_header(tool: &str, args: &Value) -> String {
     const LARGE_FIELDS: &[&str] = &["content", "replacement", "template"];
     let mut sanitized = args.clone();
@@ -104,6 +111,7 @@ fn invocation_header(tool: &str, args: &Value) -> String {
         "reason": "x-tpu-mcp-invocation",
         "tool":   tool,
         "args":   sanitized,
+        "tpu_version": env!("CARGO_PKG_VERSION"),
     }))
     .unwrap_or_else(|_| format!("{{\"reason\":\"x-tpu-mcp-invocation\",\"tool\":{tool:?}}}"))
 }
@@ -421,6 +429,12 @@ pub fn list() -> Value {
                  literal dollar sign — see the 'replacement' ESCAPING note below for when \
                  this applies. \
                  The original file is backed up to <file>.bak before writing. \
+                 A zero-match run is a no-op: the file is not rewritten (mtime is \
+                 preserved, no .bak is written) and the response includes count:0 \
+                 plus a `warning` field so a caller can distinguish it from a real \
+                 edit inline. The success response always includes `count` (the \
+                 number of substitutions performed) so no follow-up count:true call \
+                 is needed. \
                  Use count:true to count matches without modifying the file. \
                  Use dry_run:true to preview changes as a unified diff without writing. \
                  After a real write, a compact changed-region preview (new lines, with \
@@ -1970,8 +1984,18 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             "file": file,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
+            "count": n,
             "changed_lines": changed_lines,
         });
+        // A zero-match replace returns success (no error occurred) but did
+        // nothing -- make that visible inline so a caller doesn't mistake
+        // it for a real edit. See CHECKLIST.md M7 for background.
+        if n == 0 {
+            status["warning"] = serde_json::json!(
+                "pattern matched 0 times; file not modified (matching is literal by default; \
+                 pass regex:true for regex)"
+            );
+        }
         if !should_echo {
             status["diff_omitted"] = serde_json::json!(true);
         }
