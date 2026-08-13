@@ -316,6 +316,19 @@ pub fn list() -> Value {
                             "required": ["selector", "value"]
                         }
                     },
+                    "if_match": {
+                        "type": "string",
+                        "description":
+                            "Optional compare-and-swap precondition against lost updates. \
+                             Pass the 'content_version' token returned by the tpu read (or \
+                             a prior write) that your change is based on. If the file's \
+                             current content no longer matches that token — another edit \
+                             landed since you read it — this call is REFUSED with a \
+                             {\"status\":\"conflict\"} response and the file is left \
+                             UNCHANGED rather than silently clobbering the other edit. On a \
+                             conflict, re-read the file, rebuild your change against the \
+                             current content, and retry with the new content_version."
+                    },
                     "allow_mojibake": {
                         "type": "boolean",
                         "description":
@@ -627,6 +640,19 @@ pub fn list() -> Value {
                              (always shown then) or when count:true/dry_run:true is set. \
                              Default: 5."
                     },
+                    "if_match": {
+                        "type": "string",
+                        "description":
+                            "Optional compare-and-swap precondition against lost updates. \
+                             Pass the 'content_version' token returned by the tpu read (or \
+                             a prior write) that your change is based on. If the file's \
+                             current content no longer matches that token — another edit \
+                             landed since you read it — this call is REFUSED with a \
+                             {\"status\":\"conflict\"} response and the file is left \
+                             UNCHANGED rather than silently clobbering the other edit. On a \
+                             conflict, re-read the file, rebuild your change against the \
+                             current content, and retry with the new content_version."
+                    },
                     "allow_mojibake": {
                         "type": "boolean",
                         "description":
@@ -771,6 +797,19 @@ pub fn list() -> Value {
                              TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
                              write denormalises to git's expected convention for this path. \
                              Off by default."
+                    },
+                    "if_match": {
+                        "type": "string",
+                        "description":
+                            "Optional compare-and-swap precondition against lost updates. \
+                             Pass the 'content_version' token returned by the tpu read (or \
+                             a prior write) that your change is based on. If the file's \
+                             current content no longer matches that token — another edit \
+                             landed since you read it — this call is REFUSED with a \
+                             {\"status\":\"conflict\"} response and the file is left \
+                             UNCHANGED rather than silently clobbering the other edit. On a \
+                             conflict, re-read the file, rebuild your change against the \
+                             current content, and retry with the new content_version."
                     },
                     "allow_mojibake": {
                         "type": "boolean",
@@ -1206,6 +1245,19 @@ pub fn list() -> Value {
                             },
                             "required": ["selector", "value"]
                         }
+                    },
+                    "if_match": {
+                        "type": "string",
+                        "description":
+                            "Optional compare-and-swap precondition against lost updates. \
+                             Pass the 'content_version' token returned by the tpu read (or \
+                             a prior write) that your change is based on. If the file's \
+                             current content no longer matches that token — another edit \
+                             landed since you read it — this call is REFUSED with a \
+                             {\"status\":\"conflict\"} response and the file is left \
+                             UNCHANGED rather than silently clobbering the other edit. On a \
+                             conflict, re-read the file, rebuild your change against the \
+                             current content, and retry with the new content_version."
                     },
                     "allow_mojibake": {
                         "type": "boolean",
@@ -1793,7 +1845,13 @@ fn call_read_file(args: &Value) -> ToolResult {
         Ok(prepend_eol_note(args, &file, content))
     };
     match inner() {
-        Ok(content) => ToolResult::ok(format!("{header}\n{content}")),
+        Ok(content) => {
+            let version = resolve_file_arg(args)
+                .ok()
+                .and_then(|f| current_version(&f).ok().flatten());
+            let header = header_with_content_version(&header, version.as_deref());
+            ToolResult::ok(format!("{header}\n{content}"))
+        }
         Err(e) => ToolResult::error(&header, &e.to_string()),
     }
 }
@@ -1804,6 +1862,14 @@ fn call_write_file(args: &Value, config: &ServerConfig) -> ToolResult {
         let file = resolve_file_arg(args)?;
         let content = decode_content_arg(args, "content")?;
         let path = std::path::Path::new(&file);
+
+        // Hold the cross-process write lock across the CAS re-check AND the
+        // swap so two tpu instances cannot interleave and clobber each other.
+        let _write_lock = tpu::acquire_write_lock(path);
+
+        if let Some(conflict) = cas_conflict(args, &file, &header)? {
+            return Ok(conflict);
+        }
 
         let le_override = eol_write_override(args, &file, config)?;
 
@@ -1830,11 +1896,13 @@ fn call_write_file(args: &Value, config: &ServerConfig) -> ToolResult {
         )?;
         delete_bak_if_exists(&file);
         let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
+        let content_version = current_version(&file)?;
         let status = serde_json::json!({
             "status": "success",
             "file": file,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
+            "content_version": content_version,
         });
         let status_line = serde_json::to_string(&status)?;
         if diff && !diff_buf.is_empty() {
@@ -1891,6 +1959,10 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
         let replacement = decode_replacement_arg(args)?;
         let path = std::path::Path::new(&file);
 
+        // Hold the cross-process write lock across the CAS re-check AND the
+        // swap so two tpu instances cannot interleave and clobber each other.
+        let _write_lock = tpu::acquire_write_lock(path);
+
         let multiline = args
             .get("multiline")
             .and_then(|v| v.as_bool())
@@ -1903,6 +1975,19 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             .get("dry_run")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // A stale-base blind replace is the silent-clobber case; enforce the
+        // optional if_match precondition, but only for real writes (a
+        // count/dry_run preview changes nothing, so a conflict there would be
+        // spurious).
+        let cas = if !count && !dry_run {
+            cas_conflict(args, &file, &header)?
+        } else {
+            None
+        };
+        if let Some(conflict) = cas {
+            return Ok(conflict);
+        }
 
         let mut diff_buf: Vec<u8> = Vec::new();
         // The full whole-file diff clones the entire normalised file (see
@@ -1992,6 +2077,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
         // otherwise, echo automatically only when the change is small enough
         // to be a cheap, high-value safety net rather than a wall of text.
         let should_echo = diff || changed_lines <= echo_max_lines;
+        let content_version = current_version(&file)?;
         let mut status = serde_json::json!({
             "status": "success",
             "file": file,
@@ -1999,6 +2085,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             "size": stamp.size,
             "count": n,
             "changed_lines": changed_lines,
+            "content_version": content_version,
         });
         // A zero-match replace returns success (no error occurred) but
         // substituted nothing -- make that visible inline so a caller
@@ -2044,6 +2131,15 @@ fn call_edit_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
         let path = std::path::Path::new(&file);
+
+        // Hold the cross-process write lock across the CAS re-check AND the
+        // swap so two tpu instances cannot interleave and clobber each other.
+        let _write_lock = tpu::acquire_write_lock(path);
+
+        if let Some(conflict) = cas_conflict(args, &file, &header)? {
+            return Ok(conflict);
+        }
+
         let binary = args
             .get("binary")
             .and_then(|v| v.as_bool())
@@ -2178,11 +2274,13 @@ fn call_edit_file(args: &Value, config: &ServerConfig) -> ToolResult {
         )?;
         delete_bak_if_exists(&file);
         let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
+        let content_version = current_version(&file)?;
         let status = serde_json::json!({
             "status": "success",
             "file": file,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
+            "content_version": content_version,
         });
         let status_line = serde_json::to_string(&status)?;
         if diff && !diff_buf.is_empty() {
@@ -2298,6 +2396,8 @@ fn call_read_file_escaped(args: &Value) -> ToolResult {
         )?;
         let content =
             String::from_utf8(buf).map_err(|e| format!("readex: non-UTF-8 output: {e}"))?;
+        let version = current_version(&file).ok().flatten();
+        let header = header_with_content_version(&header, version.as_deref());
         Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
@@ -2332,6 +2432,8 @@ fn call_read_head(args: &Value) -> ToolResult {
         } else {
             prepend_eol_note(args, &file, content)
         };
+        let version = current_version(&file).ok().flatten();
+        let header = header_with_content_version(&header, version.as_deref());
         Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
@@ -2365,6 +2467,8 @@ fn call_read_tail(args: &Value) -> ToolResult {
         } else {
             prepend_eol_note(args, &file, content)
         };
+        let version = current_version(&file).ok().flatten();
+        let header = header_with_content_version(&header, version.as_deref());
         Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
@@ -2524,6 +2628,14 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
         let content = decode_content_arg(args, "content")?;
         let path = std::path::Path::new(&file);
 
+        // Hold the cross-process write lock across the CAS re-check AND the
+        // swap so two tpu instances cannot interleave and clobber each other.
+        let _write_lock = tpu::acquire_write_lock(path);
+
+        if let Some(conflict) = cas_conflict(args, &file, &header)? {
+            return Ok(conflict);
+        }
+
         let le_override = eol_write_override(args, &file, config)?;
         let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
 
@@ -2567,11 +2679,13 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
         )?;
         delete_bak_if_exists(&file);
         let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
+        let content_version = current_version(&file)?;
         let status = serde_json::json!({
             "status": "success",
             "file": file,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
+            "content_version": content_version,
         });
         let status_line = serde_json::to_string(&status)?;
         Ok(ToolResult::ok(format!("{header}\n{status_line}")))
@@ -3768,6 +3882,95 @@ fn mojibake_policy_from_args(args: &Value) -> tpu::mojibake::WritePolicy {
 fn resolve_file_arg(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let raw = require_str(args, "file")?;
     Ok(normalize_file_path(raw))
+}
+
+// -- compare-and-swap ("if_match") preconditions ------------------------------
+
+/// Current strong content-version token for a file: `Some(hex digest)` when
+/// the file exists, `None` when it does not.  Errors only on genuine I/O
+/// failures other than "not found".
+///
+/// The token is the XXH3-64 digest of the file's current bytes (see
+/// [`tpu::content_digest`]).  The MCP server always reads buffered so the
+/// digest streams over bytes already resident in the OS page cache.
+fn current_version(file: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match std::fs::metadata(file) {
+        Ok(_) => Ok(Some(tpu::content_digest(
+            Path::new(file),
+            tpu::IoMode::Buffered,
+        )?)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Enforce an optional `if_match` compare-and-swap precondition before a
+/// mutation.
+///
+/// When the caller supplies `if_match`, the file's current
+/// [`current_version`] must equal it or the mutation is refused.  Returns
+/// `Ok(Some(conflict))` when they differ — the caller must return that
+/// `ToolResult` immediately and perform no write — or `Ok(None)` to proceed
+/// (either no `if_match` was given, or it matched).  This is how a stale-read
+/// blind write (the silent-clobber case) is turned into a loud, recoverable
+/// same-turn error instead.
+fn cas_conflict(
+    args: &Value,
+    file: &str,
+    header: &str,
+) -> Result<Option<ToolResult>, Box<dyn std::error::Error>> {
+    let Some(expected) = args.get("if_match").and_then(|v| v.as_str()) else {
+        return Ok(None);
+    };
+    let actual = current_version(file)?;
+    if actual.as_deref() == Some(expected) {
+        return Ok(None);
+    }
+    let message = match &actual {
+        Some(current) => format!(
+            "if_match precondition failed: '{file}' now has content_version {current}, \
+             but if_match expected {expected}. The file changed since you last read it \
+             (another edit landed in between). Re-read it with tpu_read_file, rebuild \
+             your change against the current content, and retry with the new \
+             content_version."
+        ),
+        None => format!(
+            "if_match precondition failed: '{file}' does not exist (if_match expected \
+             {expected}). It was deleted or moved since you last read it."
+        ),
+    };
+    let status = serde_json::json!({
+        "status": "conflict",
+        "file": file,
+        "expected_version": expected,
+        "actual_version": actual,
+        "message": message,
+    });
+    let line = serde_json::to_string(&status)?;
+    Ok(Some(ToolResult {
+        text: format!("{header}\n{line}"),
+        is_error: true,
+    }))
+}
+
+/// Inject a `"content_version"` field into an already-serialized invocation
+/// header JSON line, so read tools can hand the caller a compare-and-swap
+/// token on the always-present first response line without disturbing their
+/// raw-content body.  A `None` version (unreadable file) leaves the header
+/// unchanged.
+fn header_with_content_version(header: &str, version: Option<&str>) -> String {
+    let Some(v) = version else {
+        return header.to_string();
+    };
+    match serde_json::from_str::<Value>(header) {
+        Ok(mut val) => {
+            if let Some(obj) = val.as_object_mut() {
+                obj.insert("content_version".to_string(), Value::String(v.to_string()));
+            }
+            serde_json::to_string(&val).unwrap_or_else(|_| header.to_string())
+        }
+        Err(_) => header.to_string(),
+    }
 }
 
 fn normalize_file_path(raw: &str) -> String {
