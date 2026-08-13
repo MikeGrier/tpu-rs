@@ -948,6 +948,33 @@ fn mcp_it_3l_no_if_match_is_opt_in() {
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2\n");
 }
 
+/// MCP-IT-3m: `tpu_append_file` with `diff:true` commits a write, so it must
+/// report the new `content_version` (same as the non-diff path) rather than
+/// forcing the caller to do a follow-up read for the next CAS token.
+#[test]
+fn mcp_it_3m_append_diff_reports_content_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("append_diff.txt");
+    let path = f.to_str().unwrap();
+    let mut s = McpSession::start();
+    s.initialize();
+
+    s.call_tool("tpu_write_file", json!({ "file": path, "content": "a\n" }));
+    let out = s.call_tool(
+        "tpu_append_file",
+        json!({ "file": path, "content": "b\n", "diff": true }),
+    );
+    let stamp = last_json_line(&out);
+    assert_eq!(stamp["status"].as_str(), Some("success"));
+    let v = stamp["content_version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("append diff:true must report content_version; got: {out:?}"));
+    assert_eq!(v.len(), 16);
+    // The token describes the post-append file, so a fresh read agrees.
+    let read = header_content_version(&s.call_tool("tpu_read_file", json!({ "file": path })));
+    assert_eq!(read.as_deref(), Some(v));
+}
+
 /// MCP-IT-4: `\n` in a tpu_replace_in_file replacement string expands to a real
 /// newline rather than the two-character sequence backslash-n.
 #[test]
