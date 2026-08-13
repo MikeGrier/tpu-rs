@@ -1807,6 +1807,8 @@ fn replace_nomatch_leaves_original_untouched_and_writes_no_bak() {
     let orig_content = fs::read(asset("singleline.txt")).unwrap();
     let (dir, f) = cp("singleline.txt");
     let before_mtime = fs::metadata(&f).unwrap().modified().unwrap();
+    // Sleep so a spurious rewrite would produce a distinguishable mtime.
+    std::thread::sleep(std::time::Duration::from_millis(50));
     ok(tpu().arg("replace").arg(&f).arg("ZZZNOMATCH_99").arg("Z"));
     assert!(
         !bak(&f).exists(),
@@ -10283,6 +10285,8 @@ fn fs_replace_short_flag_e_accepted() {
 fn fs_replace_default_literal_zero_match_exits_ok() {
     let (dir, f) = cp("singleline.txt");
     let before_mtime = fs::metadata(&f).unwrap().modified().unwrap();
+    // Sleep so a spurious rewrite would produce a distinguishable mtime.
+    std::thread::sleep(std::time::Duration::from_millis(50));
     // Pattern contains regex metacharacters but is not present in the file.
     ok(tpu()
         .arg("replace")
