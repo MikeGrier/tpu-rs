@@ -1,5 +1,25 @@
 # Changelog
 
+## [1.1.0](https://github.com/MikeGrier/tpu-rs/compare/v1.0.0...v1.1.0) (2026-08-13)
+
+
+### Features
+
+* **tpu-mcp:** add *_format base64/hex channel to bypass JSON-escape hazard ([aacf03b](https://github.com/MikeGrier/tpu-rs/commit/aacf03bf84e8e3ce7176d25b61826ea0b8e40c6d))
+* **tpu-mcp:** echo compact diff by default on small replace changes ([6189e48](https://github.com/MikeGrier/tpu-rs/commit/6189e48214fdb54e06220b4af25ce579c37e261d))
+* **tpu, tpu-mcp:** report zero-match replace no-ops and pin tool/setup versions for drift detection ([a50b45a](https://github.com/MikeGrier/tpu-rs/commit/a50b45af3217f33d5f5a5fba2b6ddc116c74b896))
+
+
+### Bug Fixes
+
+* **replace:** bound text_budget_lines by candidate size; guard .bak cleanup on zero-match no-op ([9c565f0](https://github.com/MikeGrier/tpu-rs/commit/9c565f0ac4f9ba7b3dbabe3028ae863c1933dcf2))
+* **replace:** correct multi-region hunk-header line numbers; harden zero-match tests ([6f3e3c6](https://github.com/MikeGrier/tpu-rs/commit/6f3e3c67b7ae7e4751cb6e7060100cf6db8f9a41))
+* **tools:** sanitize pattern field in invocation header ([b77f54e](https://github.com/MikeGrier/tpu-rs/commit/b77f54e12b9f16467aac81f58cd15fa41068d625))
+* **tpu-mcp:** clarify replacement_format CR docs; bound echo line length ([20fbece](https://github.com/MikeGrier/tpu-rs/commit/20fbeced36f49a0069a7a334f656ddf9858c3713))
+* **tpu:** avoid full-file diff clone for replace's default echo; fix \r docs ([d691ed5](https://github.com/MikeGrier/tpu-rs/commit/d691ed531f45486a81dd10830d1272520330a098))
+* **tpu:** fix line_no/scanned_to desync after a trailing-newline match ([6fddda4](https://github.com/MikeGrier/tpu-rs/commit/6fddda4ab46ef1fade177e58ae7c19748fb9f33c))
+* **tpu:** fix new_line_count trailing-newline overcount; bound region text ([16debce](https://github.com/MikeGrier/tpu-rs/commit/16debcecbe9c7ea0bd8168a761e574cc0bec534e))
+
 ## [1.0.0](https://github.com/MikeGrier/tpu-rs/compare/v0.6.0...v1.0.0) (2026-08-06)
 
 
