@@ -1968,8 +1968,15 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
                 "{header}\n{diff_text}{sep}{status_line}"
             )));
         }
-        // File was modified.
-        delete_bak_if_exists(&file);
+        // A real write only happened if something matched, or a
+        // line_ending_override forced a rewrite despite zero matches (see
+        // the zero-match short-circuit doc on `replace::run`). Only clean
+        // up a `.bak` when a write actually occurred -- otherwise this
+        // "no-op" turns a pre-existing `<file>.bak` into a destructive
+        // filesystem change.
+        if n > 0 || le_override.is_some() {
+            delete_bak_if_exists(&file);
+        }
         let stamp = stamp_and_verify(Path::new(&file), config.verify_delay_ms)?;
         let changed_lines: usize = regions
             .iter()
