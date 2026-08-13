@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.2.0](https://github.com/MikeGrier/tpu-rs/compare/v1.1.0...v1.2.0) (2026-08-13)
+
+
+### Features
+
+* **tpu-mcp:** cross-process write safety for concurrent edits ([66aa092](https://github.com/MikeGrier/tpu-rs/commit/66aa0920636f4b0db2ecf5c4f3fab286b082966c))
+
+
+### Bug Fixes
+
+* **tpu-mcp:** race-safe read content_version; robust current_version (PR [#57](https://github.com/MikeGrier/tpu-rs/issues/57) review) ([61af837](https://github.com/MikeGrier/tpu-rs/commit/61af83725e9b33b09bdeebe6837f97e21becbe9c))
+* **tpu-mcp:** report content_version from append diff:true path (PR [#57](https://github.com/MikeGrier/tpu-rs/issues/57) review) ([ba64425](https://github.com/MikeGrier/tpu-rs/commit/ba64425d36468cf2248ef4cc75db462e1ae3f583))
+* **tpu-mcp:** skip write lock on replace count/dry_run previews; correct CAS guidance (PR [#57](https://github.com/MikeGrier/tpu-rs/issues/57) review) ([44d8ab5](https://github.com/MikeGrier/tpu-rs/commit/44d8ab5862378e33d14f7bbeafdb770bdabc07a9))
+* update rust-toolchain action to 1.96.0 to match rust-toolchain.toml ([c4cc762](https://github.com/MikeGrier/tpu-rs/commit/c4cc762e40b1aa7b5c677982ba5dd719187230f5))
+
 ## [1.1.0](https://github.com/MikeGrier/tpu-rs/compare/v1.0.0...v1.1.0) (2026-08-13)
 
 
