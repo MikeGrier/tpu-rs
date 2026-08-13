@@ -163,6 +163,29 @@ same turn instead of requiring a follow-up read. This echo is cheap
 regardless of file size (it never clones the whole file); pass `diff:true`
 for a full old/new unified diff instead.
 
+### Concurrent edits — don't silently clobber (`content_version` / `if_match`)
+
+Copilot may issue several tool calls against the same file in quick
+succession. A blind `tpu_write_file` (or a `tpu_edit_file` at line numbers)
+whose payload was computed from an earlier read can silently overwrite an
+edit that landed in between — a lost update.
+
+Every read (`tpu_read_file`, `read_head`, `read_tail`, `read_file_escaped`)
+reports a `"content_version"` on its invocation-header line, and every
+successful write stamp reports the new `"content_version"`. This token is a
+content digest — it changes whenever the file's bytes change.
+
+When you mutate a file based on content you previously read, pass that token
+as `if_match` on `tpu_write_file` / `tpu_edit_file` / `tpu_replace_in_file` /
+`tpu_append_file`. If the file changed since you read it, the call is
+REFUSED with `{"status":"conflict",...}` and the file is left unchanged,
+instead of clobbering the other edit; then re-read, rebuild your change
+against the current content, and retry with the new `content_version`.
+
+Prefer a narrow `tpu_replace_in_file` over a full-file `tpu_write_file` when
+you can: a replace operates on the file's current bytes, so it is far less
+prone to lost updates in the first place.
+
 ### Tool output format
 
 Every tool response uses a **mixed format**: a JSON invocation header,
@@ -174,7 +197,9 @@ between the header and trailer.
   `{"reason":"x-tpu-mcp-invocation","tool":"tpu_NAME","args":{...}}`
   Large `content`/`replacement`/`template` fields appear as `"<N bytes>"` placeholders.
 - **Mutating tools** (write, replace, edit, append) — normal write:
-  `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N}`
+  `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N,"content_version":"..."}`
+  (`content_version` is the digest of the just-written file — pass it as
+  `if_match` on your next edit of this file; see "Concurrent edits" above).
   Preview modes do not stamp the file and return a reduced trailer:
   `diff:true` adds unified diff lines before the status (full stamp still present for write/replace/edit).
   `dry_run:true` (replace only): optional diff lines, then `{"status":"success","changed":true|false}`.
@@ -192,6 +217,7 @@ between the header and trailer.
   setup+target, doctor) — result line
   `{"reason":"x-tpu-mcp-result",...}` followed by `{"status":"success"}`.
 - **Read tools** (read_file, read_head, read_tail, read_file_escaped) — header then raw content; no JSON trailer on success.
+  The header line carries a `"content_version"` token for this file (see "Concurrent edits" above); pass it as `if_match` when you later edit the file.
   **Exception** — `tpu_read_file_binary` with a non-empty `hash` arg acts like a structured tool:
   `{"reason":"x-tpu-mcp-result","encoding":"bytes-base64","content":"<base64>","hashes":[...]}` followed by `{"status":"success"}`.
   Without `hash`, `tpu_read_file_binary` returns header + 7-bit-clean escaped bytes (no trailer).

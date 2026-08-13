@@ -221,6 +221,16 @@ fn last_json_line(output: &str) -> serde_json::Value {
         .unwrap_or(serde_json::Value::Null)
 }
 
+/// Extract the `content_version` compare-and-swap token from a response's
+/// first (invocation-header) JSON line, if present.
+fn header_content_version(output: &str) -> Option<String> {
+    let first = output.lines().find(|l| !l.trim().is_empty())?;
+    let v: serde_json::Value = serde_json::from_str(first).ok()?;
+    v.get("content_version")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+}
+
 // --- tests -------------------------------------------------------------------
 
 /// MCP-IT-1: initialize handshake succeeds; tools/list includes all required tools.
@@ -517,10 +527,429 @@ fn mcp_it_3c_replace_zero_match_does_not_delete_preexisting_bak() {
     );
 }
 
+/// MCP-IT-3d: reads expose a `content_version` compare-and-swap token on
+/// their header line, and a write's success stamp reports the new
+/// `content_version`; the token a read returns for a file equals the token
+/// the write that produced it returned (both are the digest of the same
+/// bytes).
+#[test]
+fn mcp_it_3d_read_and_write_report_matching_content_version() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("cas_version.txt");
+    let path = f.to_str().unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let write_out = s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "alpha\nbeta\n" }),
+    );
+    let write_stamp = last_json_line(&write_out);
+    let write_ver = write_stamp["content_version"]
+        .as_str()
+        .unwrap_or_else(|| panic!("write stamp must include content_version; got: {write_out:?}"))
+        .to_string();
+    assert_eq!(write_ver.len(), 16, "token must be 16-char xxh3-64 hex");
+
+    let read_out = s.call_tool("tpu_read_file", json!({ "file": path }));
+    let read_ver = header_content_version(&read_out)
+        .unwrap_or_else(|| panic!("read header must include content_version; got: {read_out:?}"));
+    assert_eq!(
+        read_ver, write_ver,
+        "read token must equal the writing call's token for identical bytes"
+    );
+}
+
+/// MCP-IT-3e: the `if_match` compare-and-swap precondition. A write whose
+/// `if_match` matches the file's current content_version succeeds; a later
+/// write carrying the now-stale token is REFUSED with a
+/// `{"status":"conflict"}` response and leaves the file byte-for-byte
+/// unchanged (the silent-clobber case turned into a loud, recoverable error).
+#[test]
+fn mcp_it_3e_if_match_allows_fresh_and_refuses_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("cas_ifmatch.txt");
+    let path = f.to_str().unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // Establish v0.
+    let v0_out = s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "one\ntwo\n" }),
+    );
+    let v0 = last_json_line(&v0_out)["content_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // A replace with the correct if_match (v0) succeeds and yields v1.
+    let ok_out = s.call_tool(
+        "tpu_replace_in_file",
+        json!({ "file": path, "pattern": "two", "replacement": "TWO", "if_match": v0 }),
+    );
+    let ok_stamp = last_json_line(&ok_out);
+    assert_eq!(
+        ok_stamp["status"].as_str(),
+        Some("success"),
+        "fresh if_match must succeed; got: {ok_out:?}"
+    );
+    let v1 = ok_stamp["content_version"].as_str().unwrap().to_string();
+    assert_ne!(v0, v1, "content changed, so the token must advance");
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "one\nTWO\n");
+
+    // A second write carrying the STALE v0 must be refused as a conflict and
+    // must not modify the file.
+    let stale_out = s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "CLOBBER\n", "if_match": v0 }),
+    );
+    let conflict = last_json_line(&stale_out);
+    assert_eq!(
+        conflict["status"].as_str(),
+        Some("conflict"),
+        "stale if_match must be refused with a conflict; got: {stale_out:?}"
+    );
+    assert_eq!(conflict["expected_version"].as_str(), Some(v0.as_str()));
+    assert_eq!(conflict["actual_version"].as_str(), Some(v1.as_str()));
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "one\nTWO\n",
+        "a refused (conflicting) write must leave the file unchanged"
+    );
+}
+
+/// MCP-IT-3f: `if_match` on `tpu_edit_file` — a fresh token permits the edit
+/// and yields a new content_version; a stale token is refused as a conflict
+/// and leaves the file unchanged.
+#[test]
+fn mcp_it_3f_if_match_on_edit_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("cas_edit.txt");
+    let path = f.to_str().unwrap();
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let v0 = last_json_line(&s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "one\ntwo\nthree\n" }),
+    ))["content_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let ok = last_json_line(&s.call_tool(
+        "tpu_edit_file",
+        json!({
+            "file": path,
+            "ops": [{ "op": "splice", "range": "1-1", "data": "ONE\n" }],
+            "if_match": v0,
+        }),
+    ));
+    assert_eq!(
+        ok["status"].as_str(),
+        Some("success"),
+        "fresh if_match edit must succeed; got: {ok}"
+    );
+    let v1 = ok["content_version"].as_str().unwrap().to_string();
+    assert_ne!(v0, v1);
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "ONE\ntwo\nthree\n");
+
+    let conflict = last_json_line(&s.call_tool(
+        "tpu_edit_file",
+        json!({
+            "file": path,
+            "ops": [{ "op": "splice", "range": "2-2", "data": "X\n" }],
+            "if_match": v0,
+        }),
+    ));
+    assert_eq!(
+        conflict["status"].as_str(),
+        Some("conflict"),
+        "stale if_match edit must be refused; got: {conflict}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "ONE\ntwo\nthree\n",
+        "a refused edit must not change the file"
+    );
+}
+
+/// MCP-IT-3g: `if_match` on `tpu_append_file` — fresh permits, stale refuses
+/// and leaves the file unchanged.
+#[test]
+fn mcp_it_3g_if_match_on_append_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("cas_append.txt");
+    let path = f.to_str().unwrap();
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let v0 = last_json_line(
+        &s.call_tool("tpu_write_file", json!({ "file": path, "content": "a\n" })),
+    )["content_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let ok = last_json_line(&s.call_tool(
+        "tpu_append_file",
+        json!({ "file": path, "content": "b\n", "if_match": v0 }),
+    ));
+    assert_eq!(
+        ok["status"].as_str(),
+        Some("success"),
+        "fresh if_match append must succeed; got: {ok}"
+    );
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "a\nb\n");
+
+    let conflict = last_json_line(&s.call_tool(
+        "tpu_append_file",
+        json!({ "file": path, "content": "c\n", "if_match": v0 }),
+    ));
+    assert_eq!(
+        conflict["status"].as_str(),
+        Some("conflict"),
+        "stale if_match append must be refused; got: {conflict}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "a\nb\n",
+        "a refused append must not change the file"
+    );
+}
+
+/// MCP-IT-3h: `if_match` referencing a file that no longer exists is a
+/// conflict with a null `actual_version`, and must NOT recreate the file
+/// (even though a plain write to a missing path would create it).
+#[test]
+fn mcp_it_3h_if_match_on_deleted_file_is_conflict() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("cas_deleted.txt");
+    let path = f.to_str().unwrap();
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let v0 = last_json_line(
+        &s.call_tool("tpu_write_file", json!({ "file": path, "content": "x\n" })),
+    )["content_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    std::fs::remove_file(&f).unwrap();
+
+    let conflict = last_json_line(&s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "resurrected\n", "if_match": v0 }),
+    ));
+    assert_eq!(
+        conflict["status"].as_str(),
+        Some("conflict"),
+        "if_match against a deleted file must conflict; got: {conflict}"
+    );
+    assert!(
+        conflict["actual_version"].is_null(),
+        "a deleted file's actual_version must be null; got: {conflict}"
+    );
+    assert!(
+        !f.exists(),
+        "a refused write must not recreate the deleted file"
+    );
+}
+
+/// MCP-IT-3i: preview modes are exempt from `if_match` — a stale token on
+/// `count:true` / `dry_run:true` does NOT produce a conflict (they commit
+/// nothing), and the file is left unchanged.
+#[test]
+fn mcp_it_3i_if_match_ignored_on_replace_preview() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("cas_preview.txt");
+    let path = f.to_str().unwrap();
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let v0 = last_json_line(&s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "foo\n" }),
+    ))["content_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // Change the file so v0 is now stale.
+    s.call_tool(
+        "tpu_replace_in_file",
+        json!({ "file": path, "pattern": "foo", "replacement": "bar" }),
+    );
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "bar\n");
+
+    // count:true with the stale token must NOT conflict.
+    let counted = last_json_line(&s.call_tool(
+        "tpu_replace_in_file",
+        json!({ "file": path, "pattern": "bar", "replacement": "baz", "count": true, "if_match": v0 }),
+    ));
+    assert_eq!(
+        counted["status"].as_str(),
+        Some("success"),
+        "count preview must not be blocked by a stale if_match; got: {counted}"
+    );
+    assert_eq!(counted["count"].as_u64(), Some(1));
+
+    // dry_run:true with the stale token must NOT conflict either.
+    let dry = last_json_line(&s.call_tool(
+        "tpu_replace_in_file",
+        json!({ "file": path, "pattern": "bar", "replacement": "baz", "dry_run": true, "if_match": v0 }),
+    ));
+    assert_eq!(
+        dry["status"].as_str(),
+        Some("success"),
+        "dry_run preview must not be blocked by a stale if_match; got: {dry}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&f).unwrap(),
+        "bar\n",
+        "preview modes must not modify the file"
+    );
+}
+
+/// MCP-IT-3j: every read variant (read_file, read_head, read_tail,
+/// read_file_escaped) reports the WHOLE-file content_version on its header,
+/// and a RANGED read still reports the whole-file token (not a digest of the
+/// returned slice) — so a ranged read's token is a valid `if_match`.
+#[test]
+fn mcp_it_3j_all_reads_report_whole_file_token() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("cas_reads.txt");
+    let path = f.to_str().unwrap();
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let v = last_json_line(&s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "l1\nl2\nl3\n" }),
+    ))["content_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let full = header_content_version(&s.call_tool("tpu_read_file", json!({ "file": path })));
+    assert_eq!(full.as_deref(), Some(v.as_str()), "read_file token");
+
+    let head =
+        header_content_version(&s.call_tool("tpu_read_head", json!({ "file": path, "lines": 2 })));
+    assert_eq!(
+        head.as_deref(),
+        Some(v.as_str()),
+        "read_head token is whole-file"
+    );
+
+    let tail =
+        header_content_version(&s.call_tool("tpu_read_tail", json!({ "file": path, "lines": 1 })));
+    assert_eq!(
+        tail.as_deref(),
+        Some(v.as_str()),
+        "read_tail token is whole-file"
+    );
+
+    let ranged = header_content_version(&s.call_tool(
+        "tpu_read_file_escaped",
+        json!({ "file": path, "lines": "1-1" }),
+    ));
+    assert_eq!(
+        ranged.as_deref(),
+        Some(v.as_str()),
+        "a ranged read must still report the whole-file token, not a slice digest"
+    );
+
+    // The ranged token must actually work as an if_match precondition.
+    let ok = last_json_line(&s.call_tool(
+        "tpu_replace_in_file",
+        json!({ "file": path, "pattern": "l2", "replacement": "L2", "if_match": v }),
+    ));
+    assert_eq!(
+        ok["status"].as_str(),
+        Some("success"),
+        "the whole-file token from a ranged read must satisfy if_match; got: {ok}"
+    );
+}
+
+/// MCP-IT-3k: the intended recovery loop — a stale write conflicts, the
+/// caller re-reads to learn the current content_version, and retrying with
+/// that token succeeds.
+#[test]
+fn mcp_it_3k_conflict_then_reread_and_retry_succeeds() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("cas_recover.txt");
+    let path = f.to_str().unwrap();
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let v0 = last_json_line(&s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "base\n" }),
+    ))["content_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Another edit lands (no if_match), invalidating v0.
+    let v1 = last_json_line(&s.call_tool(
+        "tpu_replace_in_file",
+        json!({ "file": path, "pattern": "base", "replacement": "mid" }),
+    ))["content_version"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Stale write conflicts and reports the current version.
+    let conflict = last_json_line(&s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "final\n", "if_match": v0 }),
+    ));
+    assert_eq!(conflict["status"].as_str(), Some("conflict"));
+    assert_eq!(conflict["actual_version"].as_str(), Some(v1.as_str()));
+
+    // Re-read to confirm the token, then retry with it.
+    let reread = header_content_version(&s.call_tool("tpu_read_file", json!({ "file": path })));
+    assert_eq!(reread.as_deref(), Some(v1.as_str()));
+
+    let retry = last_json_line(&s.call_tool(
+        "tpu_write_file",
+        json!({ "file": path, "content": "final\n", "if_match": v1 }),
+    ));
+    assert_eq!(
+        retry["status"].as_str(),
+        Some("success"),
+        "retry with the fresh token must succeed; got: {retry}"
+    );
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "final\n");
+}
+
+/// MCP-IT-3l: compare-and-swap is strictly opt-in — WITHOUT `if_match`, a
+/// write onto a file that changed since an earlier read still succeeds and is
+/// never turned into a conflict.
+#[test]
+fn mcp_it_3l_no_if_match_is_opt_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("cas_optin.txt");
+    let path = f.to_str().unwrap();
+    let mut s = McpSession::start();
+    s.initialize();
+
+    s.call_tool("tpu_write_file", json!({ "file": path, "content": "v1\n" }));
+    let second =
+        last_json_line(&s.call_tool("tpu_write_file", json!({ "file": path, "content": "v2\n" })));
+    assert_eq!(
+        second["status"].as_str(),
+        Some("success"),
+        "a write without if_match must never conflict; got: {second}"
+    );
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "v2\n");
+}
+
 /// MCP-IT-4: `\n` in a tpu_replace_in_file replacement string expands to a real
 /// newline rather than the two-character sequence backslash-n.
-///
-/// This validates the escape-expansion feature (RE milestone).
 #[test]
 fn mcp_it_4_replace_backslash_n_expands_to_newline() {
     let dir = tempfile::tempdir().unwrap();

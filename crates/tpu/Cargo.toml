@@ -21,8 +21,8 @@ name = "tpu"
 path = "src/main.rs"
 
 [dependencies]
-harrier     = "0.2.0"
-redwing     = "0.3.0"
+harrier     = "0.3.0"
+redwing     = "0.4.0"
 anstream    = { workspace = true }
 anstyle     = { workspace = true }
 clap        = { workspace = true }
