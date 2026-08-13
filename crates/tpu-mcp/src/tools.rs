@@ -437,13 +437,16 @@ pub fn list() -> Value {
                  is needed. \
                  Use count:true to count matches without modifying the file. \
                  Use dry_run:true to preview changes as a unified diff without writing. \
-                 After a real write, a compact changed-region preview (new lines, with \
-                 unified-diff-style hunk headers — cheap regardless of file size) is \
-                 included in the response BY DEFAULT — no diff:true needed — as long as \
-                 the change is small (see echo_max_lines below); this lets you catch a \
-                 mistake (e.g. an escape-hazard corruption, see the ESCAPE-HAZARD warning) \
-                 in the same turn instead of needing a follow-up tpu_read_file call. Pass \
-                 diff:true for a full old/new unified diff instead.\n\n\
+                 After a real write, a compact changed-region preview is included in the \
+                 response BY DEFAULT — no diff:true needed — as long as the change is \
+                 small (see echo_max_lines below); this lets you catch a mistake (e.g. an \
+                 escape-hazard corruption, see the ESCAPE-HAZARD warning) in the same \
+                 turn instead of needing a follow-up tpu_read_file call. Each hunk shows \
+                 only the literal replacement text for that match (unified-diff-style \
+                 `+` lines, cheap regardless of file size) — NOT the full resulting file \
+                 line for a match that replaces only part of a line, so a partial-line \
+                 substitution's preview line will not look like a complete line of the \
+                 file. Pass diff:true for a full old/new unified diff instead.\n\n\
                  ESCAPING — RECOMMENDED DEFAULT: leave regex unset (or false) and send the \
                  search target as unescaped literal text (code, JSON, structured data, \
                  anything containing . ( ) [ ] { } * + ? | ^ $ \\). This is almost always \
