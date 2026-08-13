@@ -1997,13 +1997,17 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             "count": n,
             "changed_lines": changed_lines,
         });
-        // A zero-match replace returns success (no error occurred) but did
-        // nothing -- make that visible inline so a caller doesn't mistake
-        // it for a real edit. See CHECKLIST.md M7 for background.
+        // A zero-match replace returns success (no error occurred) but
+        // substituted nothing -- make that visible inline so a caller
+        // doesn't mistake it for a real edit. See CHECKLIST.md M7 for
+        // background. Wording must not claim the file was untouched: a
+        // line_ending_override still rewrites it (mtime bump, new .bak)
+        // even with zero substitutions, so only the substitution count is
+        // asserted here, not the file's unchanged-ness.
         if n == 0 {
             status["warning"] = serde_json::json!(
-                "pattern matched 0 times; file not modified (matching is literal by default; \
-                 pass regex:true for regex)"
+                "pattern matched 0 times; no substitutions made (matching is literal by \
+                 default; pass regex:true for regex)"
             );
         }
         if !should_echo {
@@ -3681,12 +3685,20 @@ const MAX_ECHO_LINE_BYTES: usize = 500;
 /// with a marker (see that constant's doc comment).
 fn render_changed_regions(regions: &[tpu::cmd::replace::ChangedRegion]) -> String {
     let mut out = String::new();
+    // Hunk headers use `@@ -old_start,old_count +new_start,new_count @@`.
+    // `r.start_line`/`r.end_line` are ORIGINAL-file line numbers (shared by
+    // every region), but the NEW-side start line must reflect the net line
+    // growth/shrinkage already introduced by every earlier region in this
+    // same edit -- otherwise later hunks point at the wrong post-edit line.
+    let mut new_line_delta: i64 = 0;
     for r in regions {
         let old_count = r.end_line - r.start_line + 1;
+        let new_start = r.start_line as i64 + new_line_delta;
         out.push_str(&format!(
             "@@ -{},{} +{},{} @@\n",
-            r.start_line, old_count, r.start_line, r.new_line_count
+            r.start_line, old_count, new_start, r.new_line_count
         ));
+        new_line_delta += r.new_line_count as i64 - old_count as i64;
         if !r.new_text.is_empty() {
             let mut lines: Vec<&str> = r.new_text.split('\n').collect();
             // A trailing '\n' in new_text produces one spurious empty
@@ -3875,6 +3887,40 @@ mod tests {
             .collect();
         let from_const: Vec<String> = TOOL_NAMES.iter().map(|s| (*s).to_owned()).collect();
         assert_eq!(from_const, from_list, "TOOL_NAMES out of sync with list()");
+    }
+
+    /// Regression: `render_changed_regions`'s hunk-header NEW-side start
+    /// line must track the net line growth/shrinkage of every earlier
+    /// region, not just reuse the ORIGINAL-file `start_line` for both
+    /// sides. Two regions: the first replaces 1 old line with 3 new lines
+    /// (net +2), so the second region's original `start_line` of 10 must
+    /// be reported as 12 on the new side.
+    #[test]
+    fn render_changed_regions_tracks_new_side_line_delta_across_regions() {
+        let regions = vec![
+            tpu::cmd::replace::ChangedRegion {
+                start_line: 2,
+                end_line: 2,
+                new_line_count: 3,
+                new_text: "a\nb\nc".to_string(),
+            },
+            tpu::cmd::replace::ChangedRegion {
+                start_line: 10,
+                end_line: 10,
+                new_line_count: 1,
+                new_text: "z".to_string(),
+            },
+        ];
+        let rendered = render_changed_regions(&regions);
+        assert!(
+            rendered.contains("@@ -2,1 +2,3 @@"),
+            "first region's hunk header unaffected by later regions; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("@@ -10,1 +12,1 @@"),
+            "second region's new-side start must shift by the first \
+             region's net +2 line growth (10 -> 12); got: {rendered:?}"
+        );
     }
 
     // -- file:// URI stripping --

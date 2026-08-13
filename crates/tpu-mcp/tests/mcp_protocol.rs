@@ -274,11 +274,7 @@ fn mcp_it_1_initialize_and_tools_list() {
 fn mcp_it_1b_invocation_header_includes_tpu_version() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("version_probe.txt");
-    std::fs::write(
-        &f, "probe
-",
-    )
-    .unwrap();
+    std::fs::write(&f, "probe\n").unwrap();
 
     let mut s = McpSession::start();
     s.initialize();
@@ -422,12 +418,7 @@ fn mcp_it_3_replace_basic() {
 fn mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("replace_zero.txt");
-    std::fs::write(
-        &f,
-        "hello world
-",
-    )
-    .unwrap();
+    std::fs::write(&f, "hello world\n").unwrap();
     let before_mtime = std::fs::metadata(&f).unwrap().modified().unwrap();
 
     // Sleep so a spurious rewrite would produce a distinguishable mtime.
@@ -479,8 +470,7 @@ fn mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime() {
     );
     assert_eq!(
         std::fs::read_to_string(&f).unwrap(),
-        "hello world
-",
+        "hello world\n",
         "zero-match must leave file bytes untouched"
     );
 }
@@ -495,12 +485,7 @@ fn mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime() {
 fn mcp_it_3c_replace_zero_match_does_not_delete_preexisting_bak() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("replace_zero_preexisting_bak.txt");
-    std::fs::write(
-        &f,
-        "hello world
-",
-    )
-    .unwrap();
+    std::fs::write(&f, "hello world\n").unwrap();
     let bak = f.with_extension("txt.bak");
     std::fs::write(&bak, "stale backup from an earlier edit\n").unwrap();
 

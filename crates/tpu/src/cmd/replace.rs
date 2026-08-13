@@ -1143,11 +1143,7 @@ mod tests {
 
         let bak = format!("{}.bak", path.display());
         let bak_bytes = fs::read(&bak).unwrap();
-        assert_eq!(
-            bak_bytes,
-            b"original
-"
-        );
+        assert_eq!(bak_bytes, b"original\n");
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&bak);
@@ -1158,20 +1154,11 @@ mod tests {
         // Setup: write a file, capture its mtime, ensure any stray .bak
         // from a prior test in the same tmpdir is gone.
         let mut f = NamedTempFile::new().unwrap();
-        f.write_all(
-            b"hello world
-",
-        )
-        .unwrap();
+        f.write_all(b"hello world\n").unwrap();
         f.flush().unwrap();
         let path = f.path().to_path_buf();
         drop(f);
-        fs::write(
-            &path,
-            b"hello world
-",
-        )
-        .unwrap();
+        fs::write(&path, b"hello world\n").unwrap();
         let bak = format!("{}.bak", path.display());
         let _ = fs::remove_file(&bak);
 
@@ -1207,8 +1194,7 @@ mod tests {
         );
         assert_eq!(
             fs::read(&path).unwrap(),
-            b"hello world
-",
+            b"hello world\n",
             "zero-match run must leave file bytes untouched"
         );
 

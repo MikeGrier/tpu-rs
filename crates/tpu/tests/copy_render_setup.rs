@@ -276,17 +276,10 @@ fn setup_inject_is_idempotent_and_replaces_existing_block() {
 fn setup_inject_appends_when_no_markers_present() {
     let dir = TempDir::new().unwrap();
     let target = dir.path().join("notes.md");
-    write_file(
-        &target,
-        b"original content
-",
-    );
+    write_file(&target, b"original content\n");
     ok(tpu().arg("setup").arg("--inject").arg(&target));
     let after = fs::read_to_string(&target).unwrap();
-    assert!(after.starts_with(
-        "original content
-"
-    ));
+    assert!(after.starts_with("original content\n"));
     assert!(after.contains("<!-- tpu-mcp:setup:begin -->"));
 }
 
