@@ -158,10 +158,12 @@ fn lock_sidecar_path(file: &Path) -> Option<PathBuf> {
     lock_name.push("."); // Unix "hidden" convention
     lock_name.push(name);
     lock_name.push(LOCK_SUFFIX);
-    // 255 bytes is the near-universal max file-name component length; the
-    // authoritative limit for the actual volume is enforced by the OS when we
-    // try to open the sidecar (a name-too-long error also falls back — see
-    // `acquire_write_lock`).  This cheap check avoids a doomed syscall.
+    // Cheap guard against a doomed syscall: 255 is the near-universal maximum
+    // file-name component length. `OsString::len()` is the platform's encoded
+    // length (UTF-8 bytes on Unix, UTF-16 code units on Windows), not a
+    // grapheme count — good enough for this bound. The authoritative per-volume
+    // limit is enforced by the OS when we try to open the sidecar (a
+    // name-too-long error also falls back — see `acquire_write_lock`).
     if lock_name.len() > 255 {
         return None;
     }
