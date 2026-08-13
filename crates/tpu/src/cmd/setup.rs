@@ -171,16 +171,20 @@ whose payload was computed from an earlier read can silently overwrite an
 edit that landed in between — a lost update.
 
 Every read (`tpu_read_file`, `tpu_read_head`, `tpu_read_tail`, `tpu_read_file_escaped`)
-reports a `"content_version"` on its invocation-header line, and every
-successful write stamp reports the new `"content_version"`. This token is a
-content digest — it changes whenever the file's bytes change.
+reports a `"content_version"` on its invocation-header line (a content digest
+that changes whenever the file's bytes change), and every successful write
+stamp reports the new `"content_version"`. A read MAY omit the token when the
+file changed while it was being read (so it can't be guaranteed to describe
+the bytes returned) — treat a missing token as "re-read before relying on a
+version".
 
 When you mutate a file based on content you previously read, pass that token
 as `if_match` on `tpu_write_file` / `tpu_edit_file` / `tpu_replace_in_file` /
 `tpu_append_file`. If the file changed since you read it, the call is
-REFUSED with `{"status":"conflict",...}` and the file is left unchanged,
-instead of clobbering the other edit; then re-read, rebuild your change
-against the current content, and retry with the new `content_version`.
+REFUSED with `{"status":"conflict",...}` (surfaced as an MCP error,
+`isError: true`) and the file is left unchanged, instead of clobbering the
+other edit; then re-read, rebuild your change against the current content,
+and retry with the new `content_version`.
 
 Prefer a narrow `tpu_replace_in_file` over a full-file `tpu_write_file` when
 you can: a replace operates on the file's current bytes, so it is far less
@@ -217,7 +221,7 @@ between the header and trailer.
   setup+target, doctor) — result line
   `{"reason":"x-tpu-mcp-result",...}` followed by `{"status":"success"}`.
 - **Read tools** (tpu_read_file, tpu_read_head, tpu_read_tail, tpu_read_file_escaped) — header then raw content; no JSON trailer on success.
-  The header line carries a `"content_version"` token for this file (see "Concurrent edits" above); pass it as `if_match` when you later edit the file.
+  The header line usually carries a `"content_version"` token for this file (see "Concurrent edits" above); pass it as `if_match` when you later edit the file. It may be absent if the file changed mid-read — re-read to get a usable token.
   **Exception** — `tpu_read_file_binary` with a non-empty `hash` arg acts like a structured tool:
   `{"reason":"x-tpu-mcp-result","encoding":"bytes-base64","content":"<base64>","hashes":[...]}` followed by `{"status":"success"}`.
   Without `hash`, `tpu_read_file_binary` returns header + 7-bit-clean escaped bytes (no trailer).

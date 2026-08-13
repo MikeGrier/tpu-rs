@@ -1960,10 +1960,6 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
         let replacement = decode_replacement_arg(args)?;
         let path = std::path::Path::new(&file);
 
-        // Hold the cross-process write lock across the CAS re-check AND the
-        // swap so two tpu instances cannot interleave and clobber each other.
-        let _write_lock = tpu::acquire_write_lock(path);
-
         let multiline = args
             .get("multiline")
             .and_then(|v| v.as_bool())
@@ -1976,6 +1972,16 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             .get("dry_run")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        // Real writes take the cross-process write lock, held across the CAS
+        // re-check AND the swap so two tpu instances cannot interleave and
+        // clobber each other. count/dry_run previews don't modify the file, so
+        // they skip the lock and never wait on a concurrent writer.
+        let _write_lock = if !count && !dry_run {
+            tpu::acquire_write_lock(path)
+        } else {
+            None
+        };
 
         // A stale-base blind replace is the silent-clobber case; enforce the
         // optional if_match precondition, but only for real writes (a
