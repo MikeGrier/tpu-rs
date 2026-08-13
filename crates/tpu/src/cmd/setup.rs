@@ -55,9 +55,7 @@ pub fn guidance_body() -> &'static str {
     concat!(
         "<!-- tpu-mcp:setup:version=",
         env!("CARGO_PKG_VERSION"),
-        " -->
-
-",
+        " -->\n\n",
         r#"## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
 
 This workspace runs the **tpu-mcp** MCP server which exposes encoding-aware
