@@ -2659,17 +2659,25 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
                 tpu::IoMode::Buffered,
                 mojibake_policy_from_args(args),
             )?;
-            if !diff_buf.is_empty() {
+            // The append committed a write, so report the new content_version
+            // regardless of whether a diff was emitted — same as the non-diff
+            // path, so CAS chaining doesn't need a follow-up read.
+            let content_version = current_version(&file)?;
+            let changed = !diff_buf.is_empty();
+            let status = serde_json::json!({
+                "status": "success",
+                "file": file,
+                "changed": changed,
+                "content_version": content_version,
+            });
+            let status_line = serde_json::to_string(&status)?;
+            if changed {
                 let diff_text = String::from_utf8_lossy(&diff_buf);
                 let sep = diff_separator(&diff_text);
-                let status = serde_json::json!({"status":"success","file":file,"changed":true});
-                let status_line = serde_json::to_string(&status)?;
                 return Ok(ToolResult::ok(format!(
                     "{header}\n{diff_text}{sep}{status_line}"
                 )));
             }
-            let status = serde_json::json!({"status":"success","file":file,"changed":false});
-            let status_line = serde_json::to_string(&status)?;
             return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
         }
 
