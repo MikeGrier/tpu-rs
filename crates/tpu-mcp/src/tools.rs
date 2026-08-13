@@ -1817,8 +1817,11 @@ fn eol_write_override(
 
 fn call_read_file(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_file", args);
-    let inner = || -> Result<String, Box<dyn std::error::Error>> {
+    let inner = || -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
+        // Snapshot the version BEFORE reading so it can be verified unchanged
+        // afterward (see stable_content_version).
+        let before = current_version(&file).ok().flatten();
         let path = std::path::Path::new(&file);
 
         let lines_range = match args.get("lines").and_then(|v| v.as_str()) {
@@ -1842,13 +1845,11 @@ fn call_read_file(args: &Value) -> ToolResult {
             None,
         )?;
         let content = String::from_utf8(buf).map_err(|e| format!("read: non-UTF-8 output: {e}"))?;
-        Ok(prepend_eol_note(args, &file, content))
+        let version = stable_content_version(&file, before.as_deref());
+        Ok((prepend_eol_note(args, &file, content), version))
     };
     match inner() {
-        Ok(content) => {
-            let version = resolve_file_arg(args)
-                .ok()
-                .and_then(|f| current_version(&f).ok().flatten());
+        Ok((content, version)) => {
             let header = header_with_content_version(&header, version.as_deref());
             ToolResult::ok(format!("{header}\n{content}"))
         }
@@ -2372,6 +2373,7 @@ fn call_read_file_escaped(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_file_escaped", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
+        let before = current_version(&file).ok().flatten();
         let path = std::path::Path::new(&file);
 
         let lines_range = match args.get("lines").and_then(|v| v.as_str()) {
@@ -2396,7 +2398,7 @@ fn call_read_file_escaped(args: &Value) -> ToolResult {
         )?;
         let content =
             String::from_utf8(buf).map_err(|e| format!("readex: non-UTF-8 output: {e}"))?;
-        let version = current_version(&file).ok().flatten();
+        let version = stable_content_version(&file, before.as_deref());
         let header = header_with_content_version(&header, version.as_deref());
         Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
@@ -2407,6 +2409,7 @@ fn call_read_head(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_head", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
+        let before = current_version(&file).ok().flatten();
         let path = std::path::Path::new(&file);
 
         let byte_mode = args.get("bytes").and_then(|v| v.as_u64());
@@ -2432,7 +2435,7 @@ fn call_read_head(args: &Value) -> ToolResult {
         } else {
             prepend_eol_note(args, &file, content)
         };
-        let version = current_version(&file).ok().flatten();
+        let version = stable_content_version(&file, before.as_deref());
         let header = header_with_content_version(&header, version.as_deref());
         Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
@@ -2443,6 +2446,7 @@ fn call_read_tail(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_tail", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let file = resolve_file_arg(args)?;
+        let before = current_version(&file).ok().flatten();
         let path = std::path::Path::new(&file);
 
         let byte_mode = args.get("bytes").and_then(|v| v.as_u64());
@@ -2467,7 +2471,7 @@ fn call_read_tail(args: &Value) -> ToolResult {
         } else {
             prepend_eol_note(args, &file, content)
         };
-        let version = current_version(&file).ok().flatten();
+        let version = stable_content_version(&file, before.as_deref());
         let header = header_with_content_version(&header, version.as_deref());
         Ok(ToolResult::ok(format!("{header}\n{content}")))
     };
@@ -3894,13 +3898,37 @@ fn resolve_file_arg(args: &Value) -> Result<String, Box<dyn std::error::Error>> 
 /// [`tpu::content_digest`]).  The MCP server always reads buffered so the
 /// digest streams over bytes already resident in the OS page cache.
 fn current_version(file: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    match std::fs::metadata(file) {
-        Ok(_) => Ok(Some(tpu::content_digest(
-            Path::new(file),
-            tpu::IoMode::Buffered,
-        )?)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(e.into()),
+    // Digest directly, with no separate metadata existence check: a concurrent
+    // delete between a check and the digest would otherwise turn a clean
+    // "absent" into a spurious error. A NotFound from the digest's own open is
+    // mapped to Ok(None); any other I/O error propagates.
+    match tpu::content_digest(Path::new(file), tpu::IoMode::Buffered) {
+        Ok(v) => Ok(Some(v)),
+        Err(e) => match e.downcast_ref::<std::io::Error>() {
+            Some(ioe) if ioe.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            _ => Err(e),
+        },
+    }
+}
+
+/// Read-side `content_version` that is guaranteed to describe the bytes a read
+/// tool actually returned.
+///
+/// A read produces its output and then reports the file's version.  If a writer
+/// atomically swaps the file between those two steps, a naive digest-after-read
+/// would hand back a token for bytes the caller never saw — and a later
+/// `if_match` carrying that token could match the *new* file while the caller's
+/// edit was based on the *old* content (a lost update slipping past CAS).  This
+/// attaches the token only when the file's digest is identical immediately
+/// before and after the read (`before == after`), so a concurrent swap during
+/// the read yields *no* token (the caller re-reads) rather than a mismatched
+/// one.  ABA within a single read (change then revert to byte-identical content
+/// in the same window) is not distinguished, which is acceptable.
+fn stable_content_version(file: &str, before: Option<&str>) -> Option<String> {
+    let after = current_version(file).ok().flatten()?;
+    match before {
+        Some(b) if b == after => Some(after),
+        _ => None,
     }
 }
 
@@ -4093,6 +4121,39 @@ mod tests {
             .collect();
         let from_const: Vec<String> = TOOL_NAMES.iter().map(|s| (*s).to_owned()).collect();
         assert_eq!(from_const, from_list, "TOOL_NAMES out of sync with list()");
+    }
+
+    /// Regression (read-side TOCTOU): `stable_content_version` attaches the
+    /// token only when the pre-read snapshot still matches the current digest,
+    /// so a file swapped during the read yields no token instead of one that
+    /// describes bytes the caller never saw.
+    #[test]
+    fn stable_content_version_omits_token_when_file_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x.txt");
+        std::fs::write(&f, b"one\n").unwrap();
+        let fp = f.to_str().unwrap();
+
+        let cur = current_version(fp).unwrap().unwrap();
+        // Matching pre-snapshot → token attached.
+        assert_eq!(
+            stable_content_version(fp, Some(&cur)).as_deref(),
+            Some(cur.as_str())
+        );
+        // A stale pre-snapshot (as if a writer swapped mid-read) → no token.
+        assert!(stable_content_version(fp, Some("deadbeefdeadbeef")).is_none());
+        // No pre-snapshot at all → no token.
+        assert!(stable_content_version(fp, None).is_none());
+    }
+
+    /// Regression: `current_version` must report a missing file as `Ok(None)`
+    /// (a clean "absent", used for the conflict `actual_version: null` path),
+    /// not surface the digest's NotFound as an error.
+    #[test]
+    fn current_version_missing_file_is_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("does-not-exist.txt");
+        assert!(current_version(f.to_str().unwrap()).unwrap().is_none());
     }
 
     /// Regression: `invocation_header` must sanitize `pattern` alongside
