@@ -170,7 +170,7 @@ succession. A blind `tpu_write_file` (or a `tpu_edit_file` at line numbers)
 whose payload was computed from an earlier read can silently overwrite an
 edit that landed in between — a lost update.
 
-Every read (`tpu_read_file`, `read_head`, `read_tail`, `read_file_escaped`)
+Every read (`tpu_read_file`, `tpu_read_head`, `tpu_read_tail`, `tpu_read_file_escaped`)
 reports a `"content_version"` on its invocation-header line, and every
 successful write stamp reports the new `"content_version"`. This token is a
 content digest — it changes whenever the file's bytes change.
@@ -216,7 +216,7 @@ between the header and trailer.
 - **Structured tools** (count_file, stat_file, copy_file, render_file,
   setup+target, doctor) — result line
   `{"reason":"x-tpu-mcp-result",...}` followed by `{"status":"success"}`.
-- **Read tools** (read_file, read_head, read_tail, read_file_escaped) — header then raw content; no JSON trailer on success.
+- **Read tools** (tpu_read_file, tpu_read_head, tpu_read_tail, tpu_read_file_escaped) — header then raw content; no JSON trailer on success.
   The header line carries a `"content_version"` token for this file (see "Concurrent edits" above); pass it as `if_match` when you later edit the file.
   **Exception** — `tpu_read_file_binary` with a non-empty `hash` arg acts like a structured tool:
   `{"reason":"x-tpu-mcp-result","encoding":"bytes-base64","content":"<base64>","hashes":[...]}` followed by `{"status":"success"}`.
