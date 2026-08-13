@@ -202,14 +202,18 @@ pub struct ChangedRegion {
 pub struct RegionsRequest<'a> {
     /// Regions are appended here, one per match, in file order.
     pub regions_out: &'a mut Vec<ChangedRegion>,
-    /// Once the running total of `new_line_count` already collected reaches
-    /// this many lines, subsequent regions still report accurate
-    /// `start_line`/`end_line`/`new_line_count` but leave `new_text` empty
-    /// — this bounds retained text to roughly this many lines' worth
+    /// Once materialising a region's `new_text` would push the running
+    /// total of `new_line_count` already collected past this many lines,
+    /// that region (and every later one) still reports accurate
+    /// `start_line`/`end_line`/`new_line_count` but leaves `new_text` empty
+    /// — this bounds retained text to at most this many lines' worth
     /// rather than the full size of every match's replacement, which
     /// matters when there are many (or very large) matches whose combined
     /// echo will never actually be shown (see `tpu_replace_in_file`'s
-    /// `echo_max_lines`). `None` means no limit: always materialise text.
+    /// `echo_max_lines`). The check accounts for the candidate region's own
+    /// size, not just the running total, so a single match far larger than
+    /// the budget is never fully materialised. `None` means no limit:
+    /// always materialise text.
     pub text_budget_lines: Option<usize>,
 }
 
@@ -358,13 +362,19 @@ pub fn run(
                     newline_count + 1
                 }
             };
-            // Bound retained text to roughly `text_budget_lines` lines total
-            // (see RegionsRequest doc) rather than the full size of every
-            // match's replacement -- line-span numbers stay accurate either
-            // way, only `new_text` is left empty once over budget.
+            // Bound retained text to `text_budget_lines` lines total (see
+            // RegionsRequest doc) rather than the full size of every match's
+            // replacement -- line-span numbers stay accurate either way,
+            // only `new_text` is left empty once at/over budget. Checking
+            // `text_materialized + new_line_count` (not just
+            // `text_materialized`) against the budget matters: without it,
+            // a single match whose own `new_line_count` dwarfs the budget
+            // would still pass a `text_materialized < budget` check on the
+            // first match and fully materialise a huge `new_text` even
+            // though the echo can never use it.
             let under_budget = match req.text_budget_lines {
                 None => true,
-                Some(budget) => text_materialized < budget,
+                Some(budget) => text_materialized.saturating_add(new_line_count) <= budget,
             };
             let new_text = if under_budget {
                 text_materialized += new_line_count;
@@ -845,6 +855,27 @@ mod tests {
         assert_eq!(regions[2].new_text, "");
         assert_eq!(regions[2].new_line_count, 1);
         assert_eq!(regions[2].start_line, 6);
+    }
+
+    /// Regression: a single match whose own replacement dwarfs the budget
+    /// must not be fully materialised just because the running total was
+    /// still under budget beforehand -- the check must account for the
+    /// candidate region's own size (`text_materialized + new_line_count`),
+    /// not just the pre-match running total, or a huge first match defeats
+    /// the memory bound entirely.
+    #[test]
+    fn changed_region_single_huge_match_is_not_materialized_over_budget() {
+        let content = b"foo\nkeep\n";
+        let huge_replacement = "x\n".repeat(1000);
+        let regions =
+            replace_file_regions(content, "foo", huge_replacement.as_bytes(), false, Some(5));
+        assert_eq!(regions.len(), 1);
+        assert_eq!(regions[0].new_line_count, 1000);
+        assert_eq!(
+            regions[0].new_text, "",
+            "a single match whose new_line_count alone exceeds the budget must \
+             not be materialized, even though the running total started at 0"
+        );
     }
 
     /// Regression: `line_no` must track the line number of `scanned_to`,

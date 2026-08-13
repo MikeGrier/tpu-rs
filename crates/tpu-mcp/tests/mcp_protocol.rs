@@ -485,6 +485,53 @@ fn mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime() {
     );
 }
 
+/// Regression: a zero-match `tpu_replace_in_file` call is a no-op at the
+/// file-system level (M7-1 short-circuit), so it must not delete a
+/// pre-existing `<file>.bak` left over from an earlier, unrelated edit.
+/// Before the fix, `delete_bak_if_exists` ran unconditionally after the
+/// zero-match short-circuit, turning a supposed no-op into a destructive
+/// filesystem change.
+#[test]
+fn mcp_it_3c_replace_zero_match_does_not_delete_preexisting_bak() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("replace_zero_preexisting_bak.txt");
+    std::fs::write(
+        &f,
+        "hello world
+",
+    )
+    .unwrap();
+    let bak = f.with_extension("txt.bak");
+    std::fs::write(&bak, "stale backup from an earlier edit\n").unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let out = s.call_tool(
+        "tpu_replace_in_file",
+        json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "this_pattern_is_not_in_the_file",
+            "replacement": "REPLACEMENT",
+        }),
+    );
+    let stamp = last_json_line(&out);
+    assert_eq!(
+        stamp["status"].as_str(),
+        Some("success"),
+        "zero-match must still report success; got: {out:?}"
+    );
+    assert!(
+        bak.exists(),
+        "zero-match short-circuit must not delete a pre-existing .bak; got out={out:?}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&bak).unwrap(),
+        "stale backup from an earlier edit\n",
+        "pre-existing .bak content must be untouched"
+    );
+}
+
 /// MCP-IT-4: `\n` in a tpu_replace_in_file replacement string expands to a real
 /// newline rather than the two-character sequence backslash-n.
 ///
