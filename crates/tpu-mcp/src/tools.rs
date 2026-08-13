@@ -83,9 +83,9 @@ impl ToolResult {
 
 /// Build the first NDJSON line for any tool response.
 ///
-/// Large text fields (`content`, `replacement`, `template`) are replaced by
-/// a `"<N bytes>"` placeholder so the header stays compact.  All other
-/// arguments pass through as-is.
+/// Large text fields (`content`, `replacement`, `template`, `pattern`) are
+/// replaced by a `"<N bytes>"` placeholder so the header stays compact. All
+/// other arguments pass through as-is.
 ///
 /// Always includes a `"tpu_version"` field pinned to the `tpu-mcp` binary's
 /// own `CARGO_PKG_VERSION` at compile time.  A caller can compare it against
@@ -94,7 +94,10 @@ impl ToolResult {
 /// detect when the running binary is out of sync with the guidance the
 /// caller is following (M8 in `crates/tpu/CHECKLIST.md`).
 fn invocation_header(tool: &str, args: &Value) -> String {
-    const LARGE_FIELDS: &[&str] = &["content", "replacement", "template"];
+    // `pattern` is included alongside the replacement-side fields because
+    // pattern_format's base64/hex channel makes it just as likely to carry
+    // a large, inflated-vs-UTF-8 payload as `replacement` does.
+    const LARGE_FIELDS: &[&str] = &["content", "replacement", "template", "pattern"];
     let mut sanitized = args.clone();
     for field in LARGE_FIELDS {
         if let Some(obj) = sanitized.as_object_mut() {
@@ -3887,6 +3890,31 @@ mod tests {
             .collect();
         let from_const: Vec<String> = TOOL_NAMES.iter().map(|s| (*s).to_owned()).collect();
         assert_eq!(from_const, from_list, "TOOL_NAMES out of sync with list()");
+    }
+
+    /// Regression: `invocation_header` must sanitize `pattern` alongside
+    /// `content`/`replacement`/`template`. `pattern_format`'s base64/hex
+    /// channel makes `pattern` just as likely to carry a large payload as
+    /// `replacement`, and the header would otherwise defeat its own
+    /// header-size mitigation by echoing it verbatim.
+    #[test]
+    fn invocation_header_sanitizes_pattern_field() {
+        let big_pattern = "x".repeat(10_000);
+        let header = invocation_header(
+            "tpu_replace_in_file",
+            &serde_json::json!({ "file": "f.txt", "pattern": big_pattern, "count": true }),
+        );
+        let v: serde_json::Value = serde_json::from_str(&header).unwrap();
+        assert_eq!(
+            v["args"]["pattern"].as_str(),
+            Some("<10000 bytes>"),
+            "large `pattern` must be replaced with a byte-count placeholder; got: {header}"
+        );
+        assert_eq!(
+            v["args"]["file"].as_str(),
+            Some("f.txt"),
+            "non-large fields must pass through unchanged; got: {header}"
+        );
     }
 
     /// Regression: `render_changed_regions`'s hunk-header NEW-side start
