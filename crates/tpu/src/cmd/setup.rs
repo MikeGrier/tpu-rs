@@ -182,8 +182,11 @@ between the header and trailer.
   `dry_run:true` (replace only): optional diff lines, then `{"status":"success","changed":true|false}`.
   `count:true` (replace only): `{"status":"success","count":N}`.
   `append diff:true`: diff lines when changed, then `{"status":"success","file":"...","changed":true|false}`.
-  `tpu_replace_in_file` on a real write additionally reports `"changed_lines":N` in the status,
-  and — as long as N is at most `echo_max_lines` (default 5) — automatically prepends a
+  `tpu_replace_in_file` on a real write additionally reports `"changed_lines":N` in the status —
+  the sum, over every match, of `(old span line count) + (new text line count)`; this is a
+  cheap per-match total, NOT a deduplicated count of unique file lines, so two matches on the
+  same line each contribute their own share and can push N above the file's actual line count —
+  and, as long as N is at most `echo_max_lines` (default 5), automatically prepends a
   compact changed-region preview (unified-diff-style hunk headers, new lines only — no
   full-file diff) even without `diff:true`; a larger change instead adds
   `"diff_omitted":true` (pass `diff:true` for a full old/new unified diff regardless of size).
