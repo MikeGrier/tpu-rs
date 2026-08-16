@@ -62,7 +62,7 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Install Rust toolchain (${{ matrix.rust_target }})
-        uses: dtolnay/rust-toolchain@1.96.0
+        uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: ${{ matrix.rust_target }}
 
