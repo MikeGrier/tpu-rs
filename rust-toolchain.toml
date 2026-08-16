@@ -2,5 +2,5 @@
 # development and CI to a single, reproducible version.  This must stay in
 # lock-step with [workspace.package].rust-version in Cargo.toml (the MSRV).
 [toolchain]
-channel    = "1.96.0"
+channel    = "1.97.0"
 components = ["clippy", "rustfmt"]

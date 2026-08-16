@@ -241,6 +241,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "803d13fb3b09d88be9f4dbc29062c66b19bf7170867ceb746d2a8689bf6c7a26"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
+name = "crossbeam-utils"
+version = "0.8.22"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "61803da095bee82a81bb1a452ecc25d3b2f1416d1897eb86430c6159ef717c17"
+
+[[package]]
 name = "crypto-common"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1080,16 +1095,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "globset"
-version = "0.4.20"
+name = "globazog"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "07c34a9410465b45bd9787443bc7370f37735bad04b0f0cd57ff1a3186c98988"
+checksum = "787d6e53edeeec9b36a6efac3a713b82e271e9ff241ee0c6df740ef53040b521"
 dependencies = [
- "aho-corasick",
- "bstr",
- "log",
- "regex-automata",
- "regex-syntax",
+ "bitflags 2.13.1",
+ "crossbeam-queue",
+ "rustix",
+ "thiserror",
+ "windows-sys",
 ]
 
 [[package]]
@@ -1692,7 +1707,7 @@ dependencies = [
  "crc32fast",
  "encoding_rs",
  "gix",
- "globset",
+ "globazog",
  "harrier",
  "md-5",
  "memmap2",
@@ -1702,7 +1717,6 @@ dependencies = [
  "serde_json",
  "similar",
  "tempfile",
- "walkdir",
  "windows-sys",
 ]
 

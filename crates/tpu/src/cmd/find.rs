@@ -35,10 +35,8 @@ use std::{
     sync::Arc,
 };
 
-use globset::Glob;
 use harrier::{encoding::SourceConfig, lines::LineTerminator, source::Source};
 use regex::Regex;
-use walkdir::WalkDir;
 
 use crate::IoMode;
 
@@ -153,22 +151,11 @@ pub fn expand_paths_with_policy(
 ) -> Result<Vec<PathBuf>, Box<dyn std::error::Error>> {
     let mut paths: Vec<PathBuf> = Vec::new();
 
-    // Pre-compile the filename matcher once when `glob` is supplied so we
-    // don't recompile per spec.
-    let glob_matcher = match glob {
-        Some(g) => Some(
-            Glob::new(g)
-                .map_err(|e| format!("find: invalid glob {:?}: {e}", g))?
-                .compile_matcher(),
-        ),
-        None => None,
-    };
-
     for &spec in path_specs {
         let is_glob =
             spec.contains('*') || spec.contains('?') || spec.contains('[') || spec.contains('{');
 
-        if let Some(ref matcher) = glob_matcher {
+        if let Some(g) = glob {
             // `glob` mode: every spec is either a directory (walked and
             // filtered by the glob) or a literal file (included as-is).
             // Mixing in a glob-shaped path spec is ambiguous, so reject.
@@ -184,40 +171,16 @@ pub fn expand_paths_with_policy(
             let p = PathBuf::from(spec);
             if p.is_dir() {
                 let before = paths.len();
-                for entry in WalkDir::new(&p) {
-                    let entry = match entry {
-                        Ok(e) => e,
-                        Err(e) => match on_error {
-                            crate::cmd::copy::OnError::Fail => {
-                                return Err(format!("find: walk error in {spec:?}: {e}").into());
-                            }
-                            crate::cmd::copy::OnError::Warn => {
-                                let path_hint = e
-                                    .path()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or_else(|| "?".to_string());
-                                warnings_out.push(format!("find: cannot access {path_hint}: {e}"));
-                                continue;
-                            }
-                        },
-                    };
-                    if entry.file_type().is_file() {
-                        // Match the path relative to the walk root so the
-                        // glob is anchored at the user-supplied directory,
-                        // not at CWD.
-                        let rel = entry.path().strip_prefix(&p).unwrap_or(entry.path());
-                        if matcher.is_match(rel) {
-                            paths.push(entry.path().to_path_buf());
-                        }
-                    }
+                // The glob is anchored at the user-supplied directory: walk
+                // reports files whose path relative to `p` matches `g`.
+                let found = crate::walk::walk(&p, g, &[], on_error, "find", warnings_out)?;
+                for rel in found.files {
+                    paths.push(p.join(rel));
                 }
                 if paths.len() == before {
-                    return Err(format!(
-                        "find: glob {:?} matched no files under {:?}",
-                        glob.unwrap(),
-                        spec,
-                    )
-                    .into());
+                    return Err(
+                        format!("find: glob {:?} matched no files under {:?}", g, spec,).into(),
+                    );
                 }
             } else {
                 // Literal file path: include as-is. The caller explicitly
@@ -229,33 +192,11 @@ pub fn expand_paths_with_policy(
 
         // ── Legacy mode (no separate `glob`) ──────────────────────────────
         if is_glob {
-            let matcher = Glob::new(spec)
-                .map_err(|e| format!("find: invalid glob {:?}: {e}", spec))?
-                .compile_matcher();
             let before = paths.len();
-            for entry in WalkDir::new(".") {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(e) => match on_error {
-                        crate::cmd::copy::OnError::Fail => {
-                            return Err(format!("find: glob walk error: {e}").into());
-                        }
-                        crate::cmd::copy::OnError::Warn => {
-                            let path_hint = e
-                                .path()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "?".to_string());
-                            warnings_out.push(format!("find: cannot access {path_hint}: {e}"));
-                            continue;
-                        }
-                    },
-                };
-                if entry.file_type().is_file() {
-                    let rel = entry.path().strip_prefix(".").unwrap_or(entry.path());
-                    if matcher.is_match(rel) {
-                        paths.push(entry.path().to_path_buf());
-                    }
-                }
+            let found =
+                crate::walk::walk(Path::new("."), spec, &[], on_error, "find", warnings_out)?;
+            for rel in found.files {
+                paths.push(Path::new(".").join(rel));
             }
             if paths.len() == before {
                 return Err(format!("find: glob {:?} matched no files", spec).into());
