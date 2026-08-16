@@ -11,6 +11,7 @@ pub mod output;
 pub mod rsp;
 pub mod shell;
 pub mod test_fixtures;
+pub mod walk;
 
 use std::{
     error::Error,

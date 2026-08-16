@@ -94,19 +94,18 @@ use std::{
     sync::Arc,
 };
 
-use globset::{Glob, GlobSet, GlobSetBuilder};
 use harrier::{
     encoding::{LineEnding, SourceConfig},
     source::Source,
 };
 use serde_json::json;
-use walkdir::WalkDir;
 
 use crate::{
     IoMode,
     encoding::{BomPolicy, OutputEncoding},
     git::{self, EolMismatch},
     mojibake::{self, Pattern},
+    walk::GlobMatcher,
 };
 
 // ── Public option / record types ────────────────────────────────────────────
@@ -286,35 +285,18 @@ fn expand_paths_with_policy(
             spec.contains('*') || spec.contains('?') || spec.contains('[') || spec.contains('{');
 
         if is_glob {
-            let matcher = Glob::new(spec)
-                .map_err(|e| format!("doctor: invalid glob {spec:?}: {e}"))?
-                .compile_matcher();
-            for entry in WalkDir::new(".")
-                .into_iter()
-                .filter_entry(|e| !is_skipped_dir(e))
-            {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(e) => match on_error {
-                        crate::cmd::copy::OnError::Fail => {
-                            return Err(format!("doctor: glob walk error: {e}").into());
-                        }
-                        crate::cmd::copy::OnError::Warn => {
-                            let path_hint = e
-                                .path()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "?".to_string());
-                            warnings_out.push(format!("doctor: cannot access {path_hint}: {e}"));
-                            continue;
-                        }
-                    },
-                };
-                if !entry.file_type().is_file() {
-                    continue;
-                }
-                let rel = entry.path().strip_prefix(".").unwrap_or(entry.path());
-                if matcher.is_match(rel) && !is_binary_extension(entry.path()) {
-                    push_unique(&mut paths, &mut seen, entry.path().to_path_buf());
+            let found = crate::walk::walk(
+                Path::new("."),
+                spec,
+                SKIP_DIRS,
+                on_error,
+                "doctor",
+                warnings_out,
+            )?;
+            for rel in found.files {
+                let path = Path::new(".").join(&rel);
+                if !is_binary_extension(&path) {
+                    push_unique(&mut paths, &mut seen, path);
                 }
             }
             continue;
@@ -348,40 +330,18 @@ fn expand_paths_with_policy(
 
         if meta.is_dir() {
             let ignore = load_gitignore(&p);
-            for entry in WalkDir::new(&p)
-                .into_iter()
-                .filter_entry(|e| !is_skipped_dir(e))
-            {
-                let entry = match entry {
-                    Ok(e) => e,
-                    Err(e) => match on_error {
-                        crate::cmd::copy::OnError::Fail => {
-                            return Err(format!("doctor: walk error: {e}").into());
-                        }
-                        crate::cmd::copy::OnError::Warn => {
-                            let path_hint = e
-                                .path()
-                                .map(|p| p.display().to_string())
-                                .unwrap_or_else(|| "?".to_string());
-                            warnings_out.push(format!("doctor: cannot access {path_hint}: {e}"));
-                            continue;
-                        }
-                    },
-                };
-                if !entry.file_type().is_file() {
+            let found = crate::walk::walk(&p, "**/*", SKIP_DIRS, on_error, "doctor", warnings_out)?;
+            for rel in found.files {
+                let path = p.join(&rel);
+                if is_binary_extension(&path) {
                     continue;
                 }
-                let path = entry.path();
-                if is_binary_extension(path) {
+                if let Some(set) = &ignore
+                    && set.is_match(&rel)
+                {
                     continue;
                 }
-                if let Some(set) = &ignore {
-                    let rel = path.strip_prefix(&p).unwrap_or(path);
-                    if set.is_match(rel) {
-                        continue;
-                    }
-                }
-                push_unique(&mut paths, &mut seen, path.to_path_buf());
+                push_unique(&mut paths, &mut seen, path);
             }
             continue;
         }
@@ -406,52 +366,39 @@ fn push_unique(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, p: PathBuf
     }
 }
 
-/// Skip `.git/`, `node_modules/`, and `target/` subtrees during walks.
-/// These are virtually always either binary, generated, or already
-/// classified by their own checkers — and they would otherwise dominate
-/// the report.
-pub(crate) fn is_skipped_dir(entry: &walkdir::DirEntry) -> bool {
-    if !entry.file_type().is_dir() {
-        return false;
-    }
-    let name = entry.file_name().to_string_lossy();
-    matches!(name.as_ref(), ".git" | "node_modules" | "target")
-}
+/// Directory names whose subtrees are skipped during walks: `.git/`,
+/// `node_modules/`, and `target/`. These are virtually always either binary,
+/// generated, or already classified by their own checkers — and they would
+/// otherwise dominate the report.
+pub(crate) const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target"];
 
 /// Load `<root>/.gitignore` if present and compile its non-comment
-/// non-empty lines into a [`GlobSet`].  Negation lines (starting with `!`)
+/// non-empty lines into a [`GlobMatcher`].  Negation lines (starting with `!`)
 /// are ignored to keep the implementation conservative — the doctor
 /// walks files; it does not need to be a perfect gitignore engine.
-fn load_gitignore(root: &Path) -> Option<GlobSet> {
+fn load_gitignore(root: &Path) -> Option<GlobMatcher> {
     let content = fs::read_to_string(root.join(".gitignore")).ok()?;
-    let mut builder = GlobSetBuilder::new();
+    let mut matcher = GlobMatcher::new();
     let mut any = false;
     for line in content.lines() {
         let s = line.trim();
         if s.is_empty() || s.starts_with('#') || s.starts_with('!') {
             continue;
         }
-        // Trailing-slash means "directory" — globset doesn't use that
-        // syntax; expand to `dir/**`.
+        // Trailing-slash means "directory"; expand to `dir/**`.
         let pat = if let Some(stripped) = s.strip_suffix('/') {
             format!("{stripped}/**")
         } else {
             s.to_string()
         };
         // Allow both root-anchored and any-depth matches.
-        if let Ok(g) = Glob::new(&pat) {
-            builder.add(g);
-            any = true;
-        }
-        if let Ok(g) = Glob::new(&format!("**/{pat}")) {
-            builder.add(g);
-            any = true;
-        }
+        any |= matcher.add(&pat);
+        any |= matcher.add(&format!("**/{pat}"));
     }
     if !any {
         return None;
     }
-    builder.build().ok()
+    Some(matcher)
 }
 
 // ── Per-file diagnosis ──────────────────────────────────────────────────────
@@ -1284,27 +1231,35 @@ mod tests {
         fs::create_dir(tmp.path().join(".git")).unwrap();
         fs::create_dir(tmp.path().join("target")).unwrap();
         fs::create_dir(tmp.path().join("src")).unwrap();
-        let mut found_src = false;
-        let mut found_skipped = false;
-        for e in WalkDir::new(tmp.path())
-            .into_iter()
-            .filter_entry(|e| !is_skipped_dir(e))
-        {
-            let e = e.unwrap();
-            let n = e.file_name().to_string_lossy().to_string();
-            if n == "src" {
-                found_src = true;
-            }
-            if n == ".git" || n == "target" {
-                // only top-level entry survives the filter (it's checked
-                // *before* being yielded, so we still see the dir itself).
-                if e.depth() > 0 {
-                    found_skipped = true;
-                }
-            }
-        }
-        assert!(found_src);
-        assert!(!found_skipped, "should not descend into .git or target");
+        fs::write(tmp.path().join("src/keep.txt"), b"x").unwrap();
+        fs::write(tmp.path().join(".git/config"), b"x").unwrap();
+        fs::write(tmp.path().join("target/out.txt"), b"x").unwrap();
+
+        let mut warnings = Vec::new();
+        let found = crate::walk::walk(
+            tmp.path(),
+            "**/*",
+            SKIP_DIRS,
+            crate::cmd::copy::OnError::Warn,
+            "doctor",
+            &mut warnings,
+        )
+        .unwrap();
+        let names: Vec<String> = found
+            .files
+            .iter()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+            .collect();
+        assert!(
+            names.iter().any(|n| n.ends_with("src/keep.txt")),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| n.contains(".git") || n.contains("target")),
+            "should not descend into .git or target: {names:?}"
+        );
     }
 
     #[test]

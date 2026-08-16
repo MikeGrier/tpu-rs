@@ -28,9 +28,6 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use globset::Glob;
-use walkdir::WalkDir;
-
 use crate::shell::Shell;
 
 /// Lexically resolve `.` and `..` in `path` without touching the filesystem.
@@ -146,10 +143,6 @@ pub fn run(
 
     // Glob expansion: the source spec contains a glob meta-character.
     if is_glob(source) {
-        let matcher = Glob::new(source)
-            .map_err(|e| format!("copy: invalid glob {source:?}: {e}"))?
-            .compile_matcher();
-
         // Destination must be a directory (or be created as one) so that
         // each glob match can be placed within it using the source file's
         // leaf name.  Note: two matched files with the same leaf name will
@@ -166,14 +159,15 @@ pub fn run(
         // If dest already exists we skip the create on the first match.
         let mut dest_ready = dest.exists();
 
-        // Walk from the appropriate root: for absolute patterns the anchor
-        // directory (longest non-glob prefix) is used so that entry paths are
-        // absolute and the matcher can compare them against the full pattern.
+        // Split the pattern into a physical walk root (the longest non-glob
+        // prefix directory) and the remainder matched relative to it. An
+        // absolute pattern anchors at that prefix; a relative one walks from
+        // the current directory.
         let first_meta = source.bytes().position(|b| b"*?[{".contains(&b));
         let anchor_str = first_meta.map(|i| &source[..i]).unwrap_or(source);
         let anchor_path = Path::new(anchor_str);
-        let (walk_root, absolute_walk) = if anchor_path.is_absolute() {
-            // When the anchor_str already ends with a path separator the Path
+        let walk_root = if anchor_path.is_absolute() {
+            // When the anchor already ends with a path separator the Path
             // already represents the directory to search; calling `.parent()`
             // would walk one level too high (e.g. `/repo/src/` → `/repo`).
             let ends_with_sep =
@@ -186,44 +180,47 @@ pub fn run(
                     .filter(|p| !p.as_os_str().is_empty())
                     .unwrap_or(anchor_path)
             };
-            (root.to_path_buf(), true)
+            root.to_path_buf()
         } else {
-            (PathBuf::from("."), false)
+            PathBuf::from(".")
         };
+        // The pattern relative to `walk_root`: for an absolute source, strip
+        // the root prefix; a relative source is already root-relative.
+        let rel_pattern: String = if anchor_path.is_absolute() {
+            let root_str = walk_root.to_string_lossy();
+            source
+                .strip_prefix(root_str.as_ref())
+                .unwrap_or(source)
+                .trim_start_matches(['/', '\\'])
+                .to_string()
+        } else {
+            source.to_string()
+        };
+
+        let mut warnings: Vec<String> = Vec::new();
+        let found = crate::walk::walk(
+            &walk_root,
+            &rel_pattern,
+            crate::cmd::doctor::SKIP_DIRS,
+            opts.on_error,
+            "copy",
+            &mut warnings,
+        )?;
+        for w in warnings {
+            report.warnings += 1;
+            let _ = shell.warn(w);
+        }
+
         // Track how many entries the glob matched regardless of whether each
         // copy succeeded or was skipped.  This is kept separate from
         // `report.copied + report.skipped` so that warn-mode failures (which
         // increment `report.warnings` but not copied/skipped) don't falsely
         // trip the no-match guard below.
         let mut matched: usize = 0;
-        for entry in WalkDir::new(&walk_root)
-            .into_iter()
-            .filter_entry(|e| !crate::cmd::doctor::is_skipped_dir(e))
-        {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    report.warnings += 1;
-                    if matches!(opts.on_error, OnError::Fail) {
-                        return Err(format!("copy: glob walk: {e}").into());
-                    }
-                    let _ = shell.warn(format!("copy: glob walk: {e}"));
-                    continue;
-                }
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let match_path = if absolute_walk {
-                entry.path()
-            } else {
-                entry.path().strip_prefix(".").unwrap_or(entry.path())
-            };
-            if !matcher.is_match(match_path) {
-                continue;
-            }
-            let leaf = match entry.path().file_name() {
-                Some(n) => n,
+        for rel in found.files {
+            let src_path = walk_root.join(&rel);
+            let leaf = match rel.file_name() {
+                Some(n) => n.to_owned(),
                 None => continue,
             };
             matched += 1;
@@ -235,8 +232,8 @@ pub fn run(
                 })?;
                 dest_ready = true;
             }
-            let target = dest.join(leaf);
-            copy_one(entry.path(), &target, &opts, shell, &mut report)?;
+            let target = dest.join(&leaf);
+            copy_one(&src_path, &target, &opts, shell, &mut report)?;
         }
         // A glob that matched nothing is always an error — a typo in the
         // pattern would otherwise silently create an empty destination
@@ -288,45 +285,30 @@ pub fn run(
         // Directory copy: walk SRC, mirror structure under DEST.
         fs::create_dir_all(dest)
             .map_err(|e| format!("copy: cannot create destination {}: {e}", dest.display()))?;
-        let walker = WalkDir::new(src_path).into_iter();
-        for entry in walker {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    report.warnings += 1;
-                    if matches!(opts.on_error, OnError::Fail) {
-                        return Err(format!("copy: walk: {e}").into());
-                    }
-                    let path_hint = e
-                        .path()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| "?".to_string());
-                    let _ = shell.warn(format!("copy: cannot access {path_hint}: {e}"));
-                    continue;
-                }
-            };
-            let rel = match entry.path().strip_prefix(src_path) {
-                Ok(r) => r,
-                Err(_) => continue,
-            };
-            if rel.as_os_str().is_empty() {
-                // The walk root itself.
-                continue;
-            }
+        let mut warnings: Vec<String> = Vec::new();
+        // `**/*` enumerates every entry below SRC; symbolic links and reparse
+        // points are never followed. Directories (including empty ones) come
+        // back via `dirs`; regular files via `files`.
+        let found = crate::walk::walk(src_path, "**/*", &[], opts.on_error, "copy", &mut warnings)?;
+        for w in warnings {
+            report.warnings += 1;
+            let _ = shell.warn(w);
+        }
+        // Recreate the directory structure first so every file's parent exists.
+        for rel in &found.dirs {
             let target = dest.join(rel);
-            if entry.file_type().is_dir() {
-                if let Err(e) = fs::create_dir_all(&target) {
-                    report.warnings += 1;
-                    if matches!(opts.on_error, OnError::Fail) {
-                        return Err(format!("copy: mkdir {}: {e}", target.display()).into());
-                    }
-                    let _ = shell.warn(format!("copy: mkdir {}: {e}", target.display()));
+            if let Err(e) = fs::create_dir_all(&target) {
+                report.warnings += 1;
+                if matches!(opts.on_error, OnError::Fail) {
+                    return Err(format!("copy: mkdir {}: {e}", target.display()).into());
                 }
-            } else if entry.file_type().is_file() {
-                copy_one(entry.path(), &target, &opts, shell, &mut report)?;
+                let _ = shell.warn(format!("copy: mkdir {}: {e}", target.display()));
             }
-            // Symlinks and other entry types are silently ignored — keep
-            // the surface area small until there is a documented need.
+        }
+        for rel in &found.files {
+            let src_file = src_path.join(rel);
+            let target = dest.join(rel);
+            copy_one(&src_file, &target, &opts, shell, &mut report)?;
         }
         return Ok(report);
     }

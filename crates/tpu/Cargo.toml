@@ -35,8 +35,7 @@ tempfile    = "3"
 similar = "2.7.0"
 md-5 = "0.10"
 crc32fast = "1"
-globset = "0.4"
-walkdir = "2"
+globazog = "0.2"
 # Git-aware line-ending detection: pure-Rust gitoxide. `attributes` pulls in
 # gix-filter (eol), gix-attributes, excludes and index support; `sha1`
 # satisfies gix's requirement that at least one hash algorithm be enabled.

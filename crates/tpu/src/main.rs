@@ -9,6 +9,7 @@ mod mojibake;
 mod output;
 mod rsp;
 mod shell;
+mod walk;
 
 use std::{fs, io, path::PathBuf};
 
