@@ -1,5 +1,23 @@
 # Changelog
 
+## [1.3.0](https://github.com/MikeGrier/tpu-rs/compare/v1.2.0...v1.3.0) (2026-08-17)
+
+
+### Features
+
+* **tpu:** swap globset+walkdir for the globazog globbing engine ([fbbf2f2](https://github.com/MikeGrier/tpu-rs/commit/fbbf2f22306c4d360fb1a69d36d8b1c0d52c930e))
+
+
+### Bug Fixes
+
+* **tpu:** address PR [#59](https://github.com/MikeGrier/tpu-rs/issues/59) review — actionable walk errors, robust abs-glob rel derivation ([545918a](https://github.com/MikeGrier/tpu-rs/commit/545918a240176fd6a981c467de2862505fca97b7))
+* **tpu:** correct walk docs and handle absolute globs in find/doctor ([74fa3b6](https://github.com/MikeGrier/tpu-rs/commit/74fa3b62a44aea02a596e5270ff44d521c80c7a7))
+
+
+### Performance Improvements
+
+* **tpu:** cache container paths and retire them on ContainerEnd ([f365aec](https://github.com/MikeGrier/tpu-rs/commit/f365aec9c5b34301d212e83147182ad41f73c97f))
+
 ## [1.2.0](https://github.com/MikeGrier/tpu-rs/compare/v1.1.0...v1.2.0) (2026-08-13)
 
 
