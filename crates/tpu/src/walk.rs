@@ -10,12 +10,12 @@
 //! Two surfaces are exposed:
 //!
 //! - [`walk`] — enumerate a directory tree, returning the files that match a
-//!   glob pattern and the directories that were entered, as paths relative to
-//!   the walk root. Callers join the root back on to obtain full paths (which
-//!   preserves the caller's original — possibly relative — root prefix).
-//! - [`walk_each`] — the same traversal, but delivered entry-by-entry to a
-//!   callback so callers processing very large trees (e.g. recursive copy)
-//!   need not materialize the whole listing first.
+//!   glob pattern, as paths relative to the walk root. Callers join the root
+//!   back on to obtain full paths (which preserves the caller's original —
+//!   possibly relative — root prefix).
+//! - [`walk_each`] — the same traversal, but delivered entry-by-entry
+//!   (directories and files) to a callback so callers processing very large
+//!   trees (e.g. recursive copy) need not materialize the whole listing first.
 //! - [`GlobMatcher`] — a standalone glob matcher over already-known relative
 //!   paths (used for `.gitignore` filtering), replacing `globset::GlobSet`.
 
@@ -53,8 +53,7 @@ pub enum Entry {
     File(PathBuf),
 }
 
-/// Walk `root` with globazog, collecting files that match `pattern` and the
-/// directories that were entered.
+/// Walk `root` with globazog, collecting the files that match `pattern`.
 ///
 /// `pattern` is a [`Dialect::Posix`] glob (case-sensitive, `/` separators,
 /// `*` / `?` / `**` / `{a,b}`) matched against each entry's path relative to
@@ -92,6 +91,43 @@ pub fn walk(
         },
     )?;
     Ok(out)
+}
+
+/// Split a glob `spec` into a physical walk root and the pattern relative to
+/// that root, so it can be handed to [`walk`] / [`walk_each`] (whose patterns
+/// are matched relative to the root).
+///
+/// An **absolute** spec anchors at the longest non-glob prefix directory
+/// (e.g. `/repo/src/**/*.rs` → root `/repo/src`, pattern `**/*.rs`), which
+/// keeps it working regardless of `/` vs `\` separators. A **relative** spec
+/// walks from `.` with the spec used verbatim. Rejoin `root.join(rel)` on each
+/// result to reconstruct full paths.
+pub fn split_glob_root(spec: &str) -> (PathBuf, String) {
+    let first_meta = spec.bytes().position(|b| b"*?[{".contains(&b));
+    let anchor_str = first_meta.map(|i| &spec[..i]).unwrap_or(spec);
+    let anchor_path = Path::new(anchor_str);
+    if !anchor_path.is_absolute() {
+        return (PathBuf::from("."), spec.to_string());
+    }
+    // When the anchor already ends with a separator it is itself the directory
+    // to search; otherwise its parent is (the trailing element is a partial
+    // file/dir name that belongs to the pattern).
+    let ends_with_sep =
+        anchor_str.ends_with('/') || anchor_str.ends_with(std::path::MAIN_SEPARATOR);
+    let root = if ends_with_sep {
+        anchor_path.to_path_buf()
+    } else {
+        anchor_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(anchor_path)
+            .to_path_buf()
+    };
+    // The pattern is everything after the final separator of the non-glob
+    // prefix. Slicing by prefix length (rather than a string strip against the
+    // rendered root) stays correct regardless of `/` vs `\` separators.
+    let rel_start = anchor_str.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+    (root, spec[rel_start..].to_string())
 }
 
 /// Like [`walk`] but invokes `sink` for each [`Entry`] as it is discovered,
@@ -261,5 +297,37 @@ impl GlobMatcher {
             .collect();
         let segs: Vec<&[CodePoint]> = owned.iter().map(|v| v.as_slice()).collect();
         !self.set.matches(&segs).is_empty()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn split_relative_glob_walks_dot() {
+        let (root, pat) = split_glob_root("sub/*.rs");
+        assert_eq!(root, PathBuf::from("."));
+        assert_eq!(pat, "sub/*.rs");
+    }
+
+    #[test]
+    fn split_absolute_glob_anchors_at_prefix() {
+        let base = if cfg!(windows) {
+            "C:/repo/src"
+        } else {
+            "/repo/src"
+        };
+        let (root, pat) = split_glob_root(&format!("{base}/**/*.rs"));
+        assert_eq!(root, PathBuf::from(base));
+        assert_eq!(pat, "**/*.rs");
+    }
+
+    #[test]
+    fn split_absolute_glob_with_partial_leaf() {
+        let base = if cfg!(windows) { "C:/repo" } else { "/repo" };
+        let (root, pat) = split_glob_root(&format!("{base}/foo*.rs"));
+        assert_eq!(root, PathBuf::from(base));
+        assert_eq!(pat, "foo*.rs");
     }
 }

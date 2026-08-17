@@ -163,38 +163,7 @@ pub fn run(
         // prefix directory) and the remainder matched relative to it. An
         // absolute pattern anchors at that prefix; a relative one walks from
         // the current directory.
-        let first_meta = source.bytes().position(|b| b"*?[{".contains(&b));
-        let anchor_str = first_meta.map(|i| &source[..i]).unwrap_or(source);
-        let anchor_path = Path::new(anchor_str);
-        let walk_root = if anchor_path.is_absolute() {
-            // When the anchor already ends with a path separator the Path
-            // already represents the directory to search; calling `.parent()`
-            // would walk one level too high (e.g. `/repo/src/` → `/repo`).
-            let ends_with_sep =
-                anchor_str.ends_with('/') || anchor_str.ends_with(std::path::MAIN_SEPARATOR);
-            let root = if ends_with_sep {
-                anchor_path
-            } else {
-                anchor_path
-                    .parent()
-                    .filter(|p| !p.as_os_str().is_empty())
-                    .unwrap_or(anchor_path)
-            };
-            root.to_path_buf()
-        } else {
-            PathBuf::from(".")
-        };
-        // The pattern relative to `walk_root`: everything in the source after
-        // the final separator of the non-glob prefix. Slicing by the prefix
-        // length (rather than a string strip against the rendered walk_root)
-        // stays correct regardless of `/` vs `\` separators — e.g. an absolute
-        // glob written with forward slashes on Windows (`C:/repo/**/*.rs`).
-        let rel_pattern: String = if anchor_path.is_absolute() {
-            let rel_start = anchor_str.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
-            source[rel_start..].to_string()
-        } else {
-            source.to_string()
-        };
+        let (walk_root, rel_pattern) = crate::walk::split_glob_root(source);
 
         let mut warnings: Vec<String> = Vec::new();
         let found = crate::walk::walk(
