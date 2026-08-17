@@ -286,28 +286,38 @@ pub fn run(
             .map_err(|e| format!("copy: cannot create destination {}: {e}", dest.display()))?;
         let mut warnings: Vec<String> = Vec::new();
         // `**/*` enumerates every entry below SRC; symbolic links and reparse
-        // points are never followed. Directories (including empty ones) come
-        // back via `dirs`; regular files via `files`.
-        let found = crate::walk::walk(src_path, "**/*", &[], opts.on_error, "copy", &mut warnings)?;
+        // points are never followed. Entries stream in traversal order (a
+        // directory before anything inside it) so a file's parent is created
+        // before the file is copied, without buffering the whole tree.
+        crate::walk::walk_each(
+            src_path,
+            "**/*",
+            &[],
+            opts.on_error,
+            "copy",
+            &mut warnings,
+            |entry| match entry {
+                crate::walk::Entry::Dir(rel) => {
+                    let target = dest.join(&rel);
+                    if let Err(e) = fs::create_dir_all(&target) {
+                        report.warnings += 1;
+                        if matches!(opts.on_error, OnError::Fail) {
+                            return Err(format!("copy: mkdir {}: {e}", target.display()).into());
+                        }
+                        let _ = shell.warn(format!("copy: mkdir {}: {e}", target.display()));
+                    }
+                    Ok(())
+                }
+                crate::walk::Entry::File(rel) => {
+                    let src_file = src_path.join(&rel);
+                    let target = dest.join(&rel);
+                    copy_one(&src_file, &target, &opts, shell, &mut report)
+                }
+            },
+        )?;
         for w in warnings {
             report.warnings += 1;
             let _ = shell.warn(w);
-        }
-        // Recreate the directory structure first so every file's parent exists.
-        for rel in &found.dirs {
-            let target = dest.join(rel);
-            if let Err(e) = fs::create_dir_all(&target) {
-                report.warnings += 1;
-                if matches!(opts.on_error, OnError::Fail) {
-                    return Err(format!("copy: mkdir {}: {e}", target.display()).into());
-                }
-                let _ = shell.warn(format!("copy: mkdir {}: {e}", target.display()));
-            }
-        }
-        for rel in &found.files {
-            let src_file = src_path.join(rel);
-            let target = dest.join(rel);
-            copy_one(&src_file, &target, &opts, shell, &mut report)?;
         }
         return Ok(report);
     }
