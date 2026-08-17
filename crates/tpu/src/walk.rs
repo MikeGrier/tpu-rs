@@ -186,21 +186,30 @@ pub fn walk_each(
         .map_err(|e| format!("{label}: invalid glob {pattern:?}: {e}"))?;
 
     let ring = handle.completions();
-    // ContainerId -> (parent, own name); a root's name is `None`.
-    let mut containers: HashMap<ContainerId, (Option<ContainerId>, Option<String>)> =
-        HashMap::new();
+    // ContainerId -> its path relative to the walk root, cached at enter so
+    // each match is an O(1) lookup rather than an O(depth) parent-chain walk.
+    // Entries are retired on ContainerEnd to keep the map bounded (~the live
+    // frontier) on large trees.
+    let mut containers: HashMap<ContainerId, PathBuf> = HashMap::new();
 
     loop {
         match ring.wait_pop() {
             CqItem::ContainerEnter(e) => {
-                let name = match e.name {
-                    ContainerName::Entry(n) => Some(n.to_string_lossy()),
-                    ContainerName::Root(_) => None,
+                // Cache the container's full relative path now, built from its
+                // parent's cached path plus this entry's name.
+                let rel = match &e.name {
+                    ContainerName::Root(_) => PathBuf::new(),
+                    ContainerName::Entry(n) => {
+                        let parent = e
+                            .parent
+                            .and_then(|p| containers.get(&p))
+                            .cloned()
+                            .unwrap_or_default();
+                        parent.join(n.to_string_lossy())
+                    }
                 };
-                containers.insert(e.id, (e.parent, name));
-                if let Some(rel) = container_rel(e.id, &containers)
-                    && !rel.as_os_str().is_empty()
-                {
+                containers.insert(e.id, rel.clone());
+                if !rel.as_os_str().is_empty() {
                     sink(Entry::Dir(rel))?;
                 }
             }
@@ -210,8 +219,13 @@ pub fn walk_each(
                 if m.meta.entry_type != EntryType::File || m.meta.is_reparse {
                     continue;
                 }
-                let base = container_rel(m.container, &containers).unwrap_or_default();
+                let base = containers.get(&m.container).cloned().unwrap_or_default();
                 sink(Entry::File(base.join(m.name.to_string_lossy())))?;
+            }
+            CqItem::ContainerEnd(e) => {
+                // A subtree finished (bottom-up, after all its matches and
+                // children); drop its cached path to keep the map bounded.
+                containers.remove(&e.id);
             }
             CqItem::Error(e) => {
                 // The best-available entry name, included in both the fatal
@@ -240,32 +254,6 @@ pub fn walk_each(
     }
 
     Ok(())
-}
-
-/// Rebuild a container's path relative to the walk root by walking the
-/// parent chain up to the root (whose stored name is `None`).
-fn container_rel(
-    id: ContainerId,
-    containers: &HashMap<ContainerId, (Option<ContainerId>, Option<String>)>,
-) -> Option<PathBuf> {
-    let mut parts: Vec<&str> = Vec::new();
-    let mut cur = id;
-    loop {
-        let (parent, name) = containers.get(&cur)?;
-        match name {
-            Some(n) => parts.push(n),
-            None => break, // reached the root
-        }
-        match parent {
-            Some(p) => cur = *p,
-            None => break,
-        }
-    }
-    let mut rel = PathBuf::new();
-    for p in parts.iter().rev() {
-        rel.push(p);
-    }
-    Some(rel)
 }
 
 /// Build a globazog [`Segment`] that matches `name` literally: every character
