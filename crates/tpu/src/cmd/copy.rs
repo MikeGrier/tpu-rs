@@ -184,15 +184,14 @@ pub fn run(
         } else {
             PathBuf::from(".")
         };
-        // The pattern relative to `walk_root`: for an absolute source, strip
-        // the root prefix; a relative source is already root-relative.
+        // The pattern relative to `walk_root`: everything in the source after
+        // the final separator of the non-glob prefix. Slicing by the prefix
+        // length (rather than a string strip against the rendered walk_root)
+        // stays correct regardless of `/` vs `\` separators — e.g. an absolute
+        // glob written with forward slashes on Windows (`C:/repo/**/*.rs`).
         let rel_pattern: String = if anchor_path.is_absolute() {
-            let root_str = walk_root.to_string_lossy();
-            source
-                .strip_prefix(root_str.as_ref())
-                .unwrap_or(source)
-                .trim_start_matches(['/', '\\'])
-                .to_string()
+            let rel_start = anchor_str.rfind(['/', '\\']).map(|i| i + 1).unwrap_or(0);
+            source[rel_start..].to_string()
         } else {
             source.to_string()
         };

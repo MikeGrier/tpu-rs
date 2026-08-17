@@ -117,6 +117,25 @@ fn copy_glob_copies_matching_files_flat_into_dest() {
 }
 
 #[test]
+fn copy_glob_absolute_forward_slashes_matches() {
+    // A user may supply an absolute glob with `/` separators even on Windows
+    // (e.g. `C:/repo/**/*.txt`). The pattern-relative-to-root derivation must
+    // not depend on how the root path renders its separators.
+    let dir = TempDir::new().unwrap();
+    let src_dir = dir.path().join("src");
+    let dest_dir = dir.path().join("dest");
+    write_file(&src_dir.join("a.txt"), b"A");
+    write_file(&src_dir.join("nested").join("b.txt"), b"B");
+
+    let pattern = format!("{}/**/*.txt", src_dir.display()).replace('\\', "/");
+    ok(tpu().arg("copy").arg(&pattern).arg(&dest_dir));
+
+    // Glob copy flattens into dest by leaf name.
+    assert_eq!(fs::read(dest_dir.join("a.txt")).unwrap(), b"A");
+    assert_eq!(fs::read(dest_dir.join("b.txt")).unwrap(), b"B");
+}
+
+#[test]
 fn copy_glob_no_match_errors() {
     let dir = TempDir::new().unwrap();
     let dest_dir = dir.path().join("dest");

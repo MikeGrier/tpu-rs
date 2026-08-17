@@ -124,20 +124,27 @@ pub fn walk(
                 let base = container_rel(m.container, &containers).unwrap_or_default();
                 out.files.push(base.join(m.name.to_string_lossy()));
             }
-            CqItem::Error(e) => match on_error {
-                OnError::Fail => {
-                    return Err(format!("{label}: walk error: {}", e.error.source).into());
+            CqItem::Error(e) => {
+                // The best-available entry name, included in both the fatal
+                // (Fail) and non-fatal (Warn) messages so failures are
+                // actionable and the two paths stay consistent.
+                let hint = e
+                    .error
+                    .name
+                    .as_ref()
+                    .map(|n| n.to_string_lossy())
+                    .unwrap_or_else(|| "?".to_string());
+                match on_error {
+                    OnError::Fail => {
+                        return Err(
+                            format!("{label}: cannot access {hint}: {}", e.error.source).into()
+                        );
+                    }
+                    OnError::Warn => {
+                        warnings.push(format!("{label}: cannot access {hint}: {}", e.error.source));
+                    }
                 }
-                OnError::Warn => {
-                    let hint = e
-                        .error
-                        .name
-                        .as_ref()
-                        .map(|n| n.to_string_lossy())
-                        .unwrap_or_else(|| "?".to_string());
-                    warnings.push(format!("{label}: cannot access {hint}: {}", e.error.source));
-                }
-            },
+            }
             CqItem::Terminal(_) => break,
             _ => {}
         }
