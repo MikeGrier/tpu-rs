@@ -18,6 +18,17 @@
 //!   trees (e.g. recursive copy) need not materialize the whole listing first.
 //! - [`GlobMatcher`] — a standalone glob matcher over already-known relative
 //!   paths (used for `.gitignore` filtering), replacing `globset::GlobSet`.
+//!
+//! # Path fidelity
+//!
+//! globazog ships only each entry's decoded leaf *name* on its result stream,
+//! so the relative paths returned here are rebuilt from those names via
+//! [`Name::to_string_lossy`](globazog::Name::to_string_lossy). An on-disk name
+//! that is not valid UTF-8 (or otherwise not round-trippable) is therefore
+//! **lossy** — the reconstructed path can differ from the real one and may not
+//! be openable/copyable. In practice tpu operates on UTF-8 trees so this is a
+//! non-issue, but callers must not assume byte-exact path fidelity (unlike
+//! `walkdir`'s `entry.path()`).
 
 use std::{
     collections::HashMap,

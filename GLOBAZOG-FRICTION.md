@@ -65,9 +65,11 @@ convenience would close the gap.
 
 ## 8. No `[...]` character classes
 globazog dialects support `*` `?` `**` `{a,b}` but not POSIX bracket classes
-`[abc]` / `[a-z]`, which globset supported. A few gitignore lines / user globs
-that use them silently fail to compile (I skip them). Not necessarily a bug, but
-a migration gotcha.
+`[abc]` / `[a-z]`, which globset supported. The two consumers handle an
+unsupported pattern differently: a `.gitignore` line that fails to compile is
+silently skipped by `GlobMatcher`, whereas a user-supplied glob passed to
+`walk` / `walk_each` surfaces as an `invalid glob` error (`submit()` fails).
+Not necessarily a bug, but a migration gotcha.
 
 ## 9. Absolute-vs-relative root ergonomics
 Roots MUST be absolute (you resolve CWD yourself), and a relative pattern needs
