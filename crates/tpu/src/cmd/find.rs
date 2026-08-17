@@ -193,10 +193,20 @@ pub fn expand_paths_with_policy(
         // ── Legacy mode (no separate `glob`) ──────────────────────────────
         if is_glob {
             let before = paths.len();
-            let found =
-                crate::walk::walk(Path::new("."), spec, &[], on_error, "find", warnings_out)?;
+            // Anchor an absolute glob at its non-glob prefix; a relative glob
+            // walks from the current directory. Either way the reported paths
+            // are rebuilt by rejoining the walk root.
+            let (walk_root, rel_pattern) = crate::walk::split_glob_root(spec);
+            let found = crate::walk::walk(
+                &walk_root,
+                &rel_pattern,
+                &[],
+                on_error,
+                "find",
+                warnings_out,
+            )?;
             for rel in found.files {
-                paths.push(Path::new(".").join(rel));
+                paths.push(walk_root.join(rel));
             }
             if paths.len() == before {
                 return Err(format!("find: glob {:?} matched no files", spec).into());

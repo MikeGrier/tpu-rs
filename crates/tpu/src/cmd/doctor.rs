@@ -285,16 +285,19 @@ fn expand_paths_with_policy(
             spec.contains('*') || spec.contains('?') || spec.contains('[') || spec.contains('{');
 
         if is_glob {
+            // Anchor an absolute glob at its non-glob prefix; a relative glob
+            // walks from the current directory.
+            let (walk_root, rel_pattern) = crate::walk::split_glob_root(spec);
             let found = crate::walk::walk(
-                Path::new("."),
-                spec,
+                &walk_root,
+                &rel_pattern,
                 SKIP_DIRS,
                 on_error,
                 "doctor",
                 warnings_out,
             )?;
             for rel in found.files {
-                let path = Path::new(".").join(&rel);
+                let path = walk_root.join(&rel);
                 if !is_binary_extension(&path) {
                     push_unique(&mut paths, &mut seen, path);
                 }
