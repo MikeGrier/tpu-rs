@@ -13,6 +13,9 @@
 //!   glob pattern and the directories that were entered, as paths relative to
 //!   the walk root. Callers join the root back on to obtain full paths (which
 //!   preserves the caller's original — possibly relative — root prefix).
+//! - [`walk_each`] — the same traversal, but delivered entry-by-entry to a
+//!   callback so callers processing very large trees (e.g. recursive copy)
+//!   need not materialize the whole listing first.
 //! - [`GlobMatcher`] — a standalone glob matcher over already-known relative
 //!   paths (used for `.gitignore` filtering), replacing `globset::GlobSet`.
 
@@ -25,22 +28,29 @@ use std::{
 use globazog::{
     CaseSensitivity, ContainerId, ContainerName, CqItem, Dialect, EntryType, Leaf, MetaMask,
     QueryBuilder,
-    syntax::{CodePoint, PatternSegment, Segment, parse::parse, set::PatternSet},
+    syntax::{CodePoint, Segment, Token, set::PatternSet},
 };
 
 use crate::cmd::copy::OnError;
 
-/// The result of a [`walk`]: matched files and entered directories, each as a
-/// path relative to the walk root.
+/// The result of a [`walk`]: the files (relative to the walk root) that
+/// matched the glob pattern.
 #[derive(Debug, Default)]
 pub struct Walk {
     /// Regular files whose path (relative to the walk root) matched the glob
     /// pattern. Symbolic links and reparse points are excluded.
     pub files: Vec<PathBuf>,
-    /// Every directory the walk entered, relative to the walk root (the root
-    /// itself is excluded). Reparse-point directories and any directory named
-    /// in `skip_dirs` are never entered and so never appear here.
-    pub dirs: Vec<PathBuf>,
+}
+
+/// One entry delivered by [`walk_each`]: a path relative to the walk root plus
+/// its kind.
+#[derive(Debug)]
+pub enum Entry {
+    /// A directory the walk entered (including empty ones).
+    Dir(PathBuf),
+    /// A regular file matching the pattern. Symbolic links and reparse points
+    /// are excluded.
+    File(PathBuf),
 }
 
 /// Walk `root` with globazog, collecting files that match `pattern` and the
@@ -56,6 +66,8 @@ pub struct Walk {
 /// an error, while [`OnError::Warn`] appends a `"{label}: cannot access …"`
 /// note to `warnings` and continues. `label` prefixes those notes and the
 /// fatal error message (e.g. `"find"`, `"copy"`, `"doctor"`).
+///
+/// This buffers the whole listing; use [`walk_each`] to stream entries.
 pub fn walk(
     root: &Path,
     pattern: &str,
@@ -64,6 +76,37 @@ pub fn walk(
     label: &str,
     warnings: &mut Vec<String>,
 ) -> Result<Walk, Box<dyn Error>> {
+    let mut out = Walk::default();
+    walk_each(
+        root,
+        pattern,
+        skip_dirs,
+        on_error,
+        label,
+        warnings,
+        |entry| {
+            if let Entry::File(p) = entry {
+                out.files.push(p);
+            }
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+/// Like [`walk`] but invokes `sink` for each [`Entry`] as it is discovered,
+/// in traversal order (a directory is delivered before any entry inside it),
+/// instead of buffering the whole listing. If `sink` returns an error the walk
+/// stops and that error is propagated.
+pub fn walk_each(
+    root: &Path,
+    pattern: &str,
+    skip_dirs: &[&str],
+    on_error: OnError,
+    label: &str,
+    warnings: &mut Vec<String>,
+    mut sink: impl FnMut(Entry) -> Result<(), Box<dyn Error>>,
+) -> Result<(), Box<dyn Error>> {
     // globazog roots must be absolute (D-74); resolve a relative root against
     // the current directory. Path reconstruction below is independent of this
     // absolute form — it rebuilds paths relative to the root.
@@ -99,7 +142,6 @@ pub fn walk(
     // ContainerId -> (parent, own name); a root's name is `None`.
     let mut containers: HashMap<ContainerId, (Option<ContainerId>, Option<String>)> =
         HashMap::new();
-    let mut out = Walk::default();
 
     loop {
         match ring.wait_pop() {
@@ -112,7 +154,7 @@ pub fn walk(
                 if let Some(rel) = container_rel(e.id, &containers)
                     && !rel.as_os_str().is_empty()
                 {
-                    out.dirs.push(rel);
+                    sink(Entry::Dir(rel))?;
                 }
             }
             CqItem::Match(m) => {
@@ -122,7 +164,7 @@ pub fn walk(
                     continue;
                 }
                 let base = container_rel(m.container, &containers).unwrap_or_default();
-                out.files.push(base.join(m.name.to_string_lossy()));
+                sink(Entry::File(base.join(m.name.to_string_lossy())))?;
             }
             CqItem::Error(e) => {
                 // The best-available entry name, included in both the fatal
@@ -150,7 +192,7 @@ pub fn walk(
         }
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Rebuild a container's path relative to the walk root by walking the
@@ -179,20 +221,14 @@ fn container_rel(
     Some(rel)
 }
 
-/// Compile a single literal directory name into a globazog [`Segment`] for use
-/// in a negated [`Leaf::Name`] descend filter.
+/// Build a globazog [`Segment`] that matches `name` literally: every character
+/// becomes a [`Token::Literal`], so a skip-dir name containing glob
+/// metacharacters (or a construct the parser rejects) can never broaden or
+/// narrow the descend filter.
 fn literal_segment(name: &str) -> Segment {
-    let segments = match parse(name, Dialect::Posix) {
-        Ok(parsed) => parsed.pattern.segments,
-        Err(_) => return Segment::default(),
-    };
-    segments
-        .into_iter()
-        .find_map(|s| match s {
-            PatternSegment::Match(seg) => Some(seg),
-            PatternSegment::DoubleStar => None,
-        })
-        .unwrap_or_default()
+    name.chars()
+        .map(|c| Token::Literal(c as CodePoint))
+        .collect()
 }
 
 /// A set of globs matched against already-known relative paths — the
