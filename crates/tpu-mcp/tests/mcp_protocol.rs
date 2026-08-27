@@ -427,7 +427,7 @@ fn mcp_it_3_replace_basic() {
 /// caller can't mistake success-with-nothing-changed for a real edit.
 /// Regression test for CHECKLIST.md milestones 7 and 9.
 #[test]
-fn mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime() {
+fn mcp_it_3b_replace_zero_match_errors_by_default_and_preserves_mtime() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("replace_zero.txt");
     std::fs::write(&f, "hello world\n").unwrap();
