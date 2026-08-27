@@ -118,6 +118,59 @@ When `verify_delay_ms` is 0, the stamp-and-verify cycle is skipped; metadata is 
 and returned immediately without modifying the mtime.  This is appropriate once a
 Defender exclusion is in place.
 
+### Zero-match `replace` is an error by default
+
+A `tpu_replace_in_file` call whose pattern matches zero times returns
+`status: "error"`.  The caller asked for a substitution and got none, which in
+practice is nearly always a mis-anchored pattern rather than an intended no-op.
+
+The alternative — reporting success — produces a response indistinguishable from
+a real edit, and three separate defect reports traced silent corruption-of-intent
+back to exactly that.  The failure modes are asymmetric: a wrongly-errored
+idempotent re-run is loud and fixed by adding one argument, while a
+wrongly-succeeded mis-anchored pattern is silent and may only surface much later.
+
+`allow_no_match: true` restores success-with-`count:0`-and-`warning` for
+genuinely idempotent workflows (re-applying a migration that may already be
+applied).  Two exemptions never error regardless:
+
+- `count: true` and `dry_run: true` — introspection modes, where zero is the
+  legitimate answer to the question asked.
+- A `line_ending` override — it rewrites the whole file to the requested
+  convention even with zero substitutions, so the call did real work.
+
+The check runs *before* `delete_bak_if_exists` and the write-verification stamp,
+so an erroring no-op leaves the filesystem entirely untouched.
+
+### Only stamp when a write actually happened
+
+`stamp_and_verify()` **mutates the file** — step 1 opens it for write and sets its
+mtime.  It must therefore only be called on a code path where bytes were actually
+written.  Calling it after an operation that turned out to be a no-op makes the
+stamp itself the only mutation of the call, so a run that changed nothing still
+advances mtime.
+
+This is not hypothetical: `tpu_replace_in_file` short-circuits the rewrite when the
+pattern matches zero times (see `replace::run`'s zero-match short-circuit), but it
+originally still ran `stamp_and_verify` afterwards.  The result was a zero-match call
+that left content byte-identical and wrote no `.bak`, yet bumped mtime — defeating
+`tpu_stat_file` as a change detector, mtime-based watchers, and incremental builds.
+See CHECKLIST.md milestone 9.
+
+Use `read_stamp()` instead on any path that may not have written.  It reports the
+same `WriteStamp { mtime_epoch_ms, size }` by reading metadata only, so the response
+stays accurate without touching the file.  The condition guarding the choice should
+be the same one that guards `delete_bak_if_exists` — both answer "did this call
+actually modify the file?"
+
+Note that a `line_ending` override counts as a write even with zero substitutions: it
+rewrites the whole file to the requested convention, so it takes the stamping path.
+
+Testing caveat: the integration suites run the server with `--verify-delay-ms=0`,
+which takes the read-only early return and bypasses stamping entirely.  Any test that
+needs to exercise real stamping must opt in explicitly — `call_with_verify_delay` in
+`tools.rs`'s `integration_tests` exists for this.
+
 ### Configuration
 
 The delay is a server-level setting, not a per-call parameter.  It is configured via a
