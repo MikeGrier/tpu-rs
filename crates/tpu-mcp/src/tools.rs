@@ -445,14 +445,23 @@ pub fn list() -> Value {
                  literal dollar sign — see the 'replacement' ESCAPING note below for when \
                  this applies. \
                  The original file is backed up to <file>.bak before writing. \
-                 A zero-match run is a no-op: the file is not rewritten (mtime is \
-                 preserved, no .bak is written) and the response includes count:0 \
-                 plus a `warning` field so a caller can distinguish it from a real \
-                 edit inline. The success response always includes `count` (the \
+                 A zero-match run is an ERROR by default: the pattern did not appear \
+                 in the file, so nothing was substituted. The file is left untouched \
+                 (mtime preserved, no .bak written) and the response is \
+                 status:\"error\" naming the count. This is deliberate — a silent \
+                 success on a pattern that matched nothing is indistinguishable from \
+                 a real edit and has repeatedly masked mis-anchored patterns. Pass \
+                 allow_no_match:true to make a zero match a success instead (the \
+                 right choice for idempotent re-runs, e.g. re-applying a migration \
+                 that may already be applied); the response then carries count:0 and \
+                 a `warning` field. The success response always includes `count` (the \
                  number of substitutions performed) so no follow-up count:true call \
                  is needed. \
                  Use count:true to count matches without modifying the file. \
                  Use dry_run:true to preview changes as a unified diff without writing. \
+                 Neither count:true nor dry_run:true is affected by allow_no_match — \
+                 they are introspection modes, so a zero result is a legitimate \
+                 answer, never an error. \
                  After a real write, a compact changed-region preview is included in the \
                  response BY DEFAULT — no diff:true needed — as long as the change is \
                  small (see echo_max_lines below); this lets you catch a mistake (e.g. an \
@@ -602,6 +611,16 @@ pub fn list() -> Value {
                             "If true, count the number of substitutions that would be made \
                              and return the count. The file is not modified. \
                              Mutually exclusive with diff and dry_run. Default: false."
+                    },
+                    "allow_no_match": {
+                        "type": "boolean",
+                        "description":
+                            "If true, a run whose pattern matches zero times is reported \
+                             as success (with count:0 and a `warning`) instead of the \
+                             default error. Use this for idempotent re-runs where the \
+                             substitution may already have been applied. Has no effect \
+                             on count:true or dry_run:true, which never error on a zero \
+                             result. Default: false."
                     },
                     "dry_run": {
                         "type": "boolean",
@@ -1972,6 +1991,10 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             .get("dry_run")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let allow_no_match = args
+            .get("allow_no_match")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Real writes take the cross-process write lock, held across the CAS
         // re-check AND the swap so two tpu instances cannot interleave and
@@ -2066,16 +2089,49 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
                 "{header}\n{diff_text}{sep}{status_line}"
             )));
         }
+        // A zero-match replace is an error by default: the caller asked for a
+        // substitution and got none, which is almost always a mis-anchored
+        // pattern rather than an intended no-op. Reporting success there is
+        // indistinguishable from a real edit and has repeatedly masked the
+        // miss. `allow_no_match:true` opts back into success for genuinely
+        // idempotent re-runs. count/dry_run are introspection modes where a
+        // zero result is a legitimate answer, so they are exempt (and have
+        // already returned above).
+        //
+        // Ordering: this check runs before `delete_bak_if_exists` and the
+        // stamp so that an erroring no-op leaves the filesystem completely
+        // untouched.
+        if n == 0 && !allow_no_match && le_override.is_none() {
+            return Ok(ToolResult::error(
+                &header,
+                "pattern matched 0 times; no substitutions made and the file was not \
+                 modified. Check the pattern against the file's actual text (matching \
+                 is literal by default; pass regex:true for regex). Pass \
+                 allow_no_match:true if a zero match is an acceptable outcome, or use \
+                 count:true / dry_run:true to probe without writing.",
+            ));
+        }
         // A real write only happened if something matched, or a
         // line_ending_override forced a rewrite despite zero matches (see
         // the zero-match short-circuit doc on `replace::run`). Only clean
         // up a `.bak` when a write actually occurred -- otherwise this
         // "no-op" turns a pre-existing `<file>.bak` into a destructive
         // filesystem change.
-        if n > 0 || le_override.is_some() {
+        let wrote = n > 0 || le_override.is_some();
+        if wrote {
             delete_bak_if_exists(&file);
         }
-        let stamp = stamp_and_verify(Path::new(&file), config.verify_delay_ms)?;
+        // Verification works by stamping the file's mtime and reading it back
+        // to prove the write survived Defender's minifilter.  When no write
+        // happened there is nothing to verify, and stamping would itself
+        // become the *only* mutation of the call -- bumping mtime on a run
+        // that changed no bytes and defeating the M7 no-op guarantee.  Read
+        // the metadata instead so the reported stamp still describes the file.
+        let stamp = if wrote {
+            stamp_and_verify(Path::new(&file), config.verify_delay_ms)?
+        } else {
+            read_stamp(Path::new(&file))?
+        };
         let changed_lines: usize = regions
             .iter()
             .map(|r| (r.end_line - r.start_line + 1) + r.new_line_count)
@@ -2094,13 +2150,13 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             "changed_lines": changed_lines,
             "content_version": content_version,
         });
-        // A zero-match replace returns success (no error occurred) but
-        // substituted nothing -- make that visible inline so a caller
-        // doesn't mistake it for a real edit. See CHECKLIST.md M7 for
-        // background. Wording must not claim the file was untouched: a
-        // line_ending_override still rewrites it (mtime bump, new .bak)
-        // even with zero substitutions, so only the substitution count is
-        // asserted here, not the file's unchanged-ness.
+        // Reaching here with n == 0 means the caller either passed
+        // allow_no_match:true or supplied a line_ending_override that rewrote
+        // the file anyway; the hard-error case returned above. Keep the
+        // inline warning so the zero match is still visible. Wording must not
+        // claim the file was untouched: a line_ending_override still rewrites
+        // it (mtime bump, new .bak) even with zero substitutions, so only the
+        // substitution count is asserted here, not the file's unchanged-ness.
         if n == 0 {
             status["warning"] = serde_json::json!(
                 "pattern matched 0 times; no substitutions made (matching is literal by \
@@ -3479,6 +3535,20 @@ struct WriteStamp {
     size: u64,
 }
 
+/// Read a file's mtime and size **without modifying it**.
+///
+/// This is the no-write counterpart to [`stamp_and_verify`]: it reports the
+/// same metadata but performs no stamping, so callers whose operation turned
+/// out to be a no-op (e.g. a zero-match `tpu_replace_in_file`) do not bump the
+/// file's mtime merely by asking what it is.
+fn read_stamp(file: &Path) -> Result<WriteStamp, Box<dyn std::error::Error>> {
+    let meta = std::fs::metadata(file)?;
+    Ok(WriteStamp {
+        mtime_epoch_ms: mtime_as_epoch_ms(&meta),
+        size: meta.len(),
+    })
+}
+
 /// Stamp a file's mtime to a known value, wait `delay_ms` milliseconds for
 /// Windows Defender's minifilter to act, then read back the metadata to verify
 /// the write was not silently reverted.
@@ -3486,15 +3556,15 @@ struct WriteStamp {
 /// When `delay_ms` is 0, skips the stamp-and-verify cycle; metadata is read
 /// and returned immediately without modifying the mtime.
 ///
+/// Only call this when a write actually occurred — it mutates the file's
+/// mtime, so invoking it after a no-op makes the no-op observably modify the
+/// file.  Use [`read_stamp`] instead when nothing was written.
+///
 /// Returns an error if the read-back mtime diverges from the stamped value by
 /// more than 10 ms, identifying Defender as the likely cause.
 fn stamp_and_verify(file: &Path, delay_ms: u64) -> Result<WriteStamp, Box<dyn std::error::Error>> {
     if delay_ms == 0 {
-        let meta = std::fs::metadata(file)?;
-        return Ok(WriteStamp {
-            mtime_epoch_ms: mtime_as_epoch_ms(&meta),
-            size: meta.len(),
-        });
+        return read_stamp(file);
     }
 
     // Set mtime to a known millisecond-precision stamp.
@@ -4688,11 +4758,25 @@ mod integration_tests {
     /// Zero-delay wrapper so existing tests call the real `call()` without
     /// needing to supply a `ServerConfig` argument explicitly.
     fn call(name: &str, args: &serde_json::Value) -> Result<String, Box<dyn std::error::Error>> {
+        call_with_verify_delay(name, args, 0)
+    }
+
+    /// Like [`call`] but with a caller-chosen `verify_delay_ms`, so a test can
+    /// exercise the write-verification stamp that a real server runs by
+    /// default (100 ms).  Every other test here — and every `McpSession` in
+    /// `tests/mcp_protocol.rs` — passes 0, which short-circuits stamping
+    /// entirely; anything that only misbehaves when stamping is active is
+    /// invisible to them.
+    fn call_with_verify_delay(
+        name: &str,
+        args: &serde_json::Value,
+        verify_delay_ms: u64,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let tr = super::call(
             name,
             args,
             &ServerConfig {
-                verify_delay_ms: 0,
+                verify_delay_ms,
                 trace: false,
                 default_on_error: tpu::cmd::copy::OnError::Warn,
                 progress_detail: ProgressDetail::EachFile,
@@ -4704,6 +4788,200 @@ mod integration_tests {
             return Err(tr.text.into());
         }
         Ok(tr.text)
+    }
+
+    /// Regression: a zero-match `tpu_replace_in_file` must leave the file's
+    /// mtime untouched **even when write verification is enabled**.
+    ///
+    /// `replace::run` already short-circuits the rewrite on zero matches
+    /// (CHECKLIST.md M7-1), but `call_replace_in_file` then called
+    /// `stamp_and_verify` unconditionally.  That helper opens the file for
+    /// write and sets its mtime to "now", so the supposed no-op still bumped
+    /// mtime — making a matched-nothing run indistinguishable from a real
+    /// edit to `tpu_stat_file`, mtime-based watchers, and incremental builds.
+    /// The M7 regression test could not catch it because the whole protocol
+    /// suite runs with `--verify-delay-ms=0`.
+    ///
+    /// A zero match is also an error by default (M9-5), so this asserts the
+    /// filesystem is untouched on the erroring path.
+    #[test]
+    fn replace_zero_match_preserves_mtime_with_verification_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("zero_match_stamp.txt");
+        fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+
+        // Sleep past filesystem timestamp granularity so a spurious stamp
+        // would produce a visibly different mtime.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let err = call_with_verify_delay(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "THIS_TEXT_IS_NOT_IN_THE_FILE",
+                "replacement": "REPLACEMENT_NEVER_APPLIED",
+            }),
+            100,
+        )
+        .expect_err("zero-match must be an error by default");
+        let text = err.to_string();
+        assert!(
+            text.contains("matched 0 times") && text.contains("allow_no_match"),
+            "error must name the zero match and the opt-out; got: {text}"
+        );
+
+        let after = fs::metadata(&f).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "zero-match must not bump mtime even with verification enabled; got: {text}"
+        );
+        assert!(
+            !f.with_extension("txt.bak").exists(),
+            "zero-match must not leave a .bak"
+        );
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "alpha\nbeta\ngamma\n",
+            "zero-match must leave file bytes untouched"
+        );
+    }
+
+    /// `allow_no_match:true` opts back into the previous success-on-zero-match
+    /// behaviour for idempotent re-runs: success, `count:0`, an inline
+    /// `warning`, and — with verification enabled — an untouched mtime.
+    #[test]
+    fn replace_zero_match_with_allow_no_match_succeeds_and_preserves_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("zero_match_allowed.txt");
+        fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let out = call_with_verify_delay(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "THIS_TEXT_IS_NOT_IN_THE_FILE",
+                "replacement": "REPLACEMENT_NEVER_APPLIED",
+                "allow_no_match": true,
+            }),
+            100,
+        )
+        .expect("allow_no_match must turn a zero match into success");
+
+        let status = last_json_line(&out);
+        assert_eq!(status["status"].as_str(), Some("success"), "got: {out}");
+        assert_eq!(status["count"].as_u64(), Some(0), "got: {out}");
+        assert!(
+            status["warning"]
+                .as_str()
+                .is_some_and(|w| w.contains("0 times")),
+            "zero-match must warn inline; got: {out}"
+        );
+
+        let after = fs::metadata(&f).unwrap().modified().unwrap();
+        assert_eq!(
+            before, after,
+            "zero-match must not bump mtime even with verification enabled; got: {out}"
+        );
+        assert_eq!(
+            status["mtime_epoch_ms"].as_u64(),
+            Some(
+                after
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+            ),
+            "reported mtime must match the untouched on-disk mtime; got: {out}"
+        );
+        assert!(
+            !f.with_extension("txt.bak").exists(),
+            "zero-match must not leave a .bak"
+        );
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "alpha\nbeta\ngamma\n",
+            "zero-match must leave file bytes untouched"
+        );
+    }
+
+    /// `count:true` and `dry_run:true` are introspection modes: a zero result
+    /// is a legitimate answer there, so they must stay successful regardless
+    /// of `allow_no_match`.
+    #[test]
+    fn replace_zero_match_count_and_dry_run_never_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("zero_match_probe.txt");
+        fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+
+        let out = call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "NOPE",
+                "replacement": "X",
+                "count": true,
+            }),
+        )
+        .expect("count:true must not error on zero matches");
+        assert_eq!(last_json_line(&out)["count"].as_u64(), Some(0), "{out}");
+
+        let out = call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "NOPE",
+                "replacement": "X",
+                "dry_run": true,
+            }),
+        )
+        .expect("dry_run:true must not error on zero matches");
+        assert_eq!(
+            last_json_line(&out)["changed"].as_bool(),
+            Some(false),
+            "{out}"
+        );
+    }
+
+    /// Companion to the test above: with verification enabled, a replace that
+    /// *does* match must still write, still be verified, and report a stamp
+    /// matching the file on disk.  This pins the fix to "skip stamping only
+    /// when nothing was written" rather than "stop stamping altogether".
+    #[test]
+    fn replace_with_match_still_stamps_and_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("match_stamp.txt");
+        fs::write(&f, "alpha\nbeta\ngamma\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let out = call_with_verify_delay(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "beta",
+                "replacement": "delta",
+            }),
+            100,
+        )
+        .expect("matching replace should succeed");
+
+        let status = last_json_line(&out);
+        assert_eq!(status["count"].as_u64(), Some(1), "got: {out}");
+        assert!(
+            status["warning"].is_null(),
+            "a matching replace must not warn; got: {out}"
+        );
+
+        let after = fs::metadata(&f).unwrap().modified().unwrap();
+        assert!(
+            after > before,
+            "a real write must advance mtime; got: {out}"
+        );
+        assert_eq!(fs::read_to_string(&f).unwrap(), "alpha\ndelta\ngamma\n");
     }
 
     /// SF-IT-14: `tpu_find` MCP tool integration.

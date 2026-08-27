@@ -177,11 +177,23 @@ All tools accept absolute paths. Paths must use the OS-native separator
 ```jsonc
 {
   "file": "C:/project/src/lib.rs",       // required
-  "pattern": "fn old_name\\(",           // required: regex::bytes pattern
+  "pattern": "fn old_name\(",           // required: literal by default; set regex:true for a pattern
   "replacement": "fn new_name(",         // required: $0/$1/$name for groups, $$ for literal $
-  "multiline": false                     // optional: make ^ and $ match LF boundaries
+  "regex": true,                         // optional: interpret `pattern` as a regex (default false)
+  "multiline": false,                    // optional: make ^ and $ match LF boundaries
+  "allow_no_match": false                // optional: report success instead of an error on zero matches
 }
 ```
+
+A run whose pattern matches zero times is an **error** by default: nothing was
+substituted, the file is left untouched (mtime preserved, no `.bak` written), and
+the response is `status: "error"`. This is deliberate — a silent success on a
+pattern that matched nothing looks identical to a real edit and reliably hides
+mis-anchored patterns. Pass `allow_no_match: true` for genuinely idempotent
+re-runs; the response is then a success carrying `count: 0` and a `warning`.
+
+`count: true` and `dry_run: true` are unaffected — they are introspection modes,
+so a zero result is a legitimate answer rather than an error.
 
 ### `tpu_edit_file`
 

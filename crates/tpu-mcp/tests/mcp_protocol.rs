@@ -420,10 +420,12 @@ fn mcp_it_3_replace_basic() {
 }
 
 /// MCP-IT-3b: A zero-match `tpu_replace_in_file` call must (a) return
-/// `count: 0` and `changed_lines: 0` in the status JSON, (b) include a
-/// `warning` field so a caller can't mistake success-with-nothing-changed
-/// for a real edit, and (c) leave the file's mtime untouched (M7-1
-/// short-circuit).  Regression test for CHECKLIST.md milestone 7.
+/// `status: "error"` by default (M9-5) naming the zero match and the
+/// `allow_no_match` opt-out, and (b) leave the file's mtime untouched (M7-1
+/// short-circuit).  With `allow_no_match: true` the same call must instead
+/// succeed with `count: 0`, `changed_lines: 0`, and a `warning` field so a
+/// caller can't mistake success-with-nothing-changed for a real edit.
+/// Regression test for CHECKLIST.md milestones 7 and 9.
 #[test]
 fn mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime() {
     let dir = tempfile::tempdir().unwrap();
@@ -437,12 +439,36 @@ fn mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime() {
     let mut s = McpSession::start();
     s.initialize();
 
+    // Default: a zero match is a hard error and nothing is written.
+    let err_out = s.call_tool(
+        "tpu_replace_in_file",
+        json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "this_pattern_is_not_in_the_file",
+            "replacement": "REPLACEMENT",
+        }),
+    );
+    let err = last_json_line(&err_out);
+    assert_eq!(
+        err["status"].as_str(),
+        Some("error"),
+        "zero-match must be an error by default; got: {err_out:?}"
+    );
+    let msg = err["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("matched 0 times") && msg.contains("allow_no_match"),
+        "error must name the zero match and the opt-out; got: {msg:?}"
+    );
+
+    // Opt back in: allow_no_match turns the same call into a success that
+    // still reports the zero match inline.
     let out = s.call_tool(
         "tpu_replace_in_file",
         json!({
             "file": f.to_str().unwrap(),
             "pattern": "this_pattern_is_not_in_the_file",
             "replacement": "REPLACEMENT",
+            "allow_no_match": true,
         }),
     );
     let stamp = last_json_line(&out);
@@ -490,7 +516,8 @@ fn mcp_it_3b_replace_zero_match_reports_count_and_preserves_mtime() {
 /// pre-existing `<file>.bak` left over from an earlier, unrelated edit.
 /// Before the fix, `delete_bak_if_exists` ran unconditionally after the
 /// zero-match short-circuit, turning a supposed no-op into a destructive
-/// filesystem change.
+/// filesystem change.  Checked on both zero-match outcomes: the default
+/// hard error (M9-5) and the `allow_no_match: true` success.
 #[test]
 fn mcp_it_3c_replace_zero_match_does_not_delete_preexisting_bak() {
     let dir = tempfile::tempdir().unwrap();
@@ -502,7 +529,8 @@ fn mcp_it_3c_replace_zero_match_does_not_delete_preexisting_bak() {
     let mut s = McpSession::start();
     s.initialize();
 
-    let out = s.call_tool(
+    // Default (error) path must not touch the .bak.
+    let err_out = s.call_tool(
         "tpu_replace_in_file",
         json!({
             "file": f.to_str().unwrap(),
@@ -510,11 +538,31 @@ fn mcp_it_3c_replace_zero_match_does_not_delete_preexisting_bak() {
             "replacement": "REPLACEMENT",
         }),
     );
+    assert_eq!(
+        last_json_line(&err_out)["status"].as_str(),
+        Some("error"),
+        "zero-match must be an error by default; got: {err_out:?}"
+    );
+    assert!(
+        bak.exists(),
+        "erroring zero-match must not delete a pre-existing .bak; got out={err_out:?}"
+    );
+
+    // allow_no_match (success) path must not touch it either.
+    let out = s.call_tool(
+        "tpu_replace_in_file",
+        json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "this_pattern_is_not_in_the_file",
+            "replacement": "REPLACEMENT",
+            "allow_no_match": true,
+        }),
+    );
     let stamp = last_json_line(&out);
     assert_eq!(
         stamp["status"].as_str(),
         Some("success"),
-        "zero-match must still report success; got: {out:?}"
+        "allow_no_match zero-match must report success; got: {out:?}"
     );
     assert!(
         bak.exists(),

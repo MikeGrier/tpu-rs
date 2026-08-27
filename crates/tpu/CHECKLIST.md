@@ -533,3 +533,99 @@ style-only lints in files this milestone did not modify).  Filed after
 two defect reports whose evidence pointed at an older binary being used
 against present-day expectations, without any inline signal that would
 have let Copilot notice.
+
+---
+
+## Milestone 9 — zero-match `replace`: mtime bump via the verification stamp, and error-by-default
+
+**Theme:** M7-1 stopped a zero-match `tpu_replace_in_file` from *rewriting*
+the file, but the MCP wrapper then ran the write-verification stamp
+unconditionally.  `stamp_and_verify` opens the file for write and sets its
+mtime to "now", so the supposed no-op still advanced mtime — the exact
+symptom M7 set out to eliminate, just moved one layer up.
+
+**Defect report (2026-08-27):** a zero-match call left the content hash
+identical (`sha256` unchanged, no `.bak`) but advanced mtime by 20 s, and
+the reported `mtime_epoch_ms` matched the new on-disk value exactly,
+proving a real metadata write rather than a stale clock read.  This makes
+`tpu_stat_file` — documented as the way to "verify a write actually
+persisted" — unsound as a change detector, and defeats mtime-based
+watchers and incremental builds.
+
+**Why M7-4 did not catch it:** every `McpSession` in
+`crates/tpu-mcp/tests/mcp_protocol.rs` spawns the server with
+`--verify-delay-ms=0`, and the `call()` helper in `tools.rs`'s
+`integration_tests` hardcoded the same.  `delay_ms == 0` takes an early
+return that only *reads* metadata, so the entire stamping path — the code
+that actually mutates mtime — was never exercised by any test.  Production
+defaults to `verify_delay_ms: 100`.
+
+**The other half of the report** (`status: "success"` with no `count` and
+no `changed`) did **not** reproduce: current `call_replace_in_file` always
+emits `"count": n` and, when `n == 0`, a `warning`.  The reporting session
+was running a pre-M7 binary — precisely the drift M8's `tpu_version` echo
+exists to surface.
+
+- [x] M9-1: `call_replace_in_file` now computes `wrote = n > 0 ||
+      le_override.is_some()` (the same condition already gating
+      `delete_bak_if_exists`) and calls `stamp_and_verify` only when
+      `wrote`.  Otherwise it calls the new `read_stamp`, so the response
+      still reports accurate `mtime_epoch_ms`/`size` without mutating
+      them.  There is nothing to verify when nothing was written, and
+      stamping would otherwise be the call's only mutation.
+- [x] M9-2: New `read_stamp(file)` helper reads mtime/size without
+      modifying the file; `stamp_and_verify`'s `delay_ms == 0` early
+      return now delegates to it instead of duplicating the metadata
+      read.  `stamp_and_verify`'s doc-comment states that it must only be
+      called when a write actually occurred.
+- [x] M9-3: `call()` in `tools.rs`'s `integration_tests` now delegates to
+      a new `call_with_verify_delay(name, args, verify_delay_ms)` so a
+      test can opt into the production stamping path.  Existing callers
+      keep the zero-delay behaviour unchanged.
+- [x] M9-4: `replace_zero_match_preserves_mtime_with_verification_enabled`
+      runs a non-matching replace with `verify_delay_ms: 100` and asserts
+      `count:0`, an inline `warning`, unchanged mtime, no `.bak`,
+      untouched bytes, and that the reported `mtime_epoch_ms` equals the
+      untouched on-disk mtime.  Verified to fail against the pre-fix code
+      and pass after.  Companion
+      `replace_with_match_still_stamps_and_verifies` pins the fix to
+      "skip stamping only when nothing was written" by asserting a real
+      match still advances mtime and reports `count:1` with no warning.
+
+- [x] M9-5: **Breaking change** — a zero-match `tpu_replace_in_file` is now
+      an ERROR by default rather than a success.  M7 deferred this ("breaks
+      idempotent re-runs") and offered a future opt-in `require_match: true`;
+      the same defect recurred a third time, so the default is flipped and
+      the escape hatch inverted: `allow_no_match: true` restores the old
+      success-with-`count:0`-and-`warning` shape for genuinely idempotent
+      workflows.  Rationale: the failure mode is asymmetric.  A wrongly-
+      errored idempotent re-run is loud and trivially fixed by one argument;
+      a wrongly-succeeded mis-anchored pattern is silent and was caught only
+      because `git status` happened to be clean.
+      - The check runs *before* `delete_bak_if_exists` and the stamp, so an
+        erroring no-op leaves the filesystem completely untouched.
+      - `count:true` and `dry_run:true` are exempt — they are introspection
+        modes where a zero result is the legitimate answer, never an error.
+      - A `line_ending` override is also exempt: it rewrites the file to the
+        requested convention even with zero substitutions, so the call did
+        real work and still reports success (with the `warning`).
+- [x] M9-6: Tests for the new contract:
+      `replace_zero_match_preserves_mtime_with_verification_enabled` (now
+      asserts the default error path leaves mtime, `.bak`, and bytes
+      untouched), `replace_zero_match_with_allow_no_match_succeeds_and_
+      preserves_mtime`, and `replace_zero_match_count_and_dry_run_never_
+      error`.  `mcp_it_3b` and `mcp_it_3c` in `mcp_protocol.rs` were updated
+      to the new contract; 3c now checks that *both* zero-match outcomes
+      preserve a pre-existing `.bak`.
+- [x] M9-7: Tool description and the new `allow_no_match` schema property
+      document the error-by-default contract, the opt-out, and the
+      count/dry_run exemption.
+
+**Status:** ✅ Complete.  `cargo test -p tpu-mcp`: 137 passed, 0 failed
+(102 bin incl. the 4 new tests + 6 io_worker_chaos + 29 mcp_protocol);
+`cargo test -p tpu`: 2 966 passed, 0 failed, 1 ignored.
+`cargo fmt --check` clean; `cargo clippy -p tpu-mcp --all-targets`
+introduces no new lints.  Additionally verified end-to-end against a real
+`tpu-mcp.exe` at the default `verify_delay_ms: 100`: a zero-match call
+preserved mtime to the tick and wrote no `.bak`, while a matching call
+still wrote, stamped, and reported `count:1`.
