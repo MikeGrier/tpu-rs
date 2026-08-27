@@ -177,7 +177,7 @@ All tools accept absolute paths. Paths must use the OS-native separator
 ```jsonc
 {
   "file": "C:/project/src/lib.rs",       // required
-  "pattern": "fn old_name\(",           // required: literal by default; set regex:true for a pattern
+  "pattern": "fn old_name\\(",           // required: literal by default; set regex:true for a pattern
   "replacement": "fn new_name(",         // required: $0/$1/$name for groups, $$ for literal $
   "regex": true,                         // optional: interpret `pattern` as a regex (default false)
   "multiline": false,                    // optional: make ^ and $ match LF boundaries
