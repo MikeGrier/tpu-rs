@@ -1,5 +1,16 @@
 # Changelog
 
+## [2.0.0](https://github.com/MikeGrier/tpu-rs/compare/v1.3.0...v2.0.0) (2026-08-28)
+
+
+### ⚠ BREAKING CHANGES
+
+* **tpu-mcp:** a `tpu_replace_in_file` run whose pattern matches zero times now returns `status: "error"` instead of `status: "success"`. The file is left untouched (mtime preserved, no `.bak`). Pass `allow_no_match: true` to restore the previous success-with-`count:0`-and- `warning` behaviour for idempotent re-runs. `count: true` and `dry_run: true` are exempt — they are introspection modes where zero is a legitimate answer — as is a `line_ending` override, which rewrites the file even with zero substitutions.
+
+### Features
+
+* **tpu-mcp:** don't stamp mtime on a no-op replace; error on zero match ([ee93ae2](https://github.com/MikeGrier/tpu-rs/commit/ee93ae2b3e437ef6f563a59d06255899ccb0c4d9))
+
 ## [1.3.0](https://github.com/MikeGrier/tpu-rs/compare/v1.2.0...v1.3.0) (2026-08-17)
 
 
