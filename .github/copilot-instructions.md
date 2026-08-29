@@ -4,6 +4,8 @@
      examples for documentation purposes) -->
 
 <!-- tpu-mcp:setup:begin -->
+<!-- tpu-mcp:setup:version=3.0.0 -->
+
 ## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
 
 This workspace runs the **tpu-mcp** MCP server which exposes encoding-aware
@@ -15,6 +17,32 @@ and round-trip the file's native encoding and line endings safely.
 
 **Rule:** when working in any project that has the tpu-mcp server registered,
 ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
+
+### Version check (do this first)
+
+Every `tpu_*` response begins with an `x-tpu-mcp-invocation` header line
+that includes a `tpu_version` field — the version of the running `tpu-mcp`
+binary answering the call. The `<!-- tpu-mcp:setup:version=X.Y.Z -->` HTML
+comment on the very first line of this block records the version of `tpu`
+that wrote this guidance.
+
+**If the two versions differ, stop and report the mismatch to the user
+before performing any file mutation.** Include both versions in the
+message and suggest the remedy:
+
+- **Binary older than guidance** — rebuild / reinstall the `tpu-mcp`
+  extension so its bundled binary matches this guidance, then retry. This
+  is the case that has historically wasted whole sessions: a defect the
+  user reads about as "fixed" is still present in the running binary
+  because the extension's bundled `tpu-mcp.exe` was not updated.
+- **Binary newer than guidance** — re-run `tpu setup --inject
+  <path-to-copilot-instructions.md>` to refresh this block against the
+  newer binary, then retry. Tool descriptions, response shapes, or
+  recommended workflows may have changed.
+
+This check is cheap (one field on one line, checked once per session) and
+catches version-drift bugs before they manifest as silent behavioural
+differences.
 
 | MCP tool | Use it for |
 |---|---|
@@ -60,6 +88,106 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 - **Dependency-free templating** — `tpu_render_file` substitutes
   `{{NAME}}`-style tokens. Use `\{{` to emit literal braces.
 
+### Escape-sequence hazard (JSON transport)
+
+MCP arguments travel as JSON strings. In JSON, `\n` **is** a real newline —
+a literal backslash-n in the file requires `\\n` on the wire. Under-escaping
+is easy for an agent to do because it "sees" the target source text, not
+the JSON transport, and the damage is invisible: the string is already
+decoded to a real newline *before* `tpu_write_file` / `tpu_append_file` /
+`tpu_replace_in_file` / `tpu_edit_file` ever runs, so no flag on the tool
+call can distinguish "intended literal `\n`" from "intended real newline" —
+no server-side option can undo a JSON decode that already happened.
+
+tpu does not add a second layer of its own: every text payload is written
+verbatim, so a correctly JSON-escaped string always lands byte-for-byte.
+(`tpu_replace_in_file`'s `expand_escapes: true` is the sole exception, and
+it is opt-in — leave it off unless you deliberately double-escaped.) The
+residual hazard is purely in getting the JSON escaping right.
+
+**The fix**: when a payload (`content`, `pattern`, `replacement`, or an
+edit op's `data`) contains backslash escapes, embedded quotes, or anything
+not certain to be JSON-escaped correctly, set the matching `*_format`
+argument (`content_format`, `pattern_format`, `replacement_format`, or an
+op's `data_format`) to `"base64"` and send the exact bytes base64-encoded.
+Base64's alphabet has no backslashes, so there is no escaping decision to
+get wrong — this makes the whole class of bug impossible rather than just
+less likely. `"hex"` works the same way; avoid `"encoded"` for this purpose
+since it is itself a backslash-escape codec and re-introduces the hazard.
+
+**Safety net**: `tpu_replace_in_file` also echoes a compact changed-region
+preview of every small real write by default (no `diff:true` needed — see
+`echo_max_lines`), so a corruption like this is visible immediately in the
+same turn instead of requiring a follow-up read. This echo is cheap
+regardless of file size (it never clones the whole file); pass `diff:true`
+for a full old/new unified diff instead.
+
+### Concurrent edits — don't silently clobber (`content_version` / `if_match`)
+
+Copilot may issue several tool calls against the same file in quick
+succession. A blind `tpu_write_file` (or a `tpu_edit_file` at line numbers)
+whose payload was computed from an earlier read can silently overwrite an
+edit that landed in between — a lost update.
+
+Every read (`tpu_read_file`, `tpu_read_head`, `tpu_read_tail`, `tpu_read_file_escaped`)
+reports a `"content_version"` on its invocation-header line (a content digest
+that changes whenever the file's bytes change), and every successful write
+stamp reports the new `"content_version"`. A read MAY omit the token when the
+file changed while it was being read (so it can't be guaranteed to describe
+the bytes returned) — treat a missing token as "re-read before relying on a
+version".
+
+When you mutate a file based on content you previously read, pass that token
+as `if_match` on `tpu_write_file` / `tpu_edit_file` / `tpu_replace_in_file` /
+`tpu_append_file`. If the file changed since you read it, the call is
+REFUSED with `{"status":"conflict",...}` (surfaced as an MCP error,
+`isError: true`) and the file is left unchanged, instead of clobbering the
+other edit; then re-read, rebuild your change against the current content,
+and retry with the new `content_version`.
+
+Prefer a narrow `tpu_replace_in_file` over a full-file `tpu_write_file` when
+you can: a replace operates on the file's current bytes, so it is far less
+prone to lost updates in the first place.
+
+### Tool output format
+
+Every tool response uses a **mixed format**: a JSON invocation header,
+a content-type-dependent body, and (for most tools) a JSON status trailer.
+Not every line is JSON — read tools and `find` return raw content
+between the header and trailer.
+
+- **Line 1** — invocation header:
+  `{"reason":"x-tpu-mcp-invocation","tool":"tpu_NAME","args":{...}}`
+  Large `content`/`replacement`/`template` fields appear as `"<N bytes>"` placeholders.
+- **Mutating tools** (write, replace, edit, append) — normal write:
+  `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N,"content_version":"..."}`
+  (`content_version` is the digest of the just-written file — pass it as
+  `if_match` on your next edit of this file; see "Concurrent edits" above).
+  Preview modes do not stamp the file and return a reduced trailer:
+  `diff:true` adds unified diff lines before the status (full stamp still present for write/replace/edit).
+  `dry_run:true` (replace only): optional diff lines, then `{"status":"success","changed":true|false}`.
+  `count:true` (replace only): `{"status":"success","count":N}`.
+  `append diff:true`: diff lines when changed, then `{"status":"success","file":"...","changed":true|false}`.
+  `tpu_replace_in_file` on a real write additionally reports `"changed_lines":N` in the status —
+  the sum, over every match, of `(old span line count) + (new text line count)`; this is a
+  cheap per-match total, NOT a deduplicated count of unique file lines, so two matches on the
+  same line each contribute their own share and can push N above the file's actual line count —
+  and, as long as N is at most `echo_max_lines` (default 5), automatically prepends a
+  compact changed-region preview (unified-diff-style hunk headers, new lines only — no
+  full-file diff) even without `diff:true`; a larger change instead adds
+  `"diff_omitted":true` (pass `diff:true` for a full old/new unified diff regardless of size).
+- **Structured tools** (count_file, stat_file, copy_file, render_file,
+  setup+target, doctor) — result line
+  `{"reason":"x-tpu-mcp-result",...}` followed by `{"status":"success"}`.
+- **Read tools** (tpu_read_file, tpu_read_head, tpu_read_tail, tpu_read_file_escaped) — header then raw content; no JSON trailer on success.
+  The header line usually carries a `"content_version"` token for this file (see "Concurrent edits" above); pass it as `if_match` when you later edit the file. It may be absent if the file changed mid-read — re-read to get a usable token.
+  **Exception** — `tpu_read_file_binary` with a non-empty `hash` arg acts like a structured tool:
+  `{"reason":"x-tpu-mcp-result","encoding":"bytes-base64","content":"<base64>","hashes":[...]}` followed by `{"status":"success"}`.
+  Without `hash`, `tpu_read_file_binary` returns header + 7-bit-clean escaped bytes (no trailer).
+- **Find tool** (find) — header, then matching lines as plain text, then `{"status":"success","warnings":[...]}` trailer.
+- **Errors** — `{"status":"error","message":"..."}` as the final line;
+  `isError: true` in the MCP wrapper.
+
 ### When a file looks corrupted (mojibake)
 
 Symptoms: `Ã©` where `é` should be, `â€"` where `—` should be, `â"€` instead
@@ -96,6 +224,33 @@ The write-time guard in `tpu_write_file` / `tpu_append_file` /
 `tpu_replace_in_file` / `tpu_edit_file` already refuses to *introduce* new
 mojibake (pre-existing damage passes through). If you genuinely intend to
 write curated mojibake fixtures, pass `allow_mojibake: true`.
+
+### When line endings disagree with git (CRLF / LF)
+
+A separate, git-aware condition: a file's on-disk line endings can differ
+from what git would materialise in the working tree for that path (per
+`.gitattributes` `text`/`eol` attributes and `core.autocrlf` / `core.eol`).
+This is *not* mojibake — the bytes are valid — but it produces noisy diffs
+and "whole file changed" churn.
+
+Detection is **opt-in per call** via a `git_root` argument (an absolute path
+to the repository root; there is no upward auto-discovery):
+
+1. **Detect on read**: pass `git_root` to `tpu_read_file`, `tpu_read_head`,
+   or `tpu_read_tail`. When the file's endings differ from git's expectation
+   the response is prefixed with a single `note:` line and the unchanged
+   content follows.
+2. **Report / repair with doctor**: call `tpu_doctor` with `git_root` to
+   list mismatched files (each flagged with an `eol_mismatch` object). Pass
+   `fix: "eol"` to normalise line endings only, or `fix: "all"` to also peel
+   mojibake. `eol`/`all` require `git_root`; the rewrite is atomic with a
+   `<file>.bak` backup and UTF-16 files are skipped.
+3. **Normalise on write (off by default)**: when the server is started with
+   line-ending normalisation enabled (the `tpu-mcp.normalizeLineEndings` VS Code
+   setting, the `--eol-normalize` flag, or the `TPU_EOL_NORMALIZE` env var),
+   mutating tools given a `git_root` denormalise to git's expected
+   convention unless an explicit `line_ending` is supplied. This is **off by
+   default** so writes never silently rewrite endings without opt-in.
 
 ### File encoding
 

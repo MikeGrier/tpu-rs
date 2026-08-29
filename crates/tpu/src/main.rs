@@ -146,7 +146,8 @@ enum Commands {
         file: PathBuf,
 
         /// Line range to emit: N (single line) or N-M (inclusive, 1-based).
-        /// Omit to emit the entire file.
+        /// Omit to emit the entire file.  An end past the last line is
+        /// clamped; a start past the last line is an error.
         #[arg(long)]
         lines: Option<String>,
 
@@ -549,7 +550,8 @@ enum Commands {
         file: PathBuf,
 
         /// Line range to include: N (single line) or N-M (inclusive, 1-based).
-        /// Omit to include the entire file.
+        /// Omit to include the entire file.  An end past the last line is
+        /// clamped; a start past the last line is an error.
         #[arg(long)]
         lines: Option<String>,
 

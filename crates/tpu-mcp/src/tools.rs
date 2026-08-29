@@ -191,7 +191,9 @@ pub fn list() -> Value {
                         "type": "string",
                         "description":
                             "Optional 1-based inclusive line range: 'N' for a single line \
-                             or 'N-M' for a range. Omit to return the entire file."
+                             or 'N-M' for a range. Omit to return the entire file. An end \
+                             bound past the last line is clamped; a start bound past the \
+                             last line is an error reporting the file's real line count."
                     },
                     "numbers": {
                         "type": "boolean",
@@ -919,7 +921,9 @@ pub fn list() -> Value {
                         "type": "string",
                         "description":
                             "Optional 1-based inclusive line range: 'N' or 'N-M'. \
-                             Omit to include the entire file."
+                             Omit to include the entire file. An end bound past the last \
+                             line is clamped; a start bound past the last line is an error \
+                             reporting the file's real line count."
                     },
                     "numbers": {
                         "type": "boolean",

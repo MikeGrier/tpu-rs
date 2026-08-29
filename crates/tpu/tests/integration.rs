@@ -126,6 +126,22 @@ pub fn asset(name: &str) -> PathBuf {
     ASSET_DIR.1.join(name)
 }
 
+/// Count the logical lines in a file the same way `tpu read` does: split on
+/// LF and drop the empty tail produced by a trailing newline.  Valid for the
+/// ASCII/UTF-8 assets used by the generated read/readex suites.
+pub fn line_count(path: &std::path::Path) -> usize {
+    let bytes = fs::read(path).expect("read asset for line count");
+    if bytes.is_empty() {
+        return 0;
+    }
+    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
+    if bytes.ends_with(b"\n") {
+        newlines
+    } else {
+        newlines + 1
+    }
+}
+
 /// Run a command, assert exit 0, return its Output.
 /// Accepts `&mut Command` so callers can pass `tpu().arg(...).arg(...)` chains
 /// directly (since `Command::arg` returns `&mut Command`).
@@ -254,10 +270,43 @@ macro_rules! read_text_suite {
             fn lines_1_ok() {
                 ok(tpu().arg("read").arg("--lines=1").arg(f()));
             }
-            /// --lines 2 is accepted even for files shorter than 2 lines.
+            /// --lines 2 is accepted when the file actually has a second line,
+            /// and fails cleanly (never panics) when it does not.
             #[test]
-            fn lines_2_ok() {
-                ok(tpu().arg("read").arg("--lines=2").arg(f()));
+            fn lines_2_matches_file_length() {
+                if line_count(&f()) >= 2 {
+                    ok(tpu().arg("read").arg("--lines=2").arg(f()));
+                } else {
+                    let o = err(tpu().arg("read").arg("--lines=2").arg(f()));
+                    assert_clean_failure(&o, "past end of file");
+                }
+            }
+            /// The file's last line is always addressable.
+            #[test]
+            fn lines_last_ok() {
+                let total = line_count(&f());
+                ok(tpu().arg("read").arg(format!("--lines={total}")).arg(f()));
+            }
+            /// One line past the end is a clean error, never a panic.
+            #[test]
+            fn lines_one_past_end_exits_err() {
+                let total = line_count(&f());
+                let o = err(tpu()
+                    .arg("read")
+                    .arg(format!("--lines={}", total + 1))
+                    .arg(f()));
+                assert_clean_failure(&o, &format!("past end of file ({total} lines)"));
+            }
+            /// A start far past the end is a clean error, never a panic.
+            #[test]
+            fn lines_far_past_end_exits_err() {
+                let o = err(tpu().arg("read").arg("--lines=999999").arg(f()));
+                assert_clean_failure(&o, "past end of file");
+            }
+            /// An end bound past the last line is clamped, not rejected.
+            #[test]
+            fn lines_end_past_eof_is_clamped() {
+                ok(tpu().arg("read").arg("--lines=1-999999").arg(f()));
             }
             /// --numbers adds a prefix to each output line.
             #[test]
@@ -354,10 +403,33 @@ macro_rules! readex_text_suite {
             fn lines_1_ok() {
                 ok(tpu().arg("readex").arg("--lines=1").arg(f()));
             }
-            /// --lines 1-2 is accepted even for 1-line files.
+            /// --lines 1-2 is accepted even for 1-line files (the end bound is
+            /// clamped; only the *start* bound is checked against the file).
             #[test]
             fn lines_1_to_2_ok() {
                 ok(tpu().arg("readex").arg("--lines=1-2").arg(f()));
+            }
+            /// The file's last line is always addressable.
+            #[test]
+            fn lines_last_ok() {
+                let total = line_count(&f());
+                ok(tpu().arg("readex").arg(format!("--lines={total}")).arg(f()));
+            }
+            /// One line past the end is a clean error, never a panic.
+            #[test]
+            fn lines_one_past_end_exits_err() {
+                let total = line_count(&f());
+                let o = err(tpu()
+                    .arg("readex")
+                    .arg(format!("--lines={}", total + 1))
+                    .arg(f()));
+                assert_clean_failure(&o, &format!("past end of file ({total} lines)"));
+            }
+            /// A start far past the end is a clean error, never a panic.
+            #[test]
+            fn lines_far_past_end_exits_err() {
+                let o = err(tpu().arg("readex").arg("--lines=999999").arg(f()));
+                assert_clean_failure(&o, "past end of file");
             }
             /// --numbers is accepted.
             #[test]
@@ -996,13 +1068,257 @@ fn read_empty_file_text_mode_ok() {
 
 // ─── read: special behaviour ─────────────────────────────────────────────────
 
+/// Assert a `tpu` invocation failed *cleanly*: non-zero exit, no Rust panic,
+/// an `error:` diagnostic on stderr mentioning `needle`, and nothing written
+/// to stdout.
+///
+/// The distinction matters: an out-of-range `--lines` request used to abort
+/// the process with `range start index N out of range` (exit 101), which
+/// under `tpu-mcp` killed the io worker and triggered a respawn/retry storm.
+fn assert_clean_failure(o: &Output, needle: &str) {
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !stderr.contains("panicked"),
+        "process panicked instead of failing cleanly:\n{stderr}"
+    );
+    assert!(
+        !stderr.contains("out of range for slice"),
+        "slice indexing panic leaked to stderr:\n{stderr}"
+    );
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "expected a clean exit code 1, got {:?}:\n{stderr}",
+        o.status.code()
+    );
+    assert!(
+        stderr.contains(needle),
+        "stderr should mention {needle:?}:\n{stderr}"
+    );
+    assert!(
+        o.stdout.is_empty(),
+        "failed read wrote to stdout: {:?}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+}
+
 #[test]
 fn read_lines_out_of_range_exits_err() {
-    // Line 9999 is beyond the file; start > end causes a panic exit (non-zero).
-    err(tpu()
+    // Line 9999 is beyond the 10-line file: a clean error, never a panic.
+    let o = err(tpu()
         .arg("read")
         .arg("--lines=9999")
         .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(
+        &o,
+        "--lines: start line 9999 is past end of file (10 lines)",
+    );
+}
+
+#[test]
+fn read_lines_one_past_end_exits_err() {
+    let o = err(tpu()
+        .arg("read")
+        .arg("--lines=11")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(&o, "past end of file (10 lines)");
+}
+
+#[test]
+fn read_lines_range_starting_past_end_exits_err() {
+    // The end bound is normally clamped, but a start past EOF is still fatal.
+    let o = err(tpu()
+        .arg("read")
+        .arg("--lines=11-20")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(&o, "--lines: start line 11 is past end of file (10 lines)");
+}
+
+#[test]
+fn read_lines_last_line_ok() {
+    // The boundary just inside the file must still succeed.
+    let o = ok(tpu()
+        .arg("read")
+        .arg("--lines=10")
+        .arg(asset("ascii_10lines.txt")));
+    assert!(!o.stdout.is_empty(), "expected the last line's content");
+}
+
+#[test]
+fn read_lines_last_line_with_open_end_is_clamped() {
+    let o = ok(tpu()
+        .arg("read")
+        .arg("--lines=10-9999")
+        .arg(asset("ascii_10lines.txt")));
+    let lines: Vec<&[u8]> = o
+        .stdout
+        .split(|&b| b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
+    assert_eq!(lines.len(), 1, "expected exactly the last line");
+}
+
+#[test]
+fn read_lines_usize_max_exits_err_without_panic() {
+    // Parses fine as a usize, then fails the bounds check — no overflow.
+    let o = err(tpu()
+        .arg("read")
+        .arg("--lines=18446744073709551615")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(&o, "past end of file");
+}
+
+#[test]
+fn read_lines_overflowing_value_exits_err_without_panic() {
+    // Too large for usize: rejected at parse time.
+    let o = err(tpu()
+        .arg("read")
+        .arg("--lines=99999999999999999999999")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(&o, "invalid line number");
+}
+
+#[test]
+fn read_lines_negative_exits_err_without_panic() {
+    for arg in ["--lines=-5", "--lines=-5--1", "--lines=5--3", "--lines=-"] {
+        let o = err(tpu().arg("read").arg(arg).arg(asset("ascii_10lines.txt")));
+        assert_clean_failure(&o, "--lines");
+    }
+}
+
+#[test]
+fn read_lines_malformed_exits_err_without_panic() {
+    for arg in [
+        "--lines=abc",
+        "--lines=1-abc",
+        "--lines=1-",
+        "--lines=1.5",
+        "--lines=0x10",
+        "--lines=1-2-3",
+        "--lines= ",
+    ] {
+        let o = err(tpu().arg("read").arg(arg).arg(asset("ascii_10lines.txt")));
+        assert_clean_failure(&o, "--lines");
+    }
+}
+
+#[test]
+fn read_lines_on_empty_file_exits_err() {
+    let o = err(tpu().arg("read").arg("--lines=1").arg(asset("empty.txt")));
+    assert_clean_failure(&o, "past end of file (0 lines)");
+}
+
+#[test]
+fn read_lines_past_end_of_single_line_file_exits_err() {
+    let o = err(tpu()
+        .arg("read")
+        .arg("--lines=2")
+        .arg(asset("singleline.txt")));
+    assert_clean_failure(&o, "past end of file (1 lines)");
+}
+
+#[test]
+fn read_lines_last_line_of_file_without_trailing_newline_ok() {
+    // A file whose final line lacks a terminator still has that line.
+    ok(tpu()
+        .arg("read")
+        .arg("--lines=1")
+        .arg(asset("singleline_no_nl.txt")));
+}
+
+#[test]
+fn read_lines_past_end_of_file_without_trailing_newline_exits_err() {
+    let o = err(tpu()
+        .arg("read")
+        .arg("--lines=2")
+        .arg(asset("singleline_no_nl.txt")));
+    assert_clean_failure(&o, "past end of file");
+}
+
+#[test]
+fn read_lines_past_end_of_crlf_file_exits_err() {
+    let o = err(tpu()
+        .arg("read")
+        .arg("--lines=9999")
+        .arg(asset("multiline_crlf.txt")));
+    assert_clean_failure(&o, "past end of file");
+}
+
+#[test]
+fn read_lines_past_end_with_numbers_exits_err() {
+    let o = err(tpu()
+        .arg("read")
+        .arg("--numbers")
+        .arg("--lines=9999")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(&o, "past end of file");
+}
+
+#[test]
+fn read_lines_past_end_emits_no_bom() {
+    // --bom=force must not leave three stray bytes on stdout when the range
+    // itself is rejected.
+    let o = err(tpu()
+        .arg("read")
+        .arg("--utf8")
+        .arg("--bom=force")
+        .arg("--lines=9999")
+        .arg(asset("utf8_bom.txt")));
+    assert_clean_failure(&o, "past end of file");
+}
+
+#[test]
+fn readex_lines_out_of_range_exits_err() {
+    let o = err(tpu()
+        .arg("readex")
+        .arg("--lines=9999")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(
+        &o,
+        "--lines: start line 9999 is past end of file (10 lines)",
+    );
+}
+
+#[test]
+fn readex_lines_one_past_end_exits_err() {
+    let o = err(tpu()
+        .arg("readex")
+        .arg("--lines=11-20")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(&o, "past end of file (10 lines)");
+}
+
+#[test]
+fn readex_lines_on_empty_file_exits_err() {
+    // The empty-file shortcut must validate the range too.
+    let o = err(tpu().arg("readex").arg("--lines=1").arg(asset("empty.txt")));
+    assert_clean_failure(&o, "past end of file (0 lines)");
+}
+
+#[test]
+fn readex_lines_last_line_ok() {
+    ok(tpu()
+        .arg("readex")
+        .arg("--lines=10")
+        .arg(asset("ascii_10lines.txt")));
+}
+
+#[test]
+fn readex_lines_usize_max_exits_err_without_panic() {
+    let o = err(tpu()
+        .arg("readex")
+        .arg("--lines=18446744073709551615")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(&o, "past end of file");
+}
+
+#[test]
+fn readex_lines_negative_exits_err_without_panic() {
+    let o = err(tpu()
+        .arg("readex")
+        .arg("--lines=-5")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(&o, "--lines");
 }
 
 #[test]
@@ -4877,6 +5193,96 @@ fn edit_line_out_of_range_line_number_exits_nonzero() {
         !bak(&src).exists(),
         ".bak must not exist when edit aborts before any write"
     );
+}
+
+/// ED-IT-17b: `$` / `EOF` bounds against a file with no content lines exit
+/// cleanly instead of panicking.
+///
+/// Regression: `EOF_SENTINEL` was resolved to `total_lines` *after* the
+/// 1-based guard, so on a zero-line file it became 0, slipped past the
+/// `start_line > total_lines` check (`0 > 0` is false) and underflowed
+/// `line_starts[start_line - 1]`, aborting the process with exit 101.  Under
+/// tpu-mcp that killed the io worker.
+#[test]
+fn edit_line_eof_sentinel_on_empty_file_exits_cleanly() {
+    // Every EOF-bearing line-mode range form, against a truly empty file.
+    for args in [
+        vec!["--delete", "$"],
+        vec!["--delete", "1-$"],
+        vec!["--delete", "$-$"],
+        vec!["--splice", "$", "x"],
+        vec!["--splice", "1-$", "x"],
+    ] {
+        let (_dir, src) = temp_bin(b"");
+        let mut c = tpu();
+        c.arg("edit").arg(&src);
+        for a in &args {
+            c.arg(a);
+        }
+        let o = err(&mut c);
+
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            !stderr.contains("panicked"),
+            "{args:?} panicked instead of failing cleanly:\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("subtract with overflow"),
+            "{args:?} underflowed:\n{stderr}"
+        );
+        assert_eq!(
+            o.status.code(),
+            Some(1),
+            "{args:?} should exit 1, got {:?}:\n{stderr}",
+            o.status.code()
+        );
+        assert!(
+            stderr.contains("out of range"),
+            "{args:?} should report an out-of-range error:\n{stderr}"
+        );
+        // The file must be untouched and no .bak left behind.
+        assert_eq!(fs::read(&src).unwrap(), b"", "{args:?} modified the file");
+        assert!(!bak(&src).exists(), "{args:?} left a .bak behind");
+    }
+}
+
+/// ED-IT-17c: the same guarantee for a BOM-only file.
+///
+/// This case matters because the file is *not* zero-length on disk — it is
+/// three bytes — so no "empty file" shortcut catches it.  The view's bytes are
+/// empty only after the BOM is stripped.
+#[test]
+fn edit_line_eof_sentinel_on_bom_only_file_exits_cleanly() {
+    let (_dir, src) = temp_bin(&[0xEF, 0xBB, 0xBF]);
+    let original = fs::read(&src).unwrap();
+
+    let o = err(tpu().arg("edit").arg(&src).arg("--delete").arg("$"));
+
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(!stderr.contains("panicked"), "panicked:\n{stderr}");
+    assert_eq!(o.status.code(), Some(1), "expected exit 1:\n{stderr}");
+    assert!(
+        stderr.contains("out of range"),
+        "expected an out-of-range error:\n{stderr}"
+    );
+    assert_eq!(
+        fs::read(&src).unwrap(),
+        original,
+        "BOM-only file must be unchanged"
+    );
+}
+
+/// ED-IT-17d: `$` still resolves normally on files that do have lines, so the
+/// zero-line guard did not over-reject.
+#[test]
+fn edit_line_eof_sentinel_still_works_on_nonempty_file() {
+    let (_dir, src) = temp_bin(b"a\nb\nc\n");
+    ok(tpu().arg("edit").arg(&src).arg("--delete").arg("$"));
+    assert_eq!(fs::read(&src).unwrap(), b"a\nb\n");
+
+    let (_dir2, src2) = temp_bin(b"only\n");
+    ok(tpu().arg("edit").arg(&src2).arg("--delete").arg("$"));
+    assert_eq!(fs::read(&src2).unwrap(), b"");
 }
 
 /// ED-IT-18: Overlapping patches in one invocation exit non-zero before any
