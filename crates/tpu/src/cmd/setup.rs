@@ -120,7 +120,11 @@ differences.
 - **Edits** — prefer `tpu_replace_in_file` (literal matching by default,
   no escaping needed) over `tpu_edit_file` when the target text is unique,
   because line numbers can shift between reads. Use `tpu_edit_file` when
-  you have just read the file and know exact line offsets.
+  you have just read the file and know exact line offsets. Every text
+  payload — `content`, `text`, `replacement`, an op's `data` — is written
+  **verbatim**: backslashes are never collapsed, so no tpu tool needs
+  pre-doubled escapes. (`tpu_replace_in_file` accepts an opt-in
+  `expand_escapes: true` for callers that deliberately double-escape.)
 - **Writes that should be guarded** — pass `validate: [{ "selector":
   "line-contains:N", "value": "..." }]` to refuse the write if the file is
   not in the expected state.
@@ -143,8 +147,13 @@ the JSON transport, and the damage is invisible: the string is already
 decoded to a real newline *before* `tpu_write_file` / `tpu_append_file` /
 `tpu_replace_in_file` / `tpu_edit_file` ever runs, so no flag on the tool
 call can distinguish "intended literal `\n`" from "intended real newline" —
-`literal_replacement` and similar options cannot undo a JSON decode that
-already happened.
+no server-side option can undo a JSON decode that already happened.
+
+tpu does not add a second layer of its own: every text payload is written
+verbatim, so a correctly JSON-escaped string always lands byte-for-byte.
+(`tpu_replace_in_file`'s `expand_escapes: true` is the sole exception, and
+it is opt-in — leave it off unless you deliberately double-escaped.) The
+residual hazard is purely in getting the JSON escaping right.
 
 **The fix**: when a payload (`content`, `pattern`, `replacement`, or an
 edit op's `data`) contains backslash escapes, embedded quotes, or anything

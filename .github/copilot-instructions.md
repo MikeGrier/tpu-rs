@@ -42,7 +42,11 @@ ALWAYS prefer the `tpu_*` tools over PowerShell or shell file commands.
 - **Edits** — prefer `tpu_replace_in_file` (literal matching by default,
   no escaping needed) over `tpu_edit_file` when the target text is unique,
   because line numbers can shift between reads. Use `tpu_edit_file` when
-  you have just read the file and know exact line offsets.
+  you have just read the file and know exact line offsets. Every text
+  payload — `content`, `text`, `replacement`, an op's `data` — is written
+  **verbatim**: backslashes are never collapsed, so no tpu tool needs
+  pre-doubled escapes. (`tpu_replace_in_file` accepts an opt-in
+  `expand_escapes: true` for callers that deliberately double-escape.)
 - **Writes that should be guarded** — pass `validate: [{ "selector":
   "line-contains:N", "value": "..." }]` to refuse the write if the file is
   not in the expected state.
@@ -197,26 +201,29 @@ process isolation, built-in retries, and filter expressions.
    - the file is known to be ASCII-only (no non-ASCII bytes anywhere), and
    - none of the tools above are available.
 
-### ⚠️ `tpu_replace_in_file` replacement-string escaping
+### `tpu_replace_in_file` replacement-string escaping
 
-`tpu_replace_in_file` **always expands** `\n`, `\r`, `\t`, and `\\` in the
-`replacement` parameter to real newline / CR / tab / backslash before writing.
-The `tpu replace` CLI does the same by default; pass `--literal-replacement`
-(`-L`) to keep backslashes verbatim. This is intentional and documented
-behaviour, but
-it makes the tool **unsuitable for writing source-code escape sequences** like
-`"\n"`, `"\t"` in Rust, C, Python, or JSON string literals — those sequences
-become real control characters in the file.
+`tpu_replace_in_file` writes `replacement` **verbatim** — the same contract as
+`tpu_write_file`'s `content` and `tpu_append_file`'s `text`. Backslashes are
+never collapsed, so source-level escape sequences (`"\n"`, `"\t"`, `r"\\."`,
+`\d+`) land in the file exactly as sent. No pre-doubling is needed for any
+tpu tool.
 
-**Rule**: when the replacement text must contain a literal `\n`, `\t`, `\r`,
-or `\\` (e.g. a Rust string literal, a JSON value, a regex), use the
-**VS Code editor `replace_string_in_file`** tool instead, which treats
-`newString` as verbatim text with no secondary escape expansion.
+To get a real newline, put a real newline in the JSON string. Pass
+`expand_escapes: true` only if you deliberately double-escaped the payload and
+want the old sed-style decoding (`\n`/`\r` → LF, `\t` → TAB, `\\` → one
+backslash); it cannot be combined with `replacement_format`.
 
-To write a literal backslash-n via `tpu_replace_in_file` anyway, quadruple-
-escape in JSON: `"\\\\n"` → post-JSON `\\n` → tool expands `\\` → `\` and
-passes `n` through → file gets `\n`.  This is error-prone; prefer the editor
-tool for any replacement that contains source-level escape sequences.
+Builds of `tpu-mcp` up to and including 2.0.0 applied that decoding
+unconditionally, which silently collapsed `\\` to `\` — e.g. a replacement
+containing `r"\\."` was written as `r"\."`, disabling the guard it was meant to
+add. If you are working against an older server (check the `tpu_version` echoed
+in the invocation header), that hazard still applies: use
+`replacement_format: "base64"` there.
+
+Note the CLI differs on purpose: `tpu replace` interprets `\n` in the
+replacement by default (sed/perl/ripgrep convention); pass
+`--literal-replacement` / `-L` for verbatim.
 
 PowerShell is fine — and preferred — for read-only inspection
 (`Get-ChildItem`, `Select-String`, `git status`, …) and for running build

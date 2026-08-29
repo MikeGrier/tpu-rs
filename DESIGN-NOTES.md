@@ -252,9 +252,13 @@ wants the matched text echoed back must introduce a capturing group (e.g. wrap t
 pattern in `( … )` and reference `$1`).  This is a deliberate, user-visible behavioural
 change from the previous always-expand semantics.
 
-Backslash-escape decoding (`\n`, `\t`, `\\`, …) is orthogonal and unchanged — it happens
-in the caller (`decode_replacement` / the MCP `unescape_replacement`) before the bytes
-reach `run`, regardless of group presence.
+Backslash-escape decoding (`\n`, `\t`, `\\`, …) is orthogonal and happens in the caller
+before the bytes reach `run`, regardless of group presence — but the two front ends
+differ in their default.  The CLI's `decode_replacement` decodes by default
+(`sed`/`perl`/`ripgrep` convention, `--literal-replacement` / `-L` to opt out); the MCP
+server writes `replacement` verbatim by default and only calls its
+`unescape_replacement` when the caller passes `expand_escapes: true`.  See
+`crates/tpu-mcp/DESIGN-NOTES.md` for why the MCP default was inverted.
 
 ---
 
