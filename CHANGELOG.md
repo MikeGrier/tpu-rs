@@ -1,5 +1,18 @@
 # Changelog
 
+## [4.0.0](https://github.com/MikeGrier/tpu-rs/compare/v3.0.0...v4.0.0) (2026-08-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **tpu:** a `--lines` / `lines` range whose start is past the end of the file is now an error instead of producing empty output. This mostly replaces a process abort (exit 101) with a clean exit 1, but one case flips success into failure: `tpu readex --lines=1` against a zero-line file previously exited 0. End bounds past the last line are still clamped, so `--lines=1-9999` is unaffected.
+
+### Bug Fixes
+
+* **tpu:** honour --bom on empty files in readex ([c90c079](https://github.com/MikeGrier/tpu-rs/commit/c90c079f2bbb133461995ef4ae8733d64c30e783))
+* **tpu:** pluralize line counts and make usize::MAX tests target-independent ([e68b347](https://github.com/MikeGrier/tpu-rs/commit/e68b3472b7dcfb304184b9bcf11d88962a596383))
+* **tpu:** reject line ranges that start past EOF instead of panicking ([e972962](https://github.com/MikeGrier/tpu-rs/commit/e9729620f12a248f55a8df29583a71158cdcf7b0))
+
 ## [3.0.0](https://github.com/MikeGrier/tpu-rs/compare/v2.0.0...v3.0.0) (2026-08-29)
 
 
