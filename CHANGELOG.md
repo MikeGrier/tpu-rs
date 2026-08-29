@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.0.1](https://github.com/MikeGrier/tpu-rs/compare/v4.0.0...v4.0.1) (2026-08-29)
+
+
+### Bug Fixes
+
+* **tpu:** refresh setup guidance for the 2.0.0-4.0.0 behaviour changes ([2a991b5](https://github.com/MikeGrier/tpu-rs/commit/2a991b5daa917d5c58beff821ac00199f3ecc9de))
+
 ## [4.0.0](https://github.com/MikeGrier/tpu-rs/compare/v3.0.0...v4.0.0) (2026-08-29)
 
 
