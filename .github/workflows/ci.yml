@@ -14,9 +14,10 @@ permissions:
 # fork-safe — two forks can share a branch name but never the same PR number).
 # On push-to-main and other non-PR events the PR number is absent, so
 # github.run_id is used (unique per run → no cross-run cancellation).  This
-# ensures that when the release-please `update-lockfile` job pushes a
-# Cargo.lock fix commit to the Release PR branch, the earlier
-# (stale-lockfile) run is cancelled and only the fresh run proceeds.
+# ensures that when the release-please `sync-version-artifacts` job pushes a
+# fix commit to the Release PR branch (refreshed Cargo.lock and re-injected
+# guidance block), the earlier (stale-artifact) run is cancelled and only the
+# fresh run proceeds.
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true

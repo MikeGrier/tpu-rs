@@ -417,9 +417,12 @@ fn repo_copilot_instructions_block_matches_generated_guidance() {
     assert_eq!(
         block,
         generated,
-        "{} is stale: re-run `cargo run -p tpu -- setup --inject .github/copilot-instructions.md` \
-         after any change to guidance_body()",
-        instructions.display()
+        "{} is stale: re-run `cargo run -p tpu -- setup --inject .github/copilot-instructions.md`. \
+         Triggered by a change to guidance_body(), or by a version bump — the block's \
+         `setup:version=` marker embeds CARGO_PKG_VERSION ({}), so a release PR must re-inject \
+         too (automated by the sync-version-artifacts job in .github/workflows/release-please.yml)",
+        instructions.display(),
+        env!("CARGO_PKG_VERSION"),
     );
 }
 
