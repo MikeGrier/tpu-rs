@@ -126,6 +126,13 @@ pub fn asset(name: &str) -> PathBuf {
     ASSET_DIR.1.join(name)
 }
 
+/// Format a line count the way the `read`/`readex`/`edit` out-of-range errors
+/// do, so expectations stay correct for single-line files ("1 line", not
+/// "1 lines").
+pub fn plural_lines(n: usize) -> String {
+    format!("{n} line{}", if n == 1 { "" } else { "s" })
+}
+
 /// Count the logical lines in a file the same way `tpu read` does: split on
 /// LF and drop the empty tail produced by a trailing newline.  Valid for the
 /// ASCII/UTF-8 assets used by the generated read/readex suites.
@@ -295,7 +302,7 @@ macro_rules! read_text_suite {
                     .arg("read")
                     .arg(format!("--lines={}", total + 1))
                     .arg(f()));
-                assert_clean_failure(&o, &format!("past end of file ({total} lines)"));
+                assert_clean_failure(&o, &format!("past end of file ({})", plural_lines(total)));
             }
             /// A start far past the end is a clean error, never a panic.
             #[test]
@@ -423,7 +430,7 @@ macro_rules! readex_text_suite {
                     .arg("readex")
                     .arg(format!("--lines={}", total + 1))
                     .arg(f()));
-                assert_clean_failure(&o, &format!("past end of file ({total} lines)"));
+                assert_clean_failure(&o, &format!("past end of file ({})", plural_lines(total)));
             }
             /// A start far past the end is a clean error, never a panic.
             #[test]
@@ -1161,19 +1168,24 @@ fn read_lines_last_line_with_open_end_is_clamped() {
 #[test]
 fn read_lines_usize_max_exits_err_without_panic() {
     // Parses fine as a usize, then fails the bounds check — no overflow.
+    // Built from `usize::MAX` rather than a hard-coded 64-bit literal so the
+    // expected failure mode (bounds check, not parse error) holds on 32-bit
+    // targets too.
     let o = err(tpu()
         .arg("read")
-        .arg("--lines=18446744073709551615")
+        .arg(format!("--lines={}", usize::MAX))
         .arg(asset("ascii_10lines.txt")));
     assert_clean_failure(&o, "past end of file");
 }
 
 #[test]
 fn read_lines_overflowing_value_exits_err_without_panic() {
-    // Too large for usize: rejected at parse time.
+    // One past `usize::MAX`, so it can never parse on any target: rejected at
+    // parse time regardless of pointer width.
+    let overflowing = (usize::MAX as u128 + 1).to_string();
     let o = err(tpu()
         .arg("read")
-        .arg("--lines=99999999999999999999999")
+        .arg(format!("--lines={overflowing}"))
         .arg(asset("ascii_10lines.txt")));
     assert_clean_failure(&o, "invalid line number");
 }
@@ -1210,11 +1222,37 @@ fn read_lines_on_empty_file_exits_err() {
 
 #[test]
 fn read_lines_past_end_of_single_line_file_exits_err() {
+    // A 1-line file must read "1 line", not "1 lines".
     let o = err(tpu()
         .arg("read")
         .arg("--lines=2")
         .arg(asset("singleline.txt")));
-    assert_clean_failure(&o, "past end of file (1 lines)");
+    assert_clean_failure(&o, "past end of file (1 line)");
+
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        !stderr.contains("1 lines"),
+        "line count must be singular for a 1-line file:\n{stderr}"
+    );
+}
+
+#[test]
+fn read_lines_past_end_line_count_is_pluralized_correctly() {
+    // Singular only at exactly 1; plural for 0 and for >1.
+    let zero = err(tpu().arg("read").arg("--lines=1").arg(asset("empty.txt")));
+    assert_clean_failure(&zero, "past end of file (0 lines)");
+
+    let one = err(tpu()
+        .arg("read")
+        .arg("--lines=99")
+        .arg(asset("singleline.txt")));
+    assert_clean_failure(&one, "past end of file (1 line)");
+
+    let many = err(tpu()
+        .arg("read")
+        .arg("--lines=99")
+        .arg(asset("ascii_10lines.txt")));
+    assert_clean_failure(&many, "past end of file (10 lines)");
 }
 
 #[test]
@@ -1307,7 +1345,7 @@ fn readex_lines_last_line_ok() {
 fn readex_lines_usize_max_exits_err_without_panic() {
     let o = err(tpu()
         .arg("readex")
-        .arg("--lines=18446744073709551615")
+        .arg(format!("--lines={}", usize::MAX))
         .arg(asset("ascii_10lines.txt")));
     assert_clean_failure(&o, "past end of file");
 }

@@ -146,7 +146,8 @@ pub fn resolve_line_range(
     }
     if start > total_lines {
         return Err(format!(
-            "--lines: start line {start} is past end of file ({total_lines} lines)"
+            "--lines: start line {start} is past end of file ({total_lines} line{})",
+            if total_lines == 1 { "" } else { "s" }
         )
         .into());
     }
@@ -1027,6 +1028,32 @@ mod tests {
         assert!(
             err.to_string().contains("(3 lines)"),
             "message should state the real line count: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_error_message_pluralizes_line_count() {
+        // Singular only at exactly 1 line; plural at 0 and above 1.
+        assert!(
+            resolve_line_range(Some((2, 2)), 1)
+                .unwrap_err()
+                .to_string()
+                .ends_with("(1 line)"),
+            "a 1-line file must read '1 line'"
+        );
+        assert!(
+            resolve_line_range(Some((1, 1)), 0)
+                .unwrap_err()
+                .to_string()
+                .ends_with("(0 lines)"),
+            "a 0-line file must read '0 lines'"
+        );
+        assert!(
+            resolve_line_range(Some((3, 3)), 2)
+                .unwrap_err()
+                .to_string()
+                .ends_with("(2 lines)"),
+            "a 2-line file must read '2 lines'"
         );
     }
 
