@@ -386,7 +386,13 @@ fn repo_copilot_instructions_block_matches_generated_guidance() {
     let on_disk = fs::read_to_string(&instructions)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", instructions.display()))
         .replace("\r\n", "\n");
-    let generated = String::from_utf8_lossy(&ok(tpu().arg("setup")).stdout)
+    // Strict decode, not `from_utf8_lossy`: the guidance is a `&'static str`,
+    // so invalid UTF-8 on stdout means the emit path corrupted it. Lossy
+    // decoding would substitute U+FFFD and could let that corruption compare
+    // equal — silently defeating the byte-identical check this test exists for.
+    let stdout = ok(tpu().arg("setup")).stdout;
+    let generated = String::from_utf8(stdout)
+        .expect("`tpu setup` must emit valid UTF-8")
         .replace("\r\n", "\n")
         .trim_end()
         .to_string();
