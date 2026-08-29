@@ -11,16 +11,40 @@ It communicates over JSON-RPC 2.0 on stdio using newline-delimited messages and 
 
 ---
 
-## Replacement escape-sequence expansion
+## Replacement escape-sequence handling (verbatim by default)
 
-`tpu_replace_in_file` passes the `replacement` string to
-`regex::bytes::Captures::expand()`, which only interprets `$N`/`$$` capture-group
-syntax — it does not process backslash escape sequences.  Copilot routinely sends `\n`
-in replacement strings expecting a newline, which would otherwise produce the two
-literal characters `\` and `n` in the output file.
+`tpu_replace_in_file`'s `replacement` is written **verbatim**: the characters the
+caller sent are the characters substituted into the file, exactly like
+`tpu_write_file`'s `content`, `tpu_append_file`'s `text`, and an edit op's `data`.
+Only `regex::bytes::Captures::expand()`'s `$N`/`$$` capture syntax is interpreted
+on top, and only under the conditions described below.
 
-**Fix:** `unescape_replacement()` in `tools.rs` expands the following sequences before
-the replacement reaches the regex engine:
+### Why the old unconditional unescape was removed
+
+Until v2.0, `decode_replacement_arg` ran `unescape_replacement()` on every plain-text
+replacement, expanding `\n`/`\r` to LF, `\t` to TAB, and `\\` to a single backslash.
+The stated motive was ergonomic: an agent that sends `\n` "expecting a newline"
+gets one.  But JSON transport already delivers a real newline for a correctly
+escaped `"\n"`, so the pass only ever fired on *doubled* escapes — and it collapsed
+them unconditionally.  That silently corrupted every replacement whose payload
+legitimately contains backslashes:
+
+| Caller intended | Old behaviour | Consequence |
+|---|---|---|
+| `path.starts_with(r"\\.")` | `path.starts_with(r"\.")` | UNC-path guard silently disabled |
+| `"a\tb\n"` in a Rust/C/JSON literal | real TAB + real newline | broken string literal / source file |
+| `\\d+` in a regex source | `\d+` | different (or invalid) pattern |
+
+The damage was invisible from the call site: the same argument name behaved
+differently across tools (`content` verbatim, `replacement` not), so a caller had
+no way to know that this one payload needed pre-doubling, and no flag could
+recover the intent after the fact.  Verbatim-everywhere removes the guesswork —
+the rule is now "no tpu text argument is ever re-decoded."
+
+### `expand_escapes` (opt-in)
+
+`expand_escapes: true` restores the old sed-style decoding via
+`unescape_replacement()` for callers that deliberately send doubled escapes:
 
 | Input sequence | Expands to |
 |---|---|
@@ -32,7 +56,18 @@ the replacement reaches the regex engine:
 All other `\X` sequences are passed through unchanged so that capture-group syntax
 (`$1`, `$name`, `$$`) is unaffected.  After unescape, `normalize_to_lf` is applied so
 any `\r` or `\r\n` introduced by the escape expansion is folded to LF before the
-normalised tpu view sees it.
+normalised tpu view sees it.  (That LF normalisation applies to the verbatim path
+too — it is a property of tpu's substitution space, not of escape decoding.)
+
+`expand_escapes` cannot be combined with `replacement_format`: that channel exists
+precisely because the caller already knows the exact bytes, so re-decoding them
+would be contradictory.  The combination is rejected with an error rather than
+silently resolved in one direction.
+
+Note the CLI is deliberately **not** aligned with this: `tpu replace` keeps
+`sed`/`perl`/`ripgrep` escape semantics by default (with `--literal-replacement` /
+`-L` to opt out) because a shell user typing `\n` at a prompt is a different
+transport with different conventions from a JSON-RPC argument.
 
 ### Capture-group `$` expansion is conditional, and regex is opt-in
 
@@ -41,10 +76,7 @@ fires when `regex:true` is set AND the pattern has an explicit capturing group (
 "Replacement Capture-Group Expansion" section of the top-level design notes).  For a
 group-less pattern — the default literal search, and any regex without `( … )` — the
 replacement is written literally, so a bare `$` (e.g. `$5.00`, `$HOME`, `${TOKEN}`)
-survives.  This is complementary to the backslash-escape handling above:
-`unescape_replacement` still runs regardless of group presence, because `\n`/`\t`/etc.
-are transport ergonomics, not capture syntax.  The `tpu_replace_in_file` schema
-documents both behaviours.
+survives.
 
 Regex is opt-in (`regex:true`) rather than the default because ambiguous
 capture-group syntax is easy to trigger by accident: `${1}token` is a group-1

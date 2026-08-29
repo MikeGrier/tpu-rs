@@ -629,3 +629,65 @@ introduces no new lints.  Additionally verified end-to-end against a real
 `tpu-mcp.exe` at the default `verify_delay_ms: 100`: a zero-match call
 preserved mtime to the tick and wrote no `.bak`, while a matching call
 still wrote, stamped, and reported `count:1`.
+
+---
+
+## Milestone 10 — `tpu_replace_in_file` replacement is verbatim; escape expansion is opt-in
+
+**Theme:** the MCP `replacement` argument was the only text payload in the
+server that got a second decoding pass.  `decode_replacement_arg` ran
+`unescape_replacement()` on every plain-JSON replacement, so `\\` collapsed
+to `\`, `\n` became LF, and `\t` became TAB — while `tpu_write_file`'s
+`content`, `tpu_append_file`'s `text`, and an edit op's `data` all wrote
+their bytes verbatim.  A caller had no way to know which arguments needed
+pre-doubling and which did not.
+
+**Defect report (2026-08-28):** a controlled probe showed `\\` landing as
+`\` and `\\\\` landing as `\\` through `tpu_replace_in_file`, while the same
+content through `tpu_append_file` was correct.  The collapse silently broke a
+live code path — a replacement containing `path.starts_with(r"\\.")` was
+written as `r"\."`, disabling the very guard the caller was adding — and
+mangled several doc strings before it was noticed.  The reporter also found
+the same collapse in prose predating the session, so the damage had been
+accumulating quietly.
+
+**Why the old default was wrong:** its stated motive was that an agent
+sending `\n` "expects a newline".  But JSON transport already delivers a real
+newline for a correctly escaped `"\n"`, so the pass only ever fired on
+*doubled* escapes — and it collapsed them unconditionally, corrupting every
+replacement whose payload legitimately contains backslashes (Rust/C/JSON
+string literals, regex sources, Windows/UNC paths).  The failure mode is
+asymmetric in the same way M9's was: an unexpanded `\n` is visible in the
+changed-region echo and trivially fixed by one argument, whereas a collapsed
+`\\` reads as plausible code and survives review.
+
+- [x] M10-1: `decode_replacement_arg` writes the plain-JSON `replacement`
+      verbatim (LF-normalised, like every other text payload) instead of
+      calling `unescape_replacement`.
+- [x] M10-2: New `expand_escapes: true` argument restores the old sed-style
+      decoding for callers that deliberately double-escape.  Combining it
+      with `replacement_format` is rejected — that channel already carries
+      exact bytes, so re-decoding them is contradictory.
+- [x] M10-3: New `optional_bool` helper: a present-but-non-boolean
+      `expand_escapes` is an error rather than a silent `false`, so a caller
+      who sends `"true"` learns the flag did not take effect.
+- [x] M10-4: Tool description and schema document the verbatim contract, the
+      opt-in, and the mutual exclusion.  The ESCAPE-HAZARD paragraph now
+      attributes the residual risk to JSON transport alone.
+- [x] M10-5: Tests — RE-IT-1…4 now pass `expand_escapes: true` (they pin the
+      opt-in path); RE-IT-5 pins the reported `r"\\."` regression, RE-IT-6
+      pins source-level `\t`/`\n` sequences surviving, RE-IT-7 pins that a
+      real newline still works, RE-IT-8/9 pin the two rejection paths.
+      `mcp_it_4` in `mcp_protocol.rs` covers both defaults end-to-end over
+      real stdio.
+
+**Deliberately NOT changed:** the `tpu replace` CLI keeps escape decoding by
+default (`--literal-replacement` / `-L` to opt out).  A shell user typing
+`\n` at a prompt is a different transport with `sed`/`perl`/`ripgrep`
+conventions; the reported defect is specific to JSON-RPC arguments, where the
+transport has already resolved escapes before tpu sees them.
+
+**Status:** ✅ Complete.  `cargo test -p tpu-mcp`: 142 passed, 0 failed
+(107 lib incl. the 5 new tests + 6 io_worker_chaos + 29 mcp_protocol);
+`cargo test -p tpu` unaffected.  `cargo fmt --check` clean; `cargo clippy
+-p tpu-mcp --all-targets` introduces no new lints.

@@ -1023,8 +1023,9 @@ fn mcp_it_3m_append_diff_reports_content_version() {
     assert_eq!(read.as_deref(), Some(v));
 }
 
-/// MCP-IT-4: `\n` in a tpu_replace_in_file replacement string expands to a real
-/// newline rather than the two-character sequence backslash-n.
+/// MCP-IT-4: `\n` in a tpu_replace_in_file replacement string is written
+/// verbatim by default, and expands to a real newline only under
+/// `expand_escapes: true`.
 #[test]
 fn mcp_it_4_replace_backslash_n_expands_to_newline() {
     let dir = tempfile::tempdir().unwrap();
@@ -1035,14 +1036,37 @@ fn mcp_it_4_replace_backslash_n_expands_to_newline() {
     s.initialize();
 
     // The Rust string "second\\nthird injected" serialises to the JSON string
-    // "second\nthird injected" (backslash + n, not a newline character).
-    // tpu-mcp must expand that \n to a real newline before applying the regex.
+    // "second\\nthird injected", which decodes to backslash + n (not a newline
+    // character).  By default tpu-mcp writes those two characters verbatim.
     s.call_tool(
         "tpu_replace_in_file",
         json!({
             "file": f.to_str().unwrap(),
             "pattern": "line two",
             "replacement": "second\\nthird injected",
+        }),
+    );
+
+    let content = std::fs::read_to_string(&f).unwrap();
+    assert_has(
+        "backslash-n preserved verbatim",
+        &content,
+        "second\\nthird injected",
+    );
+    assert_eq!(
+        content.lines().count(),
+        1,
+        "verbatim replacement must not introduce a line break; content: {content:?}"
+    );
+
+    // Opting in expands the escape.
+    s.call_tool(
+        "tpu_replace_in_file",
+        json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "second\\nthird injected",
+            "replacement": "second\\nthird injected",
+            "expand_escapes": true,
         }),
     );
 

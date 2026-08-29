@@ -488,15 +488,19 @@ pub fn list() -> Value {
                  $1token — the latter is parsed as a reference to a group *named* \
                  '1token', silently dropping both the substitution and the literal \
                  suffix. \
-                 `\\n` and `\\r` both expand to LF (see the 'replacement' description \
-                 below for why); `\\t` expands to TAB and `\\\\` to a single backslash. \
-                 All other `\\X` pass through unchanged. Either a real newline in the \
-                 JSON string OR the two characters backslash+n will produce a newline in \
-                 the output — both are accepted.\n\n\
-                 ESCAPE-HAZARD WARNING: because of the above, a stray single backslash in \
-                 the JSON you send (e.g. \\n where \\\\n was meant) becomes a real newline \
-                 before this tool ever runs — there is no way for the tool to tell that \
-                 apart from an intentional one. When 'pattern' or 'replacement' contains \
+                 The replacement text itself is written VERBATIM — exactly the \
+                 characters you send, same as tpu_write_file's `content`. Backslashes \
+                 are never collapsed, so `\\\\` stays two characters and Rust/JSON \
+                 string literals, regex sources, and Windows/UNC paths survive intact. \
+                 To write a newline, put a real newline in the JSON string. Pass \
+                 expand_escapes:true ONLY if you deliberately send doubled escapes and \
+                 want the old sed-style decoding (`\\n`/`\\r` -> LF, `\\t` -> TAB, \
+                 `\\\\` -> one backslash).\n\n\
+                 ESCAPE-HAZARD WARNING: the JSON transport itself still decodes escapes \
+                 before this tool runs, so a stray single backslash in the JSON you send \
+                 (e.g. \\n where \\\\n was meant) is already a real newline by the time \
+                 tpu sees it — there is no way for the tool to tell that apart from an \
+                 intentional one. When 'pattern' or 'replacement' contains \
                  backslash escapes, embedded quotes, or anything you are not fully \
                  confident is JSON-escaped correctly, set pattern_format:\"base64\" and/or \
                  replacement_format:\"base64\" and send the exact bytes base64-encoded — \
@@ -546,27 +550,39 @@ pub fn list() -> Value {
                              capture reference followed by literal text, disambiguate with \
                              braces: ${1}token, NOT $1token — the latter is parsed as a \
                              reference to a group *named* '1token'. \
-                             Standard C-style backslash escapes are expanded first: \\n \
-                             and \\r both become LF (see below), \\t becomes TAB, \\\\ \
-                             becomes a single backslash; all other \\X sequences pass \
-                             through unchanged. Any resulting CRLF or bare CR — from an \
-                             escape or from a real CR/CRLF already in the JSON string — is \
-                             then normalized to LF before substitution, which is why \\r \
-                             ends up as LF rather than an actual carriage return: tpu \
+                             Standard C-style backslash escapes are NOT expanded: the \
+                             text is written verbatim, so `\\\\` stays two characters and \
+                             `\\n` stays backslash+n (this makes the tool safe for Rust / \
+                             JSON / C string literals, regex sources and Windows paths). \
+                             Set expand_escapes:true to opt into the old decoding. Any \
+                             CRLF or bare CR in the resolved text — from a real CR/CRLF in \
+                             the JSON string, or from an escape when expand_escapes is on \
+                             — is normalized to LF before substitution: tpu \
                              never writes a bare CR into the LF-normalised substitution \
                              space. When replacement_format is set, this is the encoded \
-                             payload instead — none of the above backslash-escape decoding \
-                             applies; see replacement_format."
+                             payload instead — see replacement_format."
+                    },
+                    "expand_escapes": {
+                        "type": "boolean",
+                        "description":
+                            "If true, apply sed-style backslash decoding to 'replacement' \
+                             before substituting: \\n and \\r become LF, \\t becomes TAB, \
+                             \\\\ becomes a single backslash, and all other \\X pass \
+                             through. Default: false (verbatim). Use this ONLY when you \
+                             deliberately double-escaped the payload; leaving it off is \
+                             what keeps literal backslashes intact. Cannot be combined \
+                             with replacement_format (that channel already carries exact \
+                             bytes)."
                     },
                     "replacement_format": {
                         "type": "string",
                         "enum": ["hex", "base64", "encoded"],
                         "description":
-                            "If set, 'replacement' is decoded from this format, skipping \
-                             tpu's own backslash-escape convenience decoding (\\n, \\t, \\r, \
-                             \\\\) — the whole point of this channel is that the caller \
-                             already specified the exact bytes (see the ESCAPE-HAZARD \
-                             warning above). The decoded text still goes through the same \
+                            "If set, 'replacement' is decoded from this format instead of \
+                             being used as plain JSON-string text (see the ESCAPE-HAZARD \
+                             warning above); the decoded bytes are always taken exactly as \
+                             given, so expand_escapes must not be set alongside it. The \
+                             decoded text still goes through the same \
                              CRLF/bare-CR -> LF normalisation as every other text payload, \
                              so a literal CR byte does NOT survive this channel — it always \
                              becomes LF, same as the plain-text path. \
@@ -3638,6 +3654,10 @@ fn normalize_to_lf(s: &str) -> std::borrow::Cow<'_, str> {
 
 /// Expand C-style backslash escape sequences in a regex replacement template.
 ///
+/// **Opt-in only.** This runs solely when a `tpu_replace_in_file` call passes
+/// `expand_escapes: true`; the default is verbatim (see
+/// [`decode_replacement_arg`]).
+///
 /// Recognised sequences and their expansions:
 ///   - `\n`  → LF   (`0x0A`)
 ///   - `\r`  → CR   (`0x0D`)
@@ -3792,15 +3812,35 @@ fn decode_pattern_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::er
 
 /// Resolve `tpu_replace_in_file`'s `replacement` argument.
 ///
-/// When `replacement_format` is set, the decoded bytes are taken literally:
-/// this is the whole point of the escape-hazard-free channel, so tpu's own
-/// backslash-escape convenience decoding ([`unescape_replacement`]) is
-/// skipped — it would otherwise reinterpret bytes the caller has already
-/// specified exactly. Without `replacement_format`, behaviour is unchanged:
-/// the plain JSON string is backslash-unescaped, then LF-normalised.
+/// The replacement is taken **verbatim** by default, exactly like every other
+/// text payload in this server (`tpu_write_file`'s `content`,
+/// `tpu_append_file`'s `text`, an edit op's `data`): the bytes the caller sent
+/// are the bytes written. This matters because the previous default — an
+/// unconditional [`unescape_replacement`] pass — silently collapsed `\\` to
+/// `\` in replacements that legitimately contain backslashes (Rust/JSON string
+/// literals, regex sources, Windows/UNC paths), corrupting content the caller
+/// had already escaped correctly for JSON transport. A caller had no way to
+/// know that this one argument needed pre-doubling while the others did not.
+///
+/// `expand_escapes: true` opts back into the old convenience decoding (`\n`,
+/// `\r`, `\t`, `\\`), for callers that deliberately send doubled escapes.
+///
+/// When `replacement_format` is set, the decoded bytes are likewise taken
+/// literally — the whole point of the escape-hazard-free channel is that the
+/// caller already specified the exact bytes. Combining it with
+/// `expand_escapes: true` is contradictory and is rejected rather than
+/// silently resolved one way or the other.
 fn decode_replacement_arg(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
+    let expand = optional_bool(args, "expand_escapes")?;
     match args.get("replacement_format").and_then(|v| v.as_str()) {
         Some(fmt_str) => {
+            if expand {
+                return Err("'expand_escapes' cannot be combined with \
+                     'replacement_format': the encoded payload already specifies the exact \
+                     bytes to write. Drop one of the two (use replacement_format alone for \
+                     exact bytes, or expand_escapes alone on a plain-text replacement)."
+                    .into());
+            }
             let fmt = parse_data_format(fmt_str)?;
             let raw = require_str(args, "replacement")?;
             let bytes = tpu::data_format::decode(&fmt, raw)
@@ -3812,8 +3852,12 @@ fn decode_replacement_arg(args: &Value) -> Result<String, Box<dyn std::error::Er
         }
         None => {
             let replacement_raw = require_str(args, "replacement")?;
-            let replacement_unescaped = unescape_replacement(replacement_raw);
-            Ok(normalize_to_lf(&replacement_unescaped).into_owned())
+            let resolved = if expand {
+                std::borrow::Cow::Owned(unescape_replacement(replacement_raw))
+            } else {
+                std::borrow::Cow::Borrowed(replacement_raw)
+            };
+            Ok(normalize_to_lf(&resolved).into_owned())
         }
     }
 }
@@ -3841,6 +3885,23 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, Box<dyn std::e
     args.get(key)
         .and_then(|v| v.as_str())
         .ok_or_else(|| format!("missing required argument '{key}'").into())
+}
+
+/// Read an optional boolean argument, defaulting to `false` when absent.
+///
+/// Unlike the `and_then(as_bool).unwrap_or(false)` idiom used for the older
+/// flags, a present-but-non-boolean value is an error rather than a silent
+/// `false`: a caller who sends `"true"` (a JSON string) deserves to be told
+/// the flag did not take effect instead of having the default applied behind
+/// their back.
+fn optional_bool(args: &Value, key: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(false),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => {
+            Err(format!("argument '{key}' must be a JSON boolean (true/false), got {other}").into())
+        }
+    }
 }
 
 /// Reject the removed `fixed_strings` argument with a migration error instead
@@ -5430,8 +5491,9 @@ mod integration_tests {
     }
 
     /// EH-IT-5: `tpu_replace_in_file` with `replacement_format: "base64"`
-    /// writes the exact decoded bytes verbatim — no backslash-escape
-    /// convenience decoding is applied on top (unlike the plain-text path).
+    /// writes the exact decoded bytes verbatim — the `expand_escapes` opt-in
+    /// is the only thing that ever applies backslash decoding, and it cannot
+    /// be combined with this channel (see RE-IT-8).
     #[test]
     fn eh_it_5_replace_replacement_format_base64_bypasses_unescape() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5439,8 +5501,8 @@ mod integration_tests {
         fs::write(&f, "TARGET\n").unwrap();
 
         // Intended replacement literally contains \n (backslash + n), which
-        // the plain-text path's unescape_replacement would turn into a real
-        // newline. The base64 channel must not apply that decoding.
+        // `expand_escapes: true` would turn into a real newline. The base64
+        // channel must never apply that decoding.
         let intended = "before\\nafter";
         let encoded = tpu::data_format::encode_base64(intended.as_bytes());
         let args = serde_json::json!({
@@ -5684,7 +5746,7 @@ mod integration_tests {
     }
 
     /// RE-IT-1: `tpu_replace_in_file` expands `\n` in the replacement string
-    /// to a real newline rather than writing the two-character sequence `\n`.
+    /// to a real newline when `expand_escapes: true` is set.
     #[test]
     fn re_it_1_replace_backslash_n_becomes_newline() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5692,12 +5754,13 @@ mod integration_tests {
 
         fs::write(&f, "hello world\n").unwrap();
 
-        // The replacement string contains the literal two characters \ and n,
-        // as Copilot would send them.  The tool must expand this to a newline.
+        // The replacement string contains the literal two characters \ and n.
+        // With expand_escapes on, the tool must expand this to a newline.
         let args = serde_json::json!({
             "file": f.to_str().unwrap(),
             "pattern": "hello world",
             "replacement": "hello\\nworld",
+            "expand_escapes": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -5716,7 +5779,8 @@ mod integration_tests {
         drop(dir);
     }
 
-    /// RE-IT-2: `\t` in replacement expands to a real tab character.
+    /// RE-IT-2: `\t` in replacement expands to a real tab character under
+    /// `expand_escapes: true`.
     #[test]
     fn re_it_2_replace_backslash_t_becomes_tab() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5728,6 +5792,7 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "key: value",
             "replacement": "key:\\tvalue",
+            "expand_escapes": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -5739,7 +5804,7 @@ mod integration_tests {
     }
 
     /// RE-IT-3: `\\` (double backslash) in replacement produces a single
-    /// literal backslash in the output.
+    /// literal backslash in the output under `expand_escapes: true`.
     #[test]
     fn re_it_3_replace_double_backslash_becomes_single() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -5751,6 +5816,7 @@ mod integration_tests {
             "file": f.to_str().unwrap(),
             "pattern": "path: here",
             "replacement": "path:\\\\value",
+            "expand_escapes": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
@@ -5776,12 +5842,158 @@ mod integration_tests {
             "pattern": "(fn foo)",
             "replacement": "\\n$1",
             "regex": true,
+            "expand_escapes": true,
         });
 
         call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
 
         let text = String::from_utf8(fs::read(&f).unwrap()).unwrap();
         assert_eq!(text, "\nfn foo() {}\n");
+
+        drop(dir);
+    }
+
+    /// RE-IT-5: by default the replacement is written VERBATIM — a doubled
+    /// backslash stays doubled.  Regression for the reported corruption where
+    /// a replacement containing `r"\\."` was silently written as `r"\."`,
+    /// disabling the very guard the caller was adding.
+    #[test]
+    fn re_it_5_replacement_is_verbatim_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("verbatim_replace.txt");
+
+        fs::write(&f, "GUARD\n").unwrap();
+
+        let intended = r#"path.starts_with(r"\\.")"#;
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "GUARD",
+            "replacement": intended,
+        });
+
+        call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        let text = String::from_utf8(fs::read(&f).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            format!("{intended}\n"),
+            "replacement must be written verbatim, with no backslash collapsing"
+        );
+
+        drop(dir);
+    }
+
+    /// RE-IT-6: the verbatim default also leaves `\n` / `\t` as two-character
+    /// source-level escape sequences, so writing a Rust/JSON/C string literal
+    /// no longer requires quadruple-escaping.
+    #[test]
+    fn re_it_6_source_escape_sequences_survive_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("source_escape.txt");
+
+        fs::write(&f, "LINE\n").unwrap();
+
+        let intended = r#"println!("a\tb\n");"#;
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "LINE",
+            "replacement": intended,
+        });
+
+        call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        let text = String::from_utf8(fs::read(&f).unwrap()).unwrap();
+        assert_eq!(text, format!("{intended}\n"));
+        assert_eq!(
+            text.lines().count(),
+            1,
+            "no real newline may be introduced; got: {text:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// RE-IT-7: a real newline in the JSON string still produces a real
+    /// newline — verbatim means verbatim, not "no newlines".
+    #[test]
+    fn re_it_7_real_newline_in_replacement_still_works() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("real_newline.txt");
+
+        fs::write(&f, "SPLIT\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "SPLIT",
+            "replacement": "first\nsecond",
+        });
+
+        call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        let text = String::from_utf8(fs::read(&f).unwrap()).unwrap();
+        assert_eq!(text, "first\nsecond\n");
+
+        drop(dir);
+    }
+
+    /// RE-IT-8: `expand_escapes` combined with `replacement_format` is a
+    /// contradiction (the encoded channel already carries exact bytes) and is
+    /// rejected rather than silently resolved one way or the other.
+    #[test]
+    fn re_it_8_expand_escapes_with_replacement_format_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("conflict.txt");
+
+        fs::write(&f, "X\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "X",
+            "replacement": tpu::data_format::encode_base64(b"Y"),
+            "replacement_format": "base64",
+            "expand_escapes": true,
+        });
+
+        let err = call("tpu_replace_in_file", &args)
+            .expect_err("conflicting escape arguments must be rejected")
+            .to_string();
+        assert!(
+            err.contains("expand_escapes"),
+            "conflict must be reported to the caller; got: {err}"
+        );
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "X\n",
+            "rejected call must not modify the file"
+        );
+
+        drop(dir);
+    }
+
+    /// RE-IT-9: a non-boolean `expand_escapes` is an error, not a silent
+    /// default — the caller must learn their flag did not take effect.
+    #[test]
+    fn re_it_9_non_boolean_expand_escapes_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("badflag.txt");
+
+        fs::write(&f, "X\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "X",
+            "replacement": "Y",
+            "expand_escapes": "true",
+        });
+
+        let err = call("tpu_replace_in_file", &args)
+            .expect_err("non-boolean expand_escapes must be rejected")
+            .to_string();
+        assert!(
+            err.contains("expand_escapes"),
+            "bad flag type must be reported; got: {err}"
+        );
+        assert_eq!(fs::read_to_string(&f).unwrap(), "X\n");
 
         drop(dir);
     }
