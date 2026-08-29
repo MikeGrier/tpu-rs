@@ -48,6 +48,39 @@ pub enum BomPolicy {
     Force,
 }
 
+/// UTF-8 BOM byte sequence (U+FEFF encoded as UTF-8).
+///
+/// Shared by every subcommand that can emit a BOM, so the byte sequence is
+/// written in exactly one place.
+pub const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+
+/// Decide whether a BOM should be written to the output.
+///
+/// This is the single authority for that decision, shared by `read` and
+/// `readex` (including `readex`'s empty-file fast path).  Keeping it in one
+/// place is deliberate: the rule was previously inlined at each site, and the
+/// empty-file path silently omitted it, so `readex --utf8 --bom=force` on an
+/// empty file emitted no BOM while `read` with identical flags did.
+///
+/// - A BOM is only ever written when the output is being re-encoded as UTF-8;
+///   `OutputEncoding::Preserve` never emits one.
+/// - `Preserve` mirrors the source, so it depends on `source_had_bom`.  An
+///   empty file has no BOM, so callers pass `false` for it.
+pub fn should_write_bom(
+    output_encoding: OutputEncoding,
+    bom_policy: BomPolicy,
+    source_had_bom: bool,
+) -> bool {
+    if output_encoding != OutputEncoding::Utf8 {
+        return false;
+    }
+    match bom_policy {
+        BomPolicy::Strip => false,
+        BomPolicy::Preserve => source_had_bom,
+        BomPolicy::Force => true,
+    }
+}
+
 impl FromStr for BomPolicy {
     type Err = String;
 
@@ -287,6 +320,64 @@ pub(crate) fn apply_line_ending_to_all(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── should_write_bom: exhaustive truth table ─────────────────────────────
+
+    #[test]
+    fn should_write_bom_never_when_preserving_source_encoding() {
+        // OutputEncoding::Preserve suppresses the BOM regardless of policy or
+        // whether the source had one.
+        for policy in [BomPolicy::Strip, BomPolicy::Preserve, BomPolicy::Force] {
+            for had_bom in [false, true] {
+                assert!(
+                    !should_write_bom(OutputEncoding::Preserve, policy, had_bom),
+                    "Preserve encoding must never emit a BOM ({policy:?}, had_bom={had_bom})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn should_write_bom_strip_is_always_false() {
+        for had_bom in [false, true] {
+            assert!(!should_write_bom(
+                OutputEncoding::Utf8,
+                BomPolicy::Strip,
+                had_bom
+            ));
+        }
+    }
+
+    #[test]
+    fn should_write_bom_force_is_always_true_under_utf8() {
+        // Including when the source had no BOM — e.g. an empty file.
+        for had_bom in [false, true] {
+            assert!(should_write_bom(
+                OutputEncoding::Utf8,
+                BomPolicy::Force,
+                had_bom
+            ));
+        }
+    }
+
+    #[test]
+    fn should_write_bom_preserve_mirrors_the_source() {
+        assert!(should_write_bom(
+            OutputEncoding::Utf8,
+            BomPolicy::Preserve,
+            true
+        ));
+        assert!(!should_write_bom(
+            OutputEncoding::Utf8,
+            BomPolicy::Preserve,
+            false
+        ));
+    }
+
+    #[test]
+    fn utf8_bom_is_the_expected_byte_sequence() {
+        assert_eq!(UTF8_BOM, &[0xEF, 0xBB, 0xBF]);
+    }
 
     #[test]
     fn bom_policy_from_str_strip() {
