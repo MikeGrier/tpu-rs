@@ -17,7 +17,7 @@ name: release-please
 #   - Cargo.lock (updated by the `sync-version-artifacts` job below)
 #   - the managed `tpu setup` guidance block in
 #     .github/copilot-instructions.md, whose version marker embeds
-#     CARGO_PKG_VERSION (also the `sync-version-artifacts` job)
+#     CARGO_PKG_VERSION (re-injected by the `sync-version-artifacts` job)
 #   - version in crates/tpu-mcp/extension/package.json
 #   - version in crates/tpu-mcp/extension/package-lock.json (root + packages[""])
 #   - CHANGELOG.md
