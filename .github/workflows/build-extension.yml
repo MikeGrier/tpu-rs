@@ -32,9 +32,10 @@ permissions:
 # Cancel any in-progress run for the same workflow and PR/push when a newer
 # commit arrives.  PR number is used on pull_request events (unique per PR,
 # fork-safe).  On non-PR events github.run_id is used (unique per run → no
-# cross-run cancellation).  This pairs with the `update-lockfile` job in
-# release-please.yml: when that job pushes a fresh Cargo.lock to the Release
-# PR branch, the earlier (--locked-failing) run is cancelled automatically.
+# cross-run cancellation).  This pairs with the `sync-version-artifacts` job in
+# release-please.yml: when that job pushes a fresh Cargo.lock and re-injected
+# guidance block to the Release PR branch, the earlier (--locked-failing) run
+# is cancelled automatically.
 concurrency:
   group: ${{ github.repository }}-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: true

@@ -4,7 +4,7 @@
      examples for documentation purposes) -->
 
 <!-- tpu-mcp:setup:begin -->
-<!-- tpu-mcp:setup:version=4.0.0 -->
+<!-- tpu-mcp:setup:version=4.0.1 -->
 
 ## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
 
@@ -510,6 +510,13 @@ The `repo_copilot_instructions_block_matches_generated_guidance` test in
 not match the generator's output exactly (apart from CRLF->LF normalization
 and the trailing newline `tpu setup` prints), so a forgotten re-inject is
 caught by CI instead of by a downstream user.
+
+Note that the block's `<!-- tpu-mcp:setup:version=X.Y.Z -->` marker embeds
+`CARGO_PKG_VERSION`, so **a version bump alone makes the block stale** even
+when no prose changed. Release PRs are handled automatically by the
+`sync-version-artifacts` job in `.github/workflows/release-please.yml`, which
+re-injects the block alongside the `Cargo.lock` refresh. If you bump the
+workspace version by hand, re-inject by hand too.
 
 Checklist before merging or cutting a release:
 
