@@ -24,6 +24,8 @@ const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 ///
 /// `lines_range` is a 1-based inclusive `(start, end)` pair.  `None` emits
 /// the entire file.  `numbers` prepends each line with its 1-based position.
+/// An end bound past the last line is clamped; a *start* bound past the last
+/// line is a hard error (see [`resolve_line_range`]).
 ///
 /// `output_encoding` and `bom_policy` control whether a UTF-8 BOM is
 /// prepended to the output.  They are only meaningful together:
@@ -59,20 +61,6 @@ pub fn run(
     // document text).
     let view = lines.view_range(bom_len as u64..file_len)?;
 
-    // Optionally prepend a UTF-8 BOM to stdout before any content.
-    // This is only done when --utf8 is active; the text itself is always
-    // decoded to UTF-8 regardless of the flag.
-    if output_encoding == OutputEncoding::Utf8 {
-        let write_bom = match bom_policy {
-            BomPolicy::Strip => false,
-            BomPolicy::Preserve => source_had_bom,
-            BomPolicy::Force => true,
-        };
-        if write_bom {
-            out.write_all(UTF8_BOM)?;
-        }
-    }
-
     // Decode from the original encoding (LF-normalised bytes) to a UTF-8
     // Cow<str>.  The view range already starts past the BOM bytes.
     let (text, _) = encoding.decode_without_bom_handling(&view.bytes);
@@ -93,10 +81,23 @@ pub fn run(
         &all_parts
     };
 
-    let (start, end) = match lines_range {
-        None => (0, all_lines.len()),
-        Some((s, e)) => (s.saturating_sub(1), e.min(all_lines.len())),
-    };
+    // Resolve the requested range *before* emitting anything, so an
+    // out-of-range request produces a clean error and no partial output.
+    let (start, end) = resolve_line_range(lines_range, all_lines.len())?;
+
+    // Optionally prepend a UTF-8 BOM to stdout before any content.
+    // This is only done when --utf8 is active; the text itself is always
+    // decoded to UTF-8 regardless of the flag.
+    if output_encoding == OutputEncoding::Utf8 {
+        let write_bom = match bom_policy {
+            BomPolicy::Strip => false,
+            BomPolicy::Preserve => source_had_bom,
+            BomPolicy::Force => true,
+        };
+        if write_bom {
+            out.write_all(UTF8_BOM)?;
+        }
+    }
 
     for (i, line) in all_lines[start..end].iter().enumerate() {
         if numbers {
@@ -109,13 +110,62 @@ pub fn run(
     Ok(())
 }
 
+/// Resolve a 1-based inclusive `--lines` range against a file's actual line
+/// count, returning a 0-based half-open `[start, end)` slice range.
+///
+/// This is the single place where a caller-supplied line range meets the
+/// file's real size, and it is deliberately *total*: for every possible
+/// `(lines_range, total_lines)` input it either returns a range that is a
+/// valid slice index into a `total_lines`-element slice, or an `Err`.  It
+/// must never panic — `read` and `readex` previously indexed with the raw
+/// user-supplied bounds and aborted the process (and, under `tpu-mcp`, killed
+/// the io worker) whenever the start line was past the end of the file.
+///
+/// Semantics:
+/// - `None` selects the whole file.
+/// - An `end` past the last line is **clamped** to the last line.
+/// - A `start` past the last line is a **hard error**, mirroring `tpu edit`,
+///   because silently returning nothing hides the fact that the caller's
+///   idea of the file's size is wrong.
+/// - `0` bounds and reversed ranges are rejected; [`parse_lines_arg`] already
+///   rejects them at parse time, but callers may construct ranges directly
+///   (the MCP server, tests, future subcommands) so they are re-checked here.
+pub fn resolve_line_range(
+    lines_range: Option<(usize, usize)>,
+    total_lines: usize,
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    let Some((start, end)) = lines_range else {
+        return Ok((0, total_lines));
+    };
+
+    if start == 0 || end == 0 {
+        return Err("--lines: line numbers are 1-based (minimum 1)".into());
+    }
+    if start > end {
+        return Err(format!("--lines: start {start} is after end {end}").into());
+    }
+    if start > total_lines {
+        return Err(format!(
+            "--lines: start line {start} is past end of file ({total_lines} lines)"
+        )
+        .into());
+    }
+
+    // `start >= 1` and `start <= total_lines`, so `start - 1 < total_lines`;
+    // `end >= start`, so the clamped end is `>= start > start - 1`.  The
+    // resulting range is therefore always a valid slice index.
+    Ok((start - 1, end.min(total_lines)))
+}
+
 /// Parse a `--lines` argument string into a 1-based inclusive range.
 ///
 /// Accepts:
 /// - `"N"` — single line N.
 /// - `"N-M"` — lines N through M inclusive.
 ///
-/// Returns `Err` with a human-readable message on invalid input.
+/// Returns `Err` with a human-readable message on invalid input.  Negative
+/// numbers, non-numeric text, empty bounds, and values that overflow `usize`
+/// all fail the `usize` parse and are reported as invalid line numbers.
 pub fn parse_lines_arg(s: &str) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     if let Some((lo, hi)) = s.split_once('-') {
         let lo: usize = lo
@@ -859,5 +909,531 @@ mod tests {
         .map(|s| parse_hash_arg(s).unwrap())
         .collect();
         assert!(compute_hashes(b"hello", &specs).is_err());
+    }
+
+    // ── resolve_line_range: normal cases ──────────────────────────────────────
+
+    #[test]
+    fn resolve_none_selects_whole_file() {
+        assert_eq!(resolve_line_range(None, 10).unwrap(), (0, 10));
+    }
+
+    #[test]
+    fn resolve_none_on_empty_file_is_empty_range() {
+        assert_eq!(resolve_line_range(None, 0).unwrap(), (0, 0));
+    }
+
+    #[test]
+    fn resolve_first_line() {
+        assert_eq!(resolve_line_range(Some((1, 1)), 10).unwrap(), (0, 1));
+    }
+
+    #[test]
+    fn resolve_last_line() {
+        assert_eq!(resolve_line_range(Some((10, 10)), 10).unwrap(), (9, 10));
+    }
+
+    #[test]
+    fn resolve_interior_range() {
+        assert_eq!(resolve_line_range(Some((3, 7)), 10).unwrap(), (2, 7));
+    }
+
+    #[test]
+    fn resolve_full_range_matches_none() {
+        assert_eq!(
+            resolve_line_range(Some((1, 10)), 10).unwrap(),
+            resolve_line_range(None, 10).unwrap()
+        );
+    }
+
+    #[test]
+    fn resolve_single_line_file() {
+        assert_eq!(resolve_line_range(Some((1, 1)), 1).unwrap(), (0, 1));
+    }
+
+    // ── resolve_line_range: end clamping ──────────────────────────────────────
+
+    #[test]
+    fn resolve_end_past_eof_is_clamped() {
+        assert_eq!(resolve_line_range(Some((1, 999)), 10).unwrap(), (0, 10));
+    }
+
+    #[test]
+    fn resolve_end_one_past_eof_is_clamped() {
+        assert_eq!(resolve_line_range(Some((5, 11)), 10).unwrap(), (4, 10));
+    }
+
+    #[test]
+    fn resolve_end_usize_max_is_clamped() {
+        // Must clamp rather than overflow or index out of bounds.
+        assert_eq!(
+            resolve_line_range(Some((1, usize::MAX)), 3).unwrap(),
+            (0, 3)
+        );
+    }
+
+    #[test]
+    fn resolve_last_line_with_open_ended_request_is_clamped() {
+        assert_eq!(
+            resolve_line_range(Some((10, usize::MAX)), 10).unwrap(),
+            (9, 10)
+        );
+    }
+
+    // ── resolve_line_range: start past EOF (the panic that was) ───────────────
+
+    #[test]
+    fn resolve_start_one_past_eof_is_error() {
+        let err = resolve_line_range(Some((11, 12)), 10).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--lines: start line 11 is past end of file (10 lines)"
+        );
+    }
+
+    #[test]
+    fn resolve_start_far_past_eof_is_error() {
+        // The original panic: `--lines=9999` against a 10-line file.
+        let err = resolve_line_range(Some((9999, 9999)), 10).unwrap_err();
+        assert!(
+            err.to_string().contains("past end of file"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_start_usize_max_is_error_not_overflow() {
+        let err = resolve_line_range(Some((usize::MAX, usize::MAX)), 10).unwrap_err();
+        assert!(
+            err.to_string().contains("past end of file"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_any_range_on_empty_file_is_error() {
+        for range in [(1, 1), (1, 10), (2, 3), (usize::MAX, usize::MAX)] {
+            let err = resolve_line_range(Some(range), 0).unwrap_err();
+            assert!(
+                err.to_string().contains("past end of file"),
+                "range {range:?}: unexpected message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_error_message_reports_actual_line_count() {
+        let err = resolve_line_range(Some((4, 4)), 3).unwrap_err();
+        assert!(
+            err.to_string().contains("(3 lines)"),
+            "message should state the real line count: {err}"
+        );
+    }
+
+    // ── resolve_line_range: malformed ranges ──────────────────────────────────
+
+    #[test]
+    fn resolve_zero_start_is_error() {
+        let err = resolve_line_range(Some((0, 5)), 10).unwrap_err();
+        assert!(err.to_string().contains("1-based"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_zero_end_is_error() {
+        let err = resolve_line_range(Some((1, 0)), 10).unwrap_err();
+        assert!(err.to_string().contains("1-based"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_zero_zero_is_error() {
+        assert!(resolve_line_range(Some((0, 0)), 10).is_err());
+    }
+
+    #[test]
+    fn resolve_zero_start_on_empty_file_is_error() {
+        assert!(resolve_line_range(Some((0, 0)), 0).is_err());
+    }
+
+    #[test]
+    fn resolve_reversed_range_is_error() {
+        let err = resolve_line_range(Some((7, 3)), 10).unwrap_err();
+        assert!(err.to_string().contains("is after end"), "got: {err}");
+    }
+
+    #[test]
+    fn resolve_reversed_range_is_error_before_bounds_check() {
+        // Both faults present: reversed *and* past EOF.  The reversed-range
+        // message is the more actionable one and must win.
+        let err = resolve_line_range(Some((usize::MAX, 1)), 10).unwrap_err();
+        assert!(err.to_string().contains("is after end"), "got: {err}");
+    }
+
+    // ── resolve_line_range: exhaustive no-panic guarantee ─────────────────────
+
+    #[test]
+    fn resolve_never_yields_an_out_of_bounds_slice_index() {
+        // Brute-force every small (start, end, total) combination plus the
+        // saturating extremes, and prove the returned range is always a legal
+        // slice index.  This is the invariant whose violation crashed the
+        // tpu-mcp io worker.
+        let mut ranges: Vec<Option<(usize, usize)>> = vec![None];
+        for start in 0usize..=12 {
+            for end in 0usize..=12 {
+                ranges.push(Some((start, end)));
+            }
+        }
+        ranges.extend([
+            Some((0, usize::MAX)),
+            Some((1, usize::MAX)),
+            Some((usize::MAX, 0)),
+            Some((usize::MAX, 1)),
+            Some((usize::MAX, usize::MAX)),
+            Some((usize::MAX - 1, usize::MAX)),
+        ]);
+
+        for total in 0usize..=10 {
+            let lines: Vec<usize> = (0..total).collect();
+            for range in &ranges {
+                // An Err is always acceptable here; what must never happen is
+                // an Ok whose range would panic on indexing.
+                if let Ok((start, end)) = resolve_line_range(*range, total) {
+                    assert!(
+                        start <= end && end <= total,
+                        "range {range:?} on {total} lines yielded invalid ({start}, {end})"
+                    );
+                    // Would panic if the invariant did not hold.
+                    let _ = &lines[start..end];
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_accepts_every_in_bounds_range() {
+        // The bounds check must not reject legitimate requests.
+        for total in 1usize..=10 {
+            for start in 1..=total {
+                for end in start..=total {
+                    let (lo, hi) = resolve_line_range(Some((start, end)), total)
+                        .unwrap_or_else(|e| panic!("({start}, {end}) of {total} rejected: {e}"));
+                    assert_eq!((lo, hi), (start - 1, end));
+                }
+            }
+        }
+    }
+
+    // ── parse_lines_arg: accepted forms ───────────────────────────────────────
+
+    #[test]
+    fn parse_lines_single() {
+        assert_eq!(parse_lines_arg("7").unwrap(), (7, 7));
+    }
+
+    #[test]
+    fn parse_lines_range() {
+        assert_eq!(parse_lines_arg("2-9").unwrap(), (2, 9));
+    }
+
+    #[test]
+    fn parse_lines_range_with_spaces() {
+        assert_eq!(parse_lines_arg(" 2 - 9 ").unwrap(), (2, 9));
+    }
+
+    #[test]
+    fn parse_lines_equal_bounds() {
+        assert_eq!(parse_lines_arg("4-4").unwrap(), (4, 4));
+    }
+
+    #[test]
+    fn parse_lines_minimum_valid() {
+        assert_eq!(parse_lines_arg("1").unwrap(), (1, 1));
+    }
+
+    #[test]
+    fn parse_lines_usize_max_parses() {
+        // Accepted at parse time; rejected later against the real line count.
+        let max = usize::MAX.to_string();
+        assert_eq!(parse_lines_arg(&max).unwrap(), (usize::MAX, usize::MAX));
+    }
+
+    // ── parse_lines_arg: bad input ────────────────────────────────────────────
+
+    #[test]
+    fn parse_lines_zero_is_error() {
+        assert!(parse_lines_arg("0").is_err());
+    }
+
+    #[test]
+    fn parse_lines_zero_bounds_in_range_are_error() {
+        assert!(parse_lines_arg("0-5").is_err());
+        assert!(parse_lines_arg("1-0").is_err());
+        assert!(parse_lines_arg("0-0").is_err());
+    }
+
+    #[test]
+    fn parse_lines_reversed_is_error() {
+        assert!(parse_lines_arg("9-2").is_err());
+    }
+
+    #[test]
+    fn parse_lines_negative_is_error() {
+        // "-5" splits into an empty start and "5"; the empty bound fails.
+        assert!(parse_lines_arg("-5").is_err());
+    }
+
+    #[test]
+    fn parse_lines_negative_end_is_error() {
+        assert!(parse_lines_arg("5--3").is_err());
+    }
+
+    #[test]
+    fn parse_lines_negative_range_is_error() {
+        assert!(parse_lines_arg("-5--1").is_err());
+    }
+
+    #[test]
+    fn parse_lines_bare_separator_is_error() {
+        assert!(parse_lines_arg("-").is_err());
+    }
+
+    #[test]
+    fn parse_lines_missing_end_is_error() {
+        assert!(parse_lines_arg("5-").is_err());
+    }
+
+    #[test]
+    fn parse_lines_missing_start_is_error() {
+        assert!(parse_lines_arg("-9").is_err());
+    }
+
+    #[test]
+    fn parse_lines_empty_is_error() {
+        assert!(parse_lines_arg("").is_err());
+    }
+
+    #[test]
+    fn parse_lines_whitespace_only_is_error() {
+        assert!(parse_lines_arg("   ").is_err());
+    }
+
+    #[test]
+    fn parse_lines_non_numeric_is_error() {
+        assert!(parse_lines_arg("abc").is_err());
+        assert!(parse_lines_arg("1-abc").is_err());
+        assert!(parse_lines_arg("abc-2").is_err());
+    }
+
+    #[test]
+    fn parse_lines_triple_range_is_error() {
+        assert!(parse_lines_arg("1-2-3").is_err());
+    }
+
+    #[test]
+    fn parse_lines_float_is_error() {
+        assert!(parse_lines_arg("1.5").is_err());
+        assert!(parse_lines_arg("1-2.5").is_err());
+    }
+
+    #[test]
+    fn parse_lines_overflow_is_error_not_panic() {
+        // One past usize::MAX on a 64-bit target, plus a wildly oversized value.
+        assert!(parse_lines_arg("18446744073709551616").is_err());
+        assert!(parse_lines_arg("999999999999999999999999999999").is_err());
+        assert!(parse_lines_arg("1-999999999999999999999999999999").is_err());
+    }
+
+    #[test]
+    fn parse_lines_hex_is_error() {
+        // Unlike --bytes / --hash, --lines is decimal-only.
+        assert!(parse_lines_arg("0x10").is_err());
+    }
+
+    #[test]
+    fn parse_lines_non_ascii_digits_are_error() {
+        assert!(parse_lines_arg("１").is_err());
+    }
+
+    #[test]
+    fn parse_lines_embedded_nul_is_error() {
+        assert!(parse_lines_arg("1\u{0}").is_err());
+    }
+
+    // ── run (text mode): line-range edge cases ────────────────────────────────
+
+    /// Write `content` to a temp file and run the text-mode reader over it.
+    fn text_read(
+        content: &[u8],
+        lines_range: Option<(usize, usize)>,
+        numbers: bool,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let mut out: Vec<u8> = Vec::new();
+        text_read_into(content, lines_range, numbers, &mut out)?;
+        Ok(String::from_utf8(out).unwrap())
+    }
+
+    /// As [`text_read`], but exposes the output buffer so a failed read can be
+    /// checked for partial writes.
+    fn text_read_into(
+        content: &[u8],
+        lines_range: Option<(usize, usize)>,
+        numbers: bool,
+        out: &mut Vec<u8>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(content).unwrap();
+        f.flush().unwrap();
+        run(
+            f.path(),
+            lines_range,
+            numbers,
+            OutputEncoding::Preserve,
+            BomPolicy::default(),
+            out,
+            IoMode::Buffered,
+            None,
+        )
+    }
+
+    #[test]
+    fn text_read_whole_file() {
+        assert_eq!(text_read(b"a\nb\nc\n", None, false).unwrap(), "a\nb\nc\n");
+    }
+
+    #[test]
+    fn text_read_single_line() {
+        assert_eq!(text_read(b"a\nb\nc\n", Some((2, 2)), false).unwrap(), "b\n");
+    }
+
+    #[test]
+    fn text_read_last_line() {
+        assert_eq!(text_read(b"a\nb\nc\n", Some((3, 3)), false).unwrap(), "c\n");
+    }
+
+    #[test]
+    fn text_read_end_past_eof_is_clamped() {
+        assert_eq!(
+            text_read(b"a\nb\nc\n", Some((2, 999)), false).unwrap(),
+            "b\nc\n"
+        );
+    }
+
+    #[test]
+    fn text_read_start_past_eof_is_error_not_panic() {
+        let err = text_read(b"a\nb\nc\n", Some((9999, 9999)), false).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--lines: start line 9999 is past end of file (3 lines)"
+        );
+    }
+
+    #[test]
+    fn text_read_start_one_past_eof_is_error() {
+        assert!(text_read(b"a\nb\nc\n", Some((4, 4)), false).is_err());
+    }
+
+    #[test]
+    fn text_read_start_past_eof_writes_nothing() {
+        let mut out: Vec<u8> = Vec::new();
+        assert!(text_read_into(b"a\nb\nc\n", Some((4, 9)), false, &mut out).is_err());
+        assert!(out.is_empty(), "failed read emitted output: {out:?}");
+    }
+
+    #[test]
+    fn text_read_start_past_eof_with_numbers_is_error() {
+        assert!(text_read(b"a\nb\nc\n", Some((4, 4)), true).is_err());
+    }
+
+    #[test]
+    fn text_read_start_usize_max_is_error() {
+        assert!(text_read(b"a\nb\nc\n", Some((usize::MAX, usize::MAX)), false).is_err());
+    }
+
+    #[test]
+    fn text_read_empty_file_whole() {
+        assert_eq!(text_read(b"", None, false).unwrap(), "");
+    }
+
+    #[test]
+    fn text_read_empty_file_line_one_is_error() {
+        let err = text_read(b"", Some((1, 1)), false).unwrap_err();
+        assert!(
+            err.to_string().contains("(0 lines)"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn text_read_no_trailing_newline_last_line_ok() {
+        assert_eq!(text_read(b"a\nb", Some((2, 2)), false).unwrap(), "b\n");
+    }
+
+    #[test]
+    fn text_read_no_trailing_newline_past_eof_is_error() {
+        // "a\nb" is two lines; line 3 does not exist.
+        assert!(text_read(b"a\nb", Some((3, 3)), false).is_err());
+    }
+
+    #[test]
+    fn text_read_crlf_start_past_eof_is_error() {
+        assert!(text_read(b"a\r\nb\r\n", Some((3, 3)), false).is_err());
+    }
+
+    #[test]
+    fn text_read_crlf_last_line_ok() {
+        assert_eq!(
+            text_read(b"a\r\nb\r\n", Some((2, 2)), false).unwrap(),
+            "b\n"
+        );
+    }
+
+    #[test]
+    fn text_read_blank_lines_are_counted() {
+        // A file of only newlines still has addressable (empty) lines.
+        assert_eq!(text_read(b"\n\n\n", Some((3, 3)), false).unwrap(), "\n");
+        assert!(text_read(b"\n\n\n", Some((4, 4)), false).is_err());
+    }
+
+    #[test]
+    fn text_read_reversed_range_is_error() {
+        assert!(text_read(b"a\nb\nc\n", Some((3, 2)), false).is_err());
+    }
+
+    #[test]
+    fn text_read_zero_start_is_error() {
+        assert!(text_read(b"a\nb\nc\n", Some((0, 2)), false).is_err());
+    }
+
+    #[test]
+    fn text_read_bom_not_emitted_when_range_is_invalid() {
+        // The BOM must be written only after the range has been validated,
+        // otherwise a failed read leaves three stray bytes on stdout.
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"a\nb\n").unwrap();
+        f.flush().unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let result = run(
+            f.path(),
+            Some((99, 99)),
+            false,
+            OutputEncoding::Utf8,
+            BomPolicy::Force,
+            &mut out,
+            IoMode::Buffered,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(out.is_empty(), "BOM written despite failed read: {out:?}");
+    }
+
+    #[test]
+    fn text_read_every_line_individually_addressable() {
+        let content = b"one\ntwo\nthree\nfour\nfive\n";
+        let expected = ["one\n", "two\n", "three\n", "four\n", "five\n"];
+        for (i, want) in expected.iter().enumerate() {
+            let n = i + 1;
+            assert_eq!(&text_read(content, Some((n, n)), false).unwrap(), want);
+        }
+        // One past the end is the first failing index.
+        assert!(text_read(content, Some((6, 6)), false).is_err());
     }
 }

@@ -428,8 +428,11 @@ fn denorm_bytes(norm: &[u8], le: LineEnding) -> Vec<u8> {
 ///
 /// Returns an error if:
 /// - either line number is 0 (line numbers are 1-based)
-/// - `start_line > end_line` (checked after resolving [`EOF_SENTINEL`])
-/// - either line number exceeds the number of lines in the view (after resolving)
+/// - `start_line > end_line` (checked before resolving [`EOF_SENTINEL`], which
+///   is why a sentinel start with a numeric end is rejected here)
+/// - either line number exceeds the number of lines in the view (after
+///   resolving), including the zero-line case where [`EOF_SENTINEL`] itself
+///   resolves to 0
 ///
 /// [`EOF_SENTINEL`] in either position resolves to the total line count of the
 /// file (the last line number).
@@ -475,6 +478,13 @@ pub fn line_range_to_source_bytes(
     } else {
         end_line
     };
+
+    // A file with no content lines resolves EOF_SENTINEL to 0, which would slip
+    // past the 1-based guard above (that ran before resolution) and underflow
+    // `start_line - 1` below.  Report it as the out-of-range condition it is.
+    if start_line == 0 || end_line == 0 {
+        return Err(format!("edit: line 1 is out of range (file has {total_lines} lines)").into());
+    }
 
     if start_line > total_lines {
         return Err(format!(
@@ -1785,6 +1795,80 @@ mod tests {
         let (start, end) = line_range_to_source_bytes(&view, EOF_SENTINEL, EOF_SENTINEL).unwrap();
         let content = b"line1\nline2\nline3\n";
         assert_eq!(&content[start..end], b"line3\n");
+    }
+
+    // ── EOF_SENTINEL against a zero-line view ────────────────────────────────
+    //
+    // Regression: `EOF_SENTINEL` is resolved to `total_lines` *after* the
+    // 1-based guard has run, so on a file with no content lines it became 0,
+    // slipped past `start_line > total_lines` (`0 > 0` is false), and reached
+    // `line_starts[start_line - 1]` — an arithmetic underflow that aborted the
+    // process (exit 101) and, under tpu-mcp, killed the io worker.
+
+    /// Build a `View` over a file with zero content lines.  `Buffered` I/O is
+    /// required because an empty file cannot be memory-mapped.
+    fn make_empty_view() -> (View, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.txt");
+        fs::write(&path, b"").unwrap();
+
+        let branch = crate::open_as_branch(&path, IoMode::Buffered).unwrap();
+        let file_len = branch.byte_len();
+        let source = Source::new(Arc::clone(&branch), SourceConfig::default()).unwrap();
+        let lines = source.as_lines().unwrap();
+        let view = lines.view_range(0..file_len).unwrap();
+        (view, dir)
+    }
+
+    #[test]
+    fn lrtsb_eof_both_on_empty_view_is_error_not_underflow() {
+        let (view, _dir) = make_empty_view();
+        let err = line_range_to_source_bytes(&view, EOF_SENTINEL, EOF_SENTINEL).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "edit: line 1 is out of range (file has 0 lines)"
+        );
+    }
+
+    #[test]
+    fn lrtsb_eof_end_on_empty_view_is_error_not_underflow() {
+        let (view, _dir) = make_empty_view();
+        assert!(line_range_to_source_bytes(&view, 1, EOF_SENTINEL).is_err());
+    }
+
+    #[test]
+    fn lrtsb_numeric_on_empty_view_is_error() {
+        // The numeric path already reported this; the sentinel path must agree.
+        let (view, _dir) = make_empty_view();
+        assert!(line_range_to_source_bytes(&view, 1, 1).is_err());
+    }
+
+    #[test]
+    fn lrtsb_every_bound_combination_on_empty_view_is_error() {
+        // No combination of sentinel/numeric bounds may panic on a zero-line
+        // file; every one must be a clean Err.
+        let (view, _dir) = make_empty_view();
+        for (start, end) in [
+            (EOF_SENTINEL, EOF_SENTINEL),
+            (1, EOF_SENTINEL),
+            (1, 1),
+            (1, 2),
+            (2, 2),
+            (usize::MAX - 1, EOF_SENTINEL),
+        ] {
+            assert!(
+                line_range_to_source_bytes(&view, start, end).is_err(),
+                "({start}, {end}) on a zero-line view must be an error"
+            );
+        }
+    }
+
+    #[test]
+    fn lrtsb_eof_still_works_on_single_line_file() {
+        // The fix must not reject legitimate EOF use on a non-empty file.
+        let (view, _dir) = make_view(b"only\n");
+        let (start, end) = line_range_to_source_bytes(&view, EOF_SENTINEL, EOF_SENTINEL).unwrap();
+        assert_eq!(&b"only\n"[start..end], b"only\n");
     }
 
     // 81. run_test() line Delete $: deletes the last line.

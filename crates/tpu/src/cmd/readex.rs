@@ -34,7 +34,9 @@ const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 /// treat it as a standard line of text.
 ///
 /// `lines_range` constrains which source lines are included (1-based inclusive
-/// `(start, end)` pair).  `None` includes the entire file.
+/// `(start, end)` pair).  `None` includes the entire file.  The range is
+/// resolved by [`crate::cmd::read::resolve_line_range`], so an end past the
+/// last line is clamped while a start past the last line is a hard error.
 ///
 /// `numbers` prepends a 1-based line-number prefix (`     N  `) before each
 /// source line's escaped content, separated by two spaces.  The prefix is
@@ -64,8 +66,12 @@ pub fn run(
 
     // Empty files cannot be memory-mapped on most platforms.  Handle them as
     // an immediate early return: the output is a single bare newline (the
-    // flat-line terminator with no escaped body).
+    // flat-line terminator with no escaped body).  An empty file still has
+    // zero lines, so an explicit range must be validated here too — otherwise
+    // this shortcut would silently accept a range that the normal path
+    // rejects.
     if f.metadata()?.len() == 0 {
+        crate::cmd::read::resolve_line_range(lines_range, 0)?;
         writeln!(out)?;
         return Ok(());
     }
@@ -101,10 +107,7 @@ pub fn run(
         &all_parts
     };
 
-    let (start, end) = match lines_range {
-        None => (0, all_lines.len()),
-        Some((s, e)) => (s.saturating_sub(1), e.min(all_lines.len())),
-    };
+    let (start, end) = crate::cmd::read::resolve_line_range(lines_range, all_lines.len())?;
 
     // Optionally prepend a UTF-8 BOM.
     if output_encoding == OutputEncoding::Utf8 {
@@ -455,6 +458,120 @@ mod tests {
                 "non-printable byte 0x{b:02X} in escaped output"
             );
         }
+    }
+    // ── --lines range: negative and edge cases ────────────────────────────────
+
+    /// As [`readex_bytes`], but returns the `Result` (and the raw output
+    /// buffer) so failing ranges can be inspected instead of unwrapped.
+    fn readex_try(
+        content: &[u8],
+        lines_range: Option<(usize, usize)>,
+    ) -> (Result<(), Box<dyn std::error::Error>>, Vec<u8>) {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(content).unwrap();
+        tmp.flush().unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let result = run(
+            tmp.path(),
+            lines_range,
+            false,
+            OutputEncoding::Preserve,
+            BomPolicy::Strip,
+            &mut out,
+            IoMode::Mmap,
+            None,
+        );
+        (result, out)
+    }
+
+    #[test]
+    fn readex_start_past_eof_is_error_not_panic() {
+        let (result, _) = readex_try(b"aaa\nbbb\n", Some((9999, 9999)));
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--lines: start line 9999 is past end of file (2 lines)"
+        );
+    }
+
+    #[test]
+    fn readex_start_one_past_eof_is_error() {
+        let (result, _) = readex_try(b"aaa\nbbb\n", Some((3, 4)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn readex_start_past_eof_writes_nothing() {
+        let (result, out) = readex_try(b"aaa\nbbb\n", Some((3, 9)));
+        assert!(result.is_err());
+        assert!(out.is_empty(), "failed read emitted output: {out:?}");
+    }
+
+    #[test]
+    fn readex_start_usize_max_is_error() {
+        let (result, _) = readex_try(b"aaa\n", Some((usize::MAX, usize::MAX)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn readex_end_usize_max_is_clamped() {
+        assert_eq!(
+            readex_bytes(b"aaa\nbbb\n", Some((1, usize::MAX)), false),
+            "aaa\\nbbb\\n\n"
+        );
+    }
+
+    #[test]
+    fn readex_empty_file_with_range_is_error() {
+        let (result, _) = readex_try(b"", Some((1, 1)));
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("(0 lines)"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn readex_reversed_range_is_error() {
+        let (result, _) = readex_try(b"aaa\nbbb\n", Some((2, 1)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn readex_zero_start_is_error() {
+        let (result, _) = readex_try(b"aaa\nbbb\n", Some((0, 1)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn readex_last_line_of_file_without_trailing_newline_ok() {
+        assert_eq!(readex_bytes(b"aaa\nbbb", Some((2, 2)), false), "bbb\\n\n");
+    }
+
+    #[test]
+    fn readex_past_last_line_of_file_without_trailing_newline_is_error() {
+        let (result, _) = readex_try(b"aaa\nbbb", Some((3, 3)));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn readex_bom_not_emitted_when_range_is_invalid() {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(b"aaa\n").unwrap();
+        tmp.flush().unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        let result = run(
+            tmp.path(),
+            Some((42, 42)),
+            false,
+            OutputEncoding::Utf8,
+            BomPolicy::Force,
+            &mut out,
+            IoMode::Mmap,
+            None,
+        );
+        assert!(result.is_err());
+        assert!(out.is_empty(), "BOM written despite failed read: {out:?}");
     }
 }
 

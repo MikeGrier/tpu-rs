@@ -1551,3 +1551,271 @@ fn mcp_it_13_doctor_requires_path() {
         "missing `path` must surface as isError=true; got result: {result}"
     );
 }
+
+// --- MCP-IT-14: out-of-range and malformed `lines` arguments ------------------
+//
+// Regression coverage for a crash: `tpu_read_file` with a `lines` range whose
+// start was past the end of the file indexed a slice with the raw user-supplied
+// bounds and panicked (`range start index N out of range for slice of length
+// M`).  Inside tpu-mcp that aborted the io worker, which the manager then had
+// to respawn and retry.  These tests assert the call fails as a normal tool
+// error and — crucially — that the session keeps working afterwards.
+
+/// Call a tool and return `(is_error, text)` instead of panicking on failure.
+fn call_tool_result(s: &mut McpSession, tool: &str, args: Value) -> (bool, String) {
+    let result = s.rpc("tools/call", json!({ "name": tool, "arguments": args }));
+    let is_error = result
+        .get("isError")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let text = match result["content"].as_array() {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|c| c["text"].as_str())
+            .collect::<Vec<_>>()
+            .join(""),
+        None => String::new(),
+    };
+    (is_error, text)
+}
+
+/// MCP-IT-14: a `lines` range starting past EOF is a clean tool error, not a
+/// worker crash, and the server remains usable for subsequent calls.
+#[test]
+fn mcp_it_14_read_lines_past_eof_is_error_not_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("short.txt");
+    std::fs::write(&f, "one\ntwo\nthree\n").unwrap();
+    let path = f.to_str().unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let (is_error, text) = call_tool_result(
+        &mut s,
+        "tpu_read_file",
+        json!({
+            "file": path,
+            "lines": "9999",
+        }),
+    );
+    assert!(
+        is_error,
+        "reading past EOF must surface isError=true; got: {text}"
+    );
+    assert_has("past-EOF message", &text, "past end of file");
+    assert_has("actual line count", &text, "(3 lines)");
+    assert_lacks("no panic text", &text, "panicked");
+    assert_lacks("no slice panic", &text, "out of range for slice");
+
+    // The session (and its io worker) must still be alive and correct.
+    let content = s.call_tool("tpu_read_file", json!({ "file": path }));
+    assert_has("session still usable", &content, "three");
+}
+
+/// MCP-IT-14b: the same guarantee for `tpu_read_file_escaped`.
+#[test]
+fn mcp_it_14b_read_escaped_lines_past_eof_is_error_not_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("short_escaped.txt");
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    let path = f.to_str().unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let (is_error, text) = call_tool_result(
+        &mut s,
+        "tpu_read_file_escaped",
+        json!({
+            "file": path,
+            "lines": "3-9",
+        }),
+    );
+    assert!(
+        is_error,
+        "reading past EOF must surface isError=true; got: {text}"
+    );
+    assert_has("past-EOF message", &text, "past end of file");
+    assert_lacks("no panic text", &text, "panicked");
+
+    let content = s.call_tool("tpu_read_file_escaped", json!({ "file": path }));
+    assert_has("session still usable", &content, "two");
+}
+
+/// MCP-IT-14c: an out-of-range read on an *empty* file is an error too, and
+/// does not take the worker down.
+#[test]
+fn mcp_it_14c_read_lines_on_empty_file_is_error_not_crash() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("empty_read.txt");
+    std::fs::write(&f, "").unwrap();
+    let path = f.to_str().unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    for tool in ["tpu_read_file", "tpu_read_file_escaped"] {
+        let (is_error, text) = call_tool_result(
+            &mut s,
+            tool,
+            json!({
+                "file": path,
+                "lines": "1",
+            }),
+        );
+        assert!(is_error, "{tool}: expected isError=true; got: {text}");
+        assert_has("empty-file line count", &text, "(0 lines)");
+        assert_lacks("no panic text", &text, "panicked");
+    }
+
+    // Whole-file reads of an empty file still succeed.
+    let (is_error, _) = call_tool_result(&mut s, "tpu_read_file", json!({ "file": path }));
+    assert!(!is_error, "whole-file read of an empty file must succeed");
+}
+
+/// MCP-IT-14d: every malformed / hostile `lines` argument is rejected as a
+/// tool error, and a single session survives all of them back to back.
+#[test]
+fn mcp_it_14d_malformed_lines_arguments_are_errors_not_crashes() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("hostile_lines.txt");
+    std::fs::write(&f, "a\nb\nc\n").unwrap();
+    let path = f.to_str().unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    let bad_ranges = [
+        "0",                             // zero is not a valid 1-based line
+        "0-0",                           // both bounds zero
+        "1-0",                           // zero end
+        "3-1",                           // reversed
+        "-5",                            // negative
+        "5--3",                          // negative end
+        "-",                             // bare separator
+        "1-",                            // missing end
+        "",                              // empty
+        "   ",                           // whitespace only
+        "abc",                           // non-numeric
+        "1-abc",                         // non-numeric end
+        "1.5",                           // float
+        "0x10",                          // hex is not accepted for lines
+        "1-2-3",                         // too many bounds
+        "4",                             // one line past EOF
+        "9999",                          // far past EOF
+        "18446744073709551615",          // usize::MAX
+        "999999999999999999999999999",   // overflows usize
+        "1-999999999999999999999999999", // overflowing end bound
+    ];
+
+    for range in bad_ranges {
+        for tool in ["tpu_read_file", "tpu_read_file_escaped"] {
+            let (is_error, text) = call_tool_result(
+                &mut s,
+                tool,
+                json!({
+                    "file": path,
+                    "lines": range,
+                }),
+            );
+            assert!(
+                is_error,
+                "{tool} with lines={range:?} must be an error; got: {text}"
+            );
+            assert_lacks("no panic text", &text, "panicked");
+            assert_lacks("no slice panic", &text, "out of range for slice");
+        }
+    }
+
+    // After the whole hostile batch the server is still healthy.
+    let content = s.call_tool("tpu_read_file", json!({ "file": path, "lines": "1-3" }));
+    assert_has("session still usable", &content, "c");
+}
+
+/// MCP-IT-14f: `tpu_edit_file` with a `$` / `EOF` range against a file with no
+/// content lines is a clean tool error, not a worker crash.
+///
+/// Regression: `EOF_SENTINEL` resolved to 0 on a zero-line file and underflowed
+/// a slice index in `line_range_to_source_bytes`, aborting the process.  There
+/// is no `catch_unwind` in the workspace, so this killed the io worker — and
+/// once the retry budget was exhausted the manager ran the call in-process,
+/// where the same panic would take down the server itself.
+#[test]
+fn mcp_it_14f_edit_eof_sentinel_on_empty_file_is_error_not_crash() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let empty = dir.path().join("empty_edit.txt");
+    std::fs::write(&empty, "").unwrap();
+    // Not zero-length on disk, but zero content lines once the BOM is stripped.
+    let bom_only = dir.path().join("bom_only_edit.txt");
+    std::fs::write(&bom_only, [0xEFu8, 0xBB, 0xBF]).unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    for path in [&empty, &bom_only] {
+        let path = path.to_str().unwrap();
+        for op in [
+            json!({ "op": "delete", "range": "$" }),
+            json!({ "op": "delete", "range": "1-$" }),
+            json!({ "op": "splice", "range": "$", "data": "x" }),
+        ] {
+            let (is_error, text) = call_tool_result(
+                &mut s,
+                "tpu_edit_file",
+                json!({ "file": path, "ops": [op.clone()] }),
+            );
+            assert!(is_error, "{path} {op}: expected isError=true; got: {text}");
+            assert_lacks("no panic text", &text, "panicked");
+            assert_lacks("no underflow", &text, "subtract with overflow");
+        }
+    }
+
+    // Both files must be untouched, and the server still healthy.
+    assert_eq!(std::fs::read(&empty).unwrap(), b"");
+    assert_eq!(std::fs::read(&bom_only).unwrap(), [0xEFu8, 0xBB, 0xBF]);
+
+    let content = s.call_tool("tpu_read_file", json!({ "file": empty.to_str().unwrap() }));
+    assert!(
+        !content.contains("panicked"),
+        "session unusable after the batch: {content}"
+    );
+}
+
+/// MCP-IT-14e: valid ranges keep working, including boundary and clamped ones.
+#[test]
+fn mcp_it_14e_boundary_lines_arguments_still_succeed() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("boundary_lines.txt");
+    std::fs::write(&f, "a\nb\nc\n").unwrap();
+    let path = f.to_str().unwrap();
+
+    let mut s = McpSession::start();
+    s.initialize();
+
+    // Last line exactly.
+    let (is_error, text) = call_tool_result(
+        &mut s,
+        "tpu_read_file",
+        json!({
+            "file": path,
+            "lines": "3",
+        }),
+    );
+    assert!(!is_error, "reading the last line must succeed: {text}");
+    assert_has("last line", &text, "c");
+
+    // End bound past EOF is still clamped rather than rejected.
+    let (is_error, text) = call_tool_result(
+        &mut s,
+        "tpu_read_file",
+        json!({
+            "file": path,
+            "lines": "2-9999",
+        }),
+    );
+    assert!(!is_error, "a clamped end bound must succeed: {text}");
+    assert_has("clamped range start", &text, "b");
+    assert_has("clamped range end", &text, "c");
+}
