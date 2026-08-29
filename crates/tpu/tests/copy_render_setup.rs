@@ -367,8 +367,49 @@ trailer
     );
 }
 
-// ─── walk-error policy on `find` ─────────────────────────────────────────────
+/// The repository's own `.github/copilot-instructions.md` must stay
+/// byte-identical to what the current `tpu setup` generates. Every release
+/// that changes tool behaviour has to land the corresponding guidance edit
+/// in `cmd::setup::guidance_body()` *and* re-inject it here — otherwise
+/// agents keep following instructions for a tpu that no longer exists.
+/// This drift is exactly what shipped in 4.0.0 (the block was still stamped
+/// `version=3.0.0`), so it is now a test failure rather than a review nit.
+#[test]
+fn repo_copilot_instructions_block_matches_generated_guidance() {
+    let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(2)
+        .expect("crates/tpu has a workspace root two levels up")
+        .to_path_buf();
+    let instructions = repo_root.join(".github").join("copilot-instructions.md");
 
+    let on_disk = fs::read_to_string(&instructions)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", instructions.display()))
+        .replace("\r\n", "\n");
+    let generated = String::from_utf8_lossy(&ok(tpu().arg("setup")).stdout)
+        .replace("\r\n", "\n")
+        .trim_end()
+        .to_string();
+
+    let begin = on_disk
+        .find("<!-- tpu-mcp:setup:begin -->")
+        .expect("repo instructions must contain the managed begin marker");
+    let end = on_disk[begin..]
+        .find("<!-- tpu-mcp:setup:end -->")
+        .map(|rel| begin + rel + "<!-- tpu-mcp:setup:end -->".len())
+        .expect("repo instructions must contain the managed end marker");
+    let block = &on_disk[begin..end];
+
+    assert_eq!(
+        block,
+        generated,
+        "{} is stale: re-run `cargo run -p tpu -- setup --inject .github/copilot-instructions.md` \
+         after any change to guidance_body()",
+        instructions.display()
+    );
+}
+
+// ─── walk-error policy on `find` ─────────────────────────────────────────────
 #[test]
 fn find_warn_mode_continues_past_missing_path() {
     let dir = TempDir::new().unwrap();

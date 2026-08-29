@@ -4,7 +4,7 @@
      examples for documentation purposes) -->
 
 <!-- tpu-mcp:setup:begin -->
-<!-- tpu-mcp:setup:version=3.0.0 -->
+<!-- tpu-mcp:setup:version=4.0.0 -->
 
 ## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
 
@@ -50,9 +50,10 @@ differences.
 | `tpu_read_head` / `tpu_read_tail` | first/last N lines or bytes |
 | `tpu_read_file_binary` | inspecting raw bytes of binary files |
 | `tpu_read_file_escaped` | reading text as a single 7-bit-clean escaped line |
-| `tpu_write_file` | replacing a text file's full contents |
+| `tpu_create_file` | creating a NEW file — fails if the path already exists |
+| `tpu_write_file` | replacing an existing text file's full contents |
 | `tpu_append_file` | appending text to an existing file |
-| `tpu_replace_in_file` | literal (default) or regex substitution — pass `regex: true` to opt into regex matching |
+| `tpu_replace_in_file` | literal (default) or regex substitution — pass `regex: true` to opt into regex matching; a run that matches nothing is an error |
 | `tpu_edit_file` | targeted insert/delete/splice at known line numbers |
 | `tpu_validate_file` | pre-flight assertion that a file is in the expected state |
 | `tpu_count_file` | line / word / char / byte / pattern counts |
@@ -67,6 +68,16 @@ differences.
 
 - **Reads** — always use `tpu_read_file`. Never use PowerShell `Get-Content`
   for code review or content inspection.
+- **Line ranges must start inside the file** — a `lines` argument (on
+  `tpu_read_file` or `tpu_read_file_escaped`) whose *start* is past the last
+  line is an **error** that reports the file's real line count; it is not
+  empty output. End bounds are still clamped, so `lines: "1-9999"` remains
+  the safe way to say "from here to EOF". Re-anchor using the line count in
+  the error rather than probing with another guess.
+- **New files** — use `tpu_create_file`, not `tpu_write_file`. It fails when
+  the path already exists, so a mistaken path is reported instead of
+  silently destroying whatever was there. Reach for `tpu_write_file` only
+  when you intend to replace the contents of a file you know exists.
 - **Edits** — prefer `tpu_replace_in_file` (literal matching by default,
   no escaping needed) over `tpu_edit_file` when the target text is unique,
   because line numbers can shift between reads. Use `tpu_edit_file` when
@@ -75,6 +86,18 @@ differences.
   **verbatim**: backslashes are never collapsed, so no tpu tool needs
   pre-doubled escapes. (`tpu_replace_in_file` accepts an opt-in
   `expand_escapes: true` for callers that deliberately double-escape.)
+- **A replace that matches nothing is an error** — `tpu_replace_in_file`
+  returns `{"status":"error"}` when `pattern` matches zero times, and leaves
+  the file completely untouched (mtime preserved, no `.bak`). This is
+  deliberate: a silent success on a mis-anchored pattern is
+  indistinguishable from a real edit. Re-read the file and re-anchor the
+  pattern instead of retrying blind. Pass `allow_no_match: true` only for a
+  genuinely idempotent re-run — the response then carries `count: 0` and a
+  `warning`. `count: true` and `dry_run: true` are exempt (zero is a
+  legitimate answer for an introspection mode), as is a `line_ending`
+  override, which rewrites the file even with zero substitutions. A real
+  write always reports `count`, so no follow-up `count: true` call is needed
+  to confirm how many substitutions landed.
 - **Writes that should be guarded** — pass `validate: [{ "selector":
   "line-contains:N", "value": "..." }]` to refuse the write if the file is
   not in the expected state.
@@ -163,6 +186,9 @@ between the header and trailer.
   `{"status":"success","file":"...","mtime_epoch_ms":N,"size":N,"content_version":"..."}`
   (`content_version` is the digest of the just-written file — pass it as
   `if_match` on your next edit of this file; see "Concurrent edits" above).
+  A `tpu_replace_in_file` whose `pattern` matched zero times is instead an
+  error trailer naming the count, with the file left untouched — see
+  "A replace that matches nothing is an error" above.
   Preview modes do not stamp the file and return a reduced trailer:
   `diff:true` adds unified diff lines before the status (full stamp still present for write/replace/edit).
   `dry_run:true` (replace only): optional diff lines, then `{"status":"success","changed":true|false}`.
@@ -448,6 +474,50 @@ Run it after fallback edits, and rely on CI to run it on every PR.
 For richer per-file diagnostics or in-place repair, use
 `tpu doctor <path>` (optionally with `--fix=peel`); `check-encoding.ps1`
 is the cheap binary gate, `tpu doctor` is the structured tool.
+
+## Keeping the `tpu setup` guidance current (required for every behaviour change)
+
+`guidance_body()` in [`crates/tpu/src/cmd/setup.rs`](../crates/tpu/src/cmd/setup.rs)
+is the single source of truth for the managed
+`<!-- tpu-mcp:setup:begin -->` block that every consuming repository injects
+into its own `copilot-instructions.md`. In a *downstream* repo that block is
+the only tpu documentation an agent ever reads, so guidance that lags the
+binary is not a docs nit — it actively instructs agents to drive tpu the way
+it used to work. The version marker at the top of the block does not catch
+this: it records the release that wrote the block, not whether the block's
+prose describes that release.
+
+**Any change to observable `tpu` / `tpu-mcp` behaviour must update
+`guidance_body()` in the same commit.** At minimum that includes:
+
+- a new, renamed, or removed `tpu_*` MCP tool — add/remove its row in the
+  tool table;
+- a new argument that changes what a caller should do (`allow_no_match`,
+  `expand_escapes`, `if_match`, `git_root`, a `*_format` channel, …);
+- any change to a default, to a success/error condition, or to a response
+  shape;
+- every commit carrying a `BREAKING CHANGE:` footer, without exception.
+
+Then regenerate this repo's own copy in the same commit so the two never
+diverge:
+
+```pwsh
+cargo run -p tpu -- setup --inject .github/copilot-instructions.md
+```
+
+The `repo_copilot_instructions_block_matches_generated_guidance` test in
+`crates/tpu/tests/copy_render_setup.rs` fails when the checked-in block is
+not byte-identical to the generator's output, so a forgotten re-inject is
+caught by CI instead of by a downstream user.
+
+Checklist before merging or cutting a release:
+
+1. Does the diff change anything a caller can observe? If so, does it also
+   touch `guidance_body()`?
+2. Is the new wording written for an *agent in another repository* — the
+   tool's contract and what to do differently, not this repo's internals?
+3. Was `tpu setup --inject` re-run, so the version marker in
+   `.github/copilot-instructions.md` matches the current workspace version?
 
 ## Responding to PR review comments
 
