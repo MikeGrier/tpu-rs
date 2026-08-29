@@ -133,20 +133,22 @@ pub fn plural_lines(n: usize) -> String {
     format!("{n} line{}", if n == 1 { "" } else { "s" })
 }
 
-/// Count the logical lines in a file the same way `tpu read` does: split on
-/// LF and drop the empty tail produced by a trailing newline.  Valid for the
-/// ASCII/UTF-8 assets used by the generated read/readex suites.
+/// Count the logical lines in a file, as `tpu` itself sees them.
+///
+/// This deliberately does **not** re-implement line splitting.  Line-ending
+/// normalisation is harrier's job — a bare `\r` terminates a line just as `\n`
+/// and `\r\n` do — and any hand-rolled counter in the test suite is free to
+/// drift from the binary it is supposed to be checking.  An earlier version of
+/// this helper counted only `\n` bytes and silently undercounted
+/// `mixed_endings.txt` by its 48 bare CRs (192 vs the true 240), which would
+/// have made every generated boundary test assert against the wrong line.
+///
+/// Instead we ask the product: `tpu read` emits exactly one LF per logical
+/// line, so counting LFs in its output is the binary's own answer by
+/// construction.
 pub fn line_count(path: &std::path::Path) -> usize {
-    let bytes = fs::read(path).expect("read asset for line count");
-    if bytes.is_empty() {
-        return 0;
-    }
-    let newlines = bytes.iter().filter(|&&b| b == b'\n').count();
-    if bytes.ends_with(b"\n") {
-        newlines
-    } else {
-        newlines + 1
-    }
+    let o = ok(tpu().arg("read").arg(path));
+    o.stdout.iter().filter(|&&b| b == b'\n').count()
 }
 
 /// Run a command, assert exit 0, return its Output.
@@ -1234,6 +1236,66 @@ fn read_lines_past_end_of_single_line_file_exits_err() {
         !stderr.contains("1 lines"),
         "line count must be singular for a 1-line file:\n{stderr}"
     );
+}
+
+/// `line_count` must agree with `tpu count --lines` — an independent code path
+/// through the same harrier normalisation — for every line-ending convention.
+///
+/// `mixed_endings.txt` is the load-bearing case: it contains 48 bare CRs, which
+/// harrier normalises to LF.  Any counter looking only for `\n` undercounts it
+/// (192 vs the true 240) and would silently make every generated boundary test
+/// assert against the wrong line number.
+#[test]
+fn line_count_helper_matches_tpu_count_for_all_line_endings() {
+    for name in [
+        "mixed_endings.txt",    // LF + CRLF + bare CR
+        "multiline_crlf.txt",   // CRLF
+        "multiline_lf.txt",     // LF
+        "ascii_10lines.txt",    // LF
+        "singleline.txt",       // one terminated line
+        "singleline_no_nl.txt", // one unterminated line
+        "utf8_bom.txt",         // BOM must not be counted as content
+        "empty.txt",            // zero lines
+    ] {
+        let path = asset(name);
+        let helper = line_count(&path);
+
+        // Independent ground truth: `tpu count --lines` reaches the count
+        // through its own code path rather than `read`'s.
+        let counted = ok(tpu().arg("count").arg("--lines").arg(&path));
+        let stdout = String::from_utf8_lossy(&counted.stdout);
+        let reported: usize = stdout
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("lines:"))
+            .unwrap_or_else(|| panic!("no 'lines:' in `tpu count` output for {name}:\n{stdout}"))
+            .trim()
+            .parse()
+            .unwrap_or_else(|e| panic!("unparseable line count for {name}: {e}"));
+
+        assert_eq!(
+            helper, reported,
+            "line_count({name}) = {helper} but `tpu count --lines` reported {reported}"
+        );
+
+        if reported == 0 {
+            continue;
+        }
+
+        // That value must be exactly the last addressable line: the boundary
+        // the generated suites depend on.
+        ok(tpu()
+            .arg("read")
+            .arg(format!("--lines={helper}"))
+            .arg(&path));
+        let past = err(tpu()
+            .arg("read")
+            .arg(format!("--lines={}", helper + 1))
+            .arg(&path));
+        assert_clean_failure(
+            &past,
+            &format!("past end of file ({})", plural_lines(helper)),
+        );
+    }
 }
 
 #[test]
