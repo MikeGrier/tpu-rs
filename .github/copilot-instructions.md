@@ -506,8 +506,9 @@ cargo run -p tpu -- setup --inject .github/copilot-instructions.md
 ```
 
 The `repo_copilot_instructions_block_matches_generated_guidance` test in
-`crates/tpu/tests/copy_render_setup.rs` fails when the checked-in block is
-not byte-identical to the generator's output, so a forgotten re-inject is
+`crates/tpu/tests/copy_render_setup.rs` fails when the checked-in block does
+not match the generator's output exactly (apart from CRLF->LF normalization
+and the trailing newline `tpu setup` prints), so a forgotten re-inject is
 caught by CI instead of by a downstream user.
 
 Checklist before merging or cutting a release:

@@ -367,13 +367,16 @@ trailer
     );
 }
 
-/// The repository's own `.github/copilot-instructions.md` must stay
-/// byte-identical to what the current `tpu setup` generates. Every release
-/// that changes tool behaviour has to land the corresponding guidance edit
-/// in `cmd::setup::guidance_body()` *and* re-inject it here — otherwise
-/// agents keep following instructions for a tpu that no longer exists.
-/// This drift is exactly what shipped in 4.0.0 (the block was still stamped
-/// `version=3.0.0`), so it is now a test failure rather than a review nit.
+/// The repository's own `.github/copilot-instructions.md` must stay identical
+/// to what the current `tpu setup` generates — exactly, apart from CRLF->LF
+/// normalization on both sides (so the test doesn't fail on a checkout with
+/// `core.autocrlf=true`) and the single trailing newline `tpu setup` emits
+/// after the end marker. Every release that changes tool behaviour has to land
+/// the corresponding guidance edit in `cmd::setup::guidance_body()` *and*
+/// re-inject it here — otherwise agents keep following instructions for a tpu
+/// that no longer exists. This drift is exactly what shipped in 4.0.0 (the
+/// block was still stamped `version=3.0.0`), so it is now a test failure
+/// rather than a review nit.
 #[test]
 fn repo_copilot_instructions_block_matches_generated_guidance() {
     let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -389,12 +392,17 @@ fn repo_copilot_instructions_block_matches_generated_guidance() {
     // Strict decode, not `from_utf8_lossy`: the guidance is a `&'static str`,
     // so invalid UTF-8 on stdout means the emit path corrupted it. Lossy
     // decoding would substitute U+FFFD and could let that corruption compare
-    // equal — silently defeating the byte-identical check this test exists for.
+    // equal — silently defeating the exact-match check this test exists for.
+    //
+    // `trim_end_matches('\n')` rather than `trim_end()`: only the trailing
+    // newline(s) after the end marker are an artifact of printing. Stripping
+    // all trailing whitespace would also discard significant trailing spaces
+    // (e.g. a Markdown hard break) and mask that drift.
     let stdout = ok(tpu().arg("setup")).stdout;
     let generated = String::from_utf8(stdout)
         .expect("`tpu setup` must emit valid UTF-8")
         .replace("\r\n", "\n")
-        .trim_end()
+        .trim_end_matches('\n')
         .to_string();
 
     let begin = on_disk
