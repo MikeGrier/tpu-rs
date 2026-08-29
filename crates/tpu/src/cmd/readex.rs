@@ -15,12 +15,9 @@ use harrier::{encoding::SourceConfig, source::Source};
 
 use crate::{
     IoMode,
-    encoding::{BomPolicy, OutputEncoding},
+    encoding::{BomPolicy, OutputEncoding, UTF8_BOM},
     escape,
 };
-
-/// UTF-8 BOM byte sequence (U+FEFF encoded as UTF-8).
-const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 /// Run the `readex` subcommand.
 ///
@@ -42,10 +39,13 @@ const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 /// source line's escaped content, separated by two spaces.  The prefix is
 /// itself part of the flat escaped output.
 ///
-/// `output_encoding` and `bom_policy` follow the same semantics as `read`:
-/// when `output_encoding` is `Utf8` and `bom_policy` is `Preserve` or `Force`,
-/// three UTF-8 BOM bytes (0xEF 0xBB 0xBF) are prepended to the output before
-/// the escaped text.
+/// `output_encoding` and `bom_policy` follow the same semantics as `read`,
+/// resolved through [`crate::encoding::should_write_bom`]: when
+/// `output_encoding` is `Utf8`, three UTF-8 BOM bytes (0xEF 0xBB 0xBF) are
+/// prepended to the output before the escaped text under `Force`, or under
+/// `Preserve` when the source itself had a BOM.  This holds for empty files
+/// too — an empty file has no BOM of its own, so `Preserve` writes none while
+/// `Force` still does.
 ///
 /// `notes` is the optional advisory writer (Milestone 4).  When `Some`,
 /// after decoding the file's text [`crate::mojibake::emit_read_advisory`]
@@ -72,6 +72,12 @@ pub fn run(
     // rejects.
     if f.metadata()?.len() == 0 {
         crate::cmd::read::resolve_line_range(lines_range, 0)?;
+        // An empty file has no BOM of its own, so `Preserve` writes nothing;
+        // `Force` still must.  Skipping this block entirely (as this fast path
+        // once did) made `--bom=force` silently differ from `read`.
+        if crate::encoding::should_write_bom(output_encoding, bom_policy, false) {
+            out.write_all(UTF8_BOM)?;
+        }
         writeln!(out)?;
         return Ok(());
     }
@@ -110,15 +116,8 @@ pub fn run(
     let (start, end) = crate::cmd::read::resolve_line_range(lines_range, all_lines.len())?;
 
     // Optionally prepend a UTF-8 BOM.
-    if output_encoding == OutputEncoding::Utf8 {
-        let write_bom = match bom_policy {
-            BomPolicy::Strip => false,
-            BomPolicy::Preserve => source_had_bom,
-            BomPolicy::Force => true,
-        };
-        if write_bom {
-            out.write_all(UTF8_BOM)?;
-        }
+    if crate::encoding::should_write_bom(output_encoding, bom_policy, source_had_bom) {
+        out.write_all(UTF8_BOM)?;
     }
 
     // Build the flat escaped output.  Each source line is escaped and followed
@@ -181,6 +180,111 @@ mod tests {
     fn readex_empty_file() {
         // Empty file → single actual newline (flat-line terminator, empty body).
         assert_eq!(readex_bytes(b"", None, false), "\n");
+    }
+
+    // ── Empty-file BOM policy ────────────────────────────────────────────────
+    //
+    // Regression: the empty-file fast path returned before the BOM block ever
+    // ran, so `readex --utf8 --bom=force` on an empty file emitted `0a` while
+    // `read` with identical flags emitted `ef bb bf 0a`.  The fast path now
+    // resolves the BOM through the same `should_write_bom` helper as the
+    // normal path.
+
+    /// Run `readex` over `content` with explicit BOM settings, returning the
+    /// raw output bytes.
+    fn readex_raw(
+        content: &[u8],
+        output_encoding: OutputEncoding,
+        bom_policy: BomPolicy,
+    ) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bom_case.txt");
+        std::fs::write(&path, content).unwrap();
+        let mut out: Vec<u8> = Vec::new();
+        run(
+            &path,
+            None,
+            false,
+            output_encoding,
+            bom_policy,
+            &mut out,
+            IoMode::Buffered,
+            None,
+        )
+        .unwrap();
+        out
+    }
+
+    #[test]
+    fn readex_empty_file_bom_force_emits_bom() {
+        assert_eq!(
+            readex_raw(b"", OutputEncoding::Utf8, BomPolicy::Force),
+            b"\xEF\xBB\xBF\n"
+        );
+    }
+
+    #[test]
+    fn readex_empty_file_bom_strip_emits_no_bom() {
+        assert_eq!(
+            readex_raw(b"", OutputEncoding::Utf8, BomPolicy::Strip),
+            b"\n"
+        );
+    }
+
+    #[test]
+    fn readex_empty_file_bom_preserve_emits_no_bom() {
+        // An empty file has no BOM of its own, so Preserve writes none.
+        assert_eq!(
+            readex_raw(b"", OutputEncoding::Utf8, BomPolicy::Preserve),
+            b"\n"
+        );
+    }
+
+    #[test]
+    fn readex_empty_file_without_utf8_never_emits_bom() {
+        // OutputEncoding::Preserve suppresses the BOM even under Force.
+        for policy in [BomPolicy::Strip, BomPolicy::Preserve, BomPolicy::Force] {
+            assert_eq!(
+                readex_raw(b"", OutputEncoding::Preserve, policy),
+                b"\n",
+                "unexpected BOM for {policy:?} without --utf8"
+            );
+        }
+    }
+
+    #[test]
+    fn readex_empty_file_bom_matches_read_for_every_policy() {
+        // The two commands must agree on an empty file for every combination;
+        // only the body after the BOM differs (`read` emits nothing, `readex`
+        // emits its flat-line terminator).
+        for encoding in [OutputEncoding::Preserve, OutputEncoding::Utf8] {
+            for policy in [BomPolicy::Strip, BomPolicy::Preserve, BomPolicy::Force] {
+                let rx = readex_raw(b"", encoding, policy);
+                let rx_had_bom = rx.starts_with(b"\xEF\xBB\xBF");
+
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("empty.txt");
+                std::fs::write(&path, b"").unwrap();
+                let mut rd: Vec<u8> = Vec::new();
+                crate::cmd::read::run(
+                    &path,
+                    None,
+                    false,
+                    encoding,
+                    policy,
+                    &mut rd,
+                    IoMode::Buffered,
+                    None,
+                )
+                .unwrap();
+                let rd_had_bom = rd.starts_with(b"\xEF\xBB\xBF");
+
+                assert_eq!(
+                    rx_had_bom, rd_had_bom,
+                    "readex/read disagree on BOM for {encoding:?} + {policy:?}"
+                );
+            }
+        }
     }
 
     #[test]

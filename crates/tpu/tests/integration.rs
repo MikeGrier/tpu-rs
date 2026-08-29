@@ -1441,6 +1441,62 @@ fn read_lines_range_clamped_ok() {
     );
 }
 
+/// `readex` must honour `--bom` on an empty file exactly as `read` does.
+///
+/// Regression: `readex`'s empty-file fast path returned before the BOM block,
+/// so `--utf8 --bom=force` emitted no BOM (`0a`) while `read` with identical
+/// flags emitted `ef bb bf 0a` — a silent divergence from both `read` and
+/// `readex`'s own documented behaviour.
+#[test]
+fn readex_empty_file_honours_bom_policy_like_read() {
+    let empty = asset("empty.txt");
+
+    // --bom=force must emit the BOM.
+    let forced = ok(tpu()
+        .arg("readex")
+        .arg("--utf8")
+        .arg("--bom=force")
+        .arg(&empty));
+    assert!(
+        forced.stdout.starts_with(&[0xEF, 0xBB, 0xBF]),
+        "readex --bom=force on an empty file must emit a BOM; got {:02x?}",
+        forced.stdout
+    );
+
+    // --bom=strip and --bom=preserve must not (an empty file has no BOM).
+    for policy in ["strip", "preserve"] {
+        let o = ok(tpu()
+            .arg("readex")
+            .arg("--utf8")
+            .arg(format!("--bom={policy}"))
+            .arg(&empty));
+        assert!(
+            !o.stdout.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "readex --bom={policy} on an empty file must not emit a BOM; got {:02x?}",
+            o.stdout
+        );
+    }
+
+    // read and readex must agree on whether a BOM is present, for every policy.
+    for policy in ["strip", "preserve", "force"] {
+        let rx = ok(tpu()
+            .arg("readex")
+            .arg("--utf8")
+            .arg(format!("--bom={policy}"))
+            .arg(&empty));
+        let rd = ok(tpu()
+            .arg("read")
+            .arg("--utf8")
+            .arg(format!("--bom={policy}"))
+            .arg(&empty));
+        assert_eq!(
+            rx.stdout.starts_with(&[0xEF, 0xBB, 0xBF]),
+            rd.stdout.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "read and readex disagree on --bom={policy} for an empty file"
+        );
+    }
+}
+
 #[test]
 fn read_binary_empty_file_gives_empty_output() {
     let o = ok(tpu().arg("read").arg("--binary").arg(asset("empty.txt")));

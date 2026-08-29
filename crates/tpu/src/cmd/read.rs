@@ -10,11 +10,8 @@ use md5::{Digest, Md5};
 
 use crate::{
     IoMode,
-    encoding::{BomPolicy, OutputEncoding},
+    encoding::{BomPolicy, OutputEncoding, UTF8_BOM},
 };
-
-/// UTF-8 BOM byte sequence (U+FEFF encoded as UTF-8).
-const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
 
 /// Run the `read` subcommand.
 ///
@@ -88,15 +85,8 @@ pub fn run(
     // Optionally prepend a UTF-8 BOM to stdout before any content.
     // This is only done when --utf8 is active; the text itself is always
     // decoded to UTF-8 regardless of the flag.
-    if output_encoding == OutputEncoding::Utf8 {
-        let write_bom = match bom_policy {
-            BomPolicy::Strip => false,
-            BomPolicy::Preserve => source_had_bom,
-            BomPolicy::Force => true,
-        };
-        if write_bom {
-            out.write_all(UTF8_BOM)?;
-        }
+    if crate::encoding::should_write_bom(output_encoding, bom_policy, source_had_bom) {
+        out.write_all(UTF8_BOM)?;
     }
 
     for (i, line) in all_lines[start..end].iter().enumerate() {
