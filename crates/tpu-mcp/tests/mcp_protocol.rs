@@ -1686,27 +1686,32 @@ fn mcp_it_14d_malformed_lines_arguments_are_errors_not_crashes() {
     let mut s = McpSession::start();
     s.initialize();
 
-    let bad_ranges = [
-        "0",                             // zero is not a valid 1-based line
-        "0-0",                           // both bounds zero
-        "1-0",                           // zero end
-        "3-1",                           // reversed
-        "-5",                            // negative
-        "5--3",                          // negative end
-        "-",                             // bare separator
-        "1-",                            // missing end
-        "",                              // empty
-        "   ",                           // whitespace only
-        "abc",                           // non-numeric
-        "1-abc",                         // non-numeric end
-        "1.5",                           // float
-        "0x10",                          // hex is not accepted for lines
-        "1-2-3",                         // too many bounds
-        "4",                             // one line past EOF
-        "9999",                          // far past EOF
-        "18446744073709551615",          // usize::MAX
-        "999999999999999999999999999",   // overflows usize
-        "1-999999999999999999999999999", // overflowing end bound
+    // Built dynamically where the value depends on pointer width, so the
+    // comments stay accurate (and the intent is preserved) on 32-bit targets.
+    let usize_max = usize::MAX.to_string();
+    let past_usize_max = (usize::MAX as u128 + 1).to_string();
+    let past_usize_max_end = format!("1-{past_usize_max}");
+    let bad_ranges: [&str; 20] = [
+        "0",                 // zero is not a valid 1-based line
+        "0-0",               // both bounds zero
+        "1-0",               // zero end
+        "3-1",               // reversed
+        "-5",                // negative
+        "5--3",              // negative end
+        "-",                 // bare separator
+        "1-",                // missing end
+        "",                  // empty
+        "   ",               // whitespace only
+        "abc",               // non-numeric
+        "1-abc",             // non-numeric end
+        "1.5",               // float
+        "0x10",              // hex is not accepted for lines
+        "1-2-3",             // too many bounds
+        "4",                 // one line past EOF
+        "9999",              // far past EOF
+        &usize_max,          // usize::MAX — parses, then fails the bounds check
+        &past_usize_max,     // one past usize::MAX — fails to parse
+        &past_usize_max_end, // overflowing end bound
     ];
 
     for range in bad_ranges {
