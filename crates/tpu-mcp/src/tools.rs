@@ -2226,14 +2226,32 @@ fn call_edit_file(args: &Value, config: &ServerConfig) -> ToolResult {
 
         let le_override = eol_write_override(args, &file, config)?;
 
-        // Collect --data-format from the first op that specifies one.
+        // Collect --data-format from the first op that specifies one. A
+        // present-but-non-string value on ANY op is an error rather than
+        // being skipped: silently ignoring it would drop the caller into the
+        // plain-text path and write their encoded payload literally into the
+        // file (see `optional_format_str`).
         let data_format: Option<tpu::data_format::DataFormat> =
             if let Some(ops_arr) = args.get("ops").and_then(|v| v.as_array()) {
-                ops_arr
-                    .iter()
-                    .find_map(|op| op.get("data_format").and_then(|v| v.as_str()))
-                    .map(parse_data_format)
-                    .transpose()?
+                let mut first: Option<&str> = None;
+                for op in ops_arr {
+                    match op.get("data_format") {
+                        None | Some(Value::Null) => {}
+                        Some(Value::String(s)) => {
+                            if first.is_none() {
+                                first = Some(s);
+                            }
+                        }
+                        Some(other) => {
+                            return Err(format!(
+                                "an op's 'data_format' must be a JSON string naming a data \
+                                 format (hex, base64, or encoded), got {other}"
+                            )
+                            .into());
+                        }
+                    }
+                }
+                first.map(parse_data_format).transpose()?
             } else {
                 None
             };
@@ -3777,7 +3795,7 @@ fn parse_data_format(s: &str) -> Result<tpu::data_format::DataFormat, Box<dyn st
 /// is normalised to LF, matching every other text-content argument.
 fn decode_content_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::error::Error>> {
     let format_key = format!("{key}_format");
-    let text = match args.get(&format_key).and_then(|v| v.as_str()) {
+    let text = match optional_format_str(args, &format_key)? {
         Some(fmt_str) => {
             let fmt = parse_data_format(fmt_str)?;
             let raw = require_str(args, key)?;
@@ -3797,7 +3815,7 @@ fn decode_content_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::er
 /// matched against the file's already LF-normalised view exactly as today.
 fn decode_pattern_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::error::Error>> {
     let format_key = format!("{key}_format");
-    match args.get(&format_key).and_then(|v| v.as_str()) {
+    match optional_format_str(args, &format_key)? {
         Some(fmt_str) => {
             let fmt = parse_data_format(fmt_str)?;
             let raw = require_str(args, key)?;
@@ -3832,7 +3850,7 @@ fn decode_pattern_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::er
 /// silently resolved one way or the other.
 fn decode_replacement_arg(args: &Value) -> Result<String, Box<dyn std::error::Error>> {
     let expand = optional_bool(args, "expand_escapes")?;
-    match args.get("replacement_format").and_then(|v| v.as_str()) {
+    match optional_format_str(args, "replacement_format")? {
         Some(fmt_str) => {
             if expand {
                 return Err("'expand_escapes' cannot be combined with \
@@ -3880,6 +3898,32 @@ impl std::io::Write for SharedBufWriter {
 // SAFETY: The MCP server is single-threaded; Arc<Mutex<_>> is used solely to
 // allow shared ownership across the Output trait boundary.
 unsafe impl Send for SharedBufWriter {}
+
+/// Read an optional `{key}_format` argument, defaulting to `None` when absent.
+///
+/// A present-but-non-string value is an error rather than a silent `None`.
+/// This matters more than it looks: `and_then(|v| v.as_str())` collapses
+/// `123`, `true`, or `["base64"]` to `None`, which silently drops the caller
+/// into the plain-text branch — so their base64/hex payload would be written
+/// into the file as its literal encoded text, and (for `replacement`) the
+/// `expand_escapes`/`replacement_format` conflict check would never fire.
+/// Failing loudly is the same principle as [`optional_bool`] and
+/// [`reject_removed_fixed_strings_arg`]: never silently reinterpret an
+/// argument the caller clearly meant to set.
+fn optional_format_str<'a>(
+    args: &'a Value,
+    format_key: &str,
+) -> Result<Option<&'a str>, Box<dyn std::error::Error>> {
+    match args.get(format_key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s)),
+        Some(other) => Err(format!(
+            "argument '{format_key}' must be a JSON string naming a data format \
+             (hex, base64, or encoded), got {other}"
+        )
+        .into()),
+    }
+}
 
 fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, Box<dyn std::error::Error>> {
     args.get(key)
@@ -5945,6 +5989,8 @@ mod integration_tests {
         let f = dir.path().join("conflict.txt");
 
         fs::write(&f, "X\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         let args = serde_json::json!({
             "file": f.to_str().unwrap(),
@@ -5961,11 +6007,7 @@ mod integration_tests {
             err.contains("expand_escapes"),
             "conflict must be reported to the caller; got: {err}"
         );
-        assert_eq!(
-            fs::read_to_string(&f).unwrap(),
-            "X\n",
-            "rejected call must not modify the file"
-        );
+        assert_rejection_was_inert(&f, "X\n", before, &err);
 
         drop(dir);
     }
@@ -5978,6 +6020,8 @@ mod integration_tests {
         let f = dir.path().join("badflag.txt");
 
         fs::write(&f, "X\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
 
         let args = serde_json::json!({
             "file": f.to_str().unwrap(),
@@ -5993,7 +6037,141 @@ mod integration_tests {
             err.contains("expand_escapes"),
             "bad flag type must be reported; got: {err}"
         );
-        assert_eq!(fs::read_to_string(&f).unwrap(), "X\n");
+        assert_rejection_was_inert(&f, "X\n", before, &err);
+
+        drop(dir);
+    }
+
+    /// Assert that a rejected call left the filesystem completely untouched:
+    /// same bytes, same mtime, and no `<file>.bak` created.  `crates/tpu/
+    /// CHECKLIST.md` Milestones 7 and 9 record two separate regressions where
+    /// a supposed no-op still advanced mtime (via the verification stamp) or
+    /// left a stray `.bak`, so an argument-rejection path asserting only file
+    /// content would not actually pin the property that matters.
+    fn assert_rejection_was_inert(
+        f: &std::path::Path,
+        expected: &str,
+        before: std::time::SystemTime,
+        err: &str,
+    ) {
+        assert_eq!(
+            fs::read_to_string(f).unwrap(),
+            expected,
+            "rejected call must not modify the file; error was: {err}"
+        );
+        assert_eq!(
+            fs::metadata(f).unwrap().modified().unwrap(),
+            before,
+            "rejected call must not bump mtime; error was: {err}"
+        );
+        let bak = f.with_file_name(format!("{}.bak", f.file_name().unwrap().to_str().unwrap()));
+        assert!(
+            !bak.exists(),
+            "rejected call must not leave a .bak at {bak:?}"
+        );
+    }
+
+    /// RE-IT-10: a present-but-non-string `replacement_format` is rejected
+    /// rather than silently collapsing to "absent".
+    ///
+    /// Regression for a bug found in review of the verbatim change itself:
+    /// `args.get("replacement_format").and_then(|v| v.as_str())` yields `None`
+    /// for `123` / `true` / `["base64"]`, which silently took the plain-text
+    /// branch.  That defeated the RE-IT-8 conflict guard AND — with
+    /// `expand_escapes: true` also set — ran escape decoding over the caller's
+    /// encoded payload, reintroducing the exact second-decoding pass this
+    /// change exists to remove.
+    #[test]
+    fn re_it_10_non_string_replacement_format_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("badformat.txt");
+
+        fs::write(&f, "X\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "X",
+            "replacement": "a\\nb",
+            "replacement_format": 123,
+            "expand_escapes": true,
+        });
+
+        let err = call("tpu_replace_in_file", &args)
+            .expect_err("non-string replacement_format must be rejected")
+            .to_string();
+        assert!(
+            err.contains("replacement_format"),
+            "bad format type must be reported; got: {err}"
+        );
+        assert_rejection_was_inert(&f, "X\n", before, &err);
+
+        drop(dir);
+    }
+
+    /// RE-IT-11: the verbatim default holds in regex mode with a capture
+    /// group, where the replacement additionally goes through
+    /// `regex::bytes::Captures::expand()`.  Backslashes must survive that
+    /// expansion untouched while `${1}` still substitutes.
+    ///
+    /// Note the braces: `$1_unc` would be parsed as a reference to a group
+    /// *named* `1_unc` and silently substitute empty, which is the documented
+    /// `$1token` hazard the tool description warns about — orthogonal to
+    /// backslash handling, but easy to trip over when writing this test.
+    #[test]
+    fn re_it_11_verbatim_survives_capture_group_expansion() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("verbatim_capture.txt");
+
+        fs::write(&f, "fn guard() {}\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "(guard)",
+            "replacement": r#"${1}_unc // r"\\." and \d+"#,
+            "regex": true,
+        });
+
+        call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        let text = String::from_utf8(fs::read(&f).unwrap()).unwrap();
+        assert_eq!(
+            text,
+            concat!(r#"fn guard_unc // r"\\." and \d+() {}"#, "\n"),
+            "capture group must expand while backslashes stay verbatim; got: {text:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// RE-IT-12: the same non-string-format hole on `tpu_edit_file`'s per-op
+    /// `data_format`.  Previously a non-string value was skipped by the
+    /// `find_map`, so the op's encoded payload was inserted literally.
+    #[test]
+    fn re_it_12_non_string_data_format_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("badopformat.txt");
+
+        fs::write(&f, "ab\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [
+                { "op": "insert", "offset": "2", "data": tpu::data_format::encode_base64(b"Z"), "data_format": 7 }
+            ],
+        });
+
+        let err = call("tpu_edit_file", &args)
+            .expect_err("non-string data_format must be rejected")
+            .to_string();
+        assert!(
+            err.contains("data_format"),
+            "bad op format type must be reported; got: {err}"
+        );
+        assert_rejection_was_inert(&f, "ab\n", before, &err);
 
         drop(dir);
     }

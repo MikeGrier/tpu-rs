@@ -687,7 +687,49 @@ default (`--literal-replacement` / `-L` to opt out).  A shell user typing
 conventions; the reported defect is specific to JSON-RPC arguments, where the
 transport has already resolved escapes before tpu sees them.
 
-**Status:** ✅ Complete.  `cargo test -p tpu-mcp`: 142 passed, 0 failed
-(107 lib incl. the 5 new tests + 6 io_worker_chaos + 29 mcp_protocol);
+**Status:** ✅ Complete.  `cargo test -p tpu-mcp`: 145 passed, 0 failed
+(110 lib incl. the 8 new tests + 6 io_worker_chaos + 29 mcp_protocol);
 `cargo test -p tpu` unaffected.  `cargo fmt --check` clean; `cargo clippy
 -p tpu-mcp --all-targets` introduces no new lints.
+
+### Review follow-up — the same silent-ignore class in the `*_format` accessors
+
+Code review of the fix found that M10-2's conflict guard could be bypassed,
+by the *same* class of defect the milestone exists to remove.
+`decode_replacement_arg` dispatched on
+`args.get("replacement_format").and_then(|v| v.as_str())`, which collapses a
+present-but-non-string value (`123`, `true`, `["base64"]`) to `None`.  A call
+carrying `replacement_format: 123` therefore fell silently into the plain-text
+branch: the conflict check never fired, the caller's encoded payload was
+written as its literal encoded text, and with `expand_escapes: true` also set
+the escape decoding ran anyway — reintroducing the exact second decoding pass
+this milestone removes.  Reproduced end-to-end over stdio before fixing.
+
+- [x] M10-6: New `optional_format_str` helper errors on a present-but-non-
+      string `{key}_format`, mirroring `optional_bool`.  Applied to all three
+      accessors — `decode_replacement_arg`, `decode_content_arg`, and
+      `decode_pattern_arg` — so `content_format` / `pattern_format` cannot be
+      silently dropped either.  The conflict check now keys on the argument's
+      presence rather than on successful string extraction.
+- [x] M10-7: `tpu_edit_file`'s per-op `data_format` had the same shape via
+      `find_map(|op| op.get("data_format").and_then(|v| v.as_str()))`, which
+      *skipped* a non-string value and moved on to later ops.  Now a
+      non-string `data_format` on any op is an error; the "first op that
+      specifies one wins" semantics is preserved.  This matters because the
+      guidance written by M10-4 points callers at `*_format` as the reliable
+      escape-hazard-free channel — a channel that can be silently ignored
+      would make that advice unsound.
+- [x] M10-8: Tests — RE-IT-10 (non-string `replacement_format`, the reported
+      bypass), RE-IT-11 (verbatim survives `regex:true` + capture-group
+      `expand()`, a gap review found untested), RE-IT-12 (non-string per-op
+      `data_format`).  RE-IT-8/9 were strengthened via a new
+      `assert_rejection_was_inert` helper that asserts bytes, mtime, AND
+      absence of `.bak` — previously they asserted content only, leaving the
+      Milestone 7/9 regression class unpinned on the new rejection paths.
+- [x] M10-9: The agent-facing version note in `.github/copilot-instructions.md`
+      keyed the hazard to "up to and including 2.0.0", but the crate is still
+      at 2.0.0 on this branch, so the *fixed* server also reports 2.0.0 and the
+      check could never distinguish fixed from unfixed.  Reworded to "released
+      builds before 3.0.0", with an explicit note that a dev build reports the
+      pre-release version and a one-shot behavioural probe as the decisive
+      check.
