@@ -1,5 +1,16 @@
 # Changelog
 
+## [3.0.0](https://github.com/MikeGrier/tpu-rs/compare/v2.0.0...v3.0.0) (2026-08-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **tpu-mcp:** **tpu-mcp:** `tpu_replace_in_file` no longer expands `\n`, `\r`, `\t`, or `\\` in `replacement`. The text is written verbatim, so `\\` stays two characters and source-level escape sequences survive intact. Previously `\\` silently collapsed to `\`, corrupting Rust/JSON string literals, regex sources, and Windows/UNC paths — a replacement containing `r"\\."` was written as `r"\."`. Pass `expand_escapes: true` to restore the old sed-style decoding; it cannot be combined with `replacement_format`. The `tpu replace` CLI is unchanged and still decodes by default (`--literal-replacement` / `-L` to opt out).
+
+### Features
+
+* **tpu-mcp:** write replace `replacement` verbatim; escape expansion is opt-in ([f538d8e](https://github.com/MikeGrier/tpu-rs/commit/f538d8e6813a18f4361d18a15640edea2cbc8a30))
+
 ## [2.0.0](https://github.com/MikeGrier/tpu-rs/compare/v1.3.0...v2.0.0) (2026-08-28)
 
 
