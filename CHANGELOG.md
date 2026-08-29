@@ -1,5 +1,12 @@
 # Changelog
 
+## [4.0.2](https://github.com/MikeGrier/tpu-rs/compare/v4.0.1...v4.0.2) (2026-08-29)
+
+
+### Bug Fixes
+
+* **ci:** re-inject the tpu setup block on release PRs so version bumps stay green ([501bff8](https://github.com/MikeGrier/tpu-rs/commit/501bff829ba0b3b0d5a536a13d07767491e09a23))
+
 ## [4.0.1](https://github.com/MikeGrier/tpu-rs/compare/v4.0.0...v4.0.1) (2026-08-29)
 
 

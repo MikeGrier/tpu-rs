@@ -2,7 +2,7 @@
     "name": "tpu-mcp",
     "displayName": "tpu-mcp — encoding-safe file I/O for Copilot",
     "description": "MCP server for encoding-aware file I/O: read, write, replace, search, and validate files with correct handling of UTF-8, UTF-16LE/BE, Windows-1252, Shift-JIS, and CRLF/LF/CR line endings. Use from Copilot Chat instead of PowerShell/shell file commands to avoid encoding corruption.",
-    "version": "4.0.1",
+    "version": "4.0.2",
     "publisher": "MikeGrierTools",
     "license": "MIT",
     "author": {
