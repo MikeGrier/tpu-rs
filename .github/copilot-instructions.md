@@ -214,12 +214,14 @@ To get a real newline, put a real newline in the JSON string. Pass
 want the old sed-style decoding (`\n`/`\r` → LF, `\t` → TAB, `\\` → one
 backslash); it cannot be combined with `replacement_format`.
 
-Builds of `tpu-mcp` up to and including 2.0.0 applied that decoding
-unconditionally, which silently collapsed `\\` to `\` — e.g. a replacement
-containing `r"\\."` was written as `r"\."`, disabling the guard it was meant to
-add. If you are working against an older server (check the `tpu_version` echoed
-in the invocation header), that hazard still applies: use
-`replacement_format: "base64"` there.
+Released builds before 3.0.0 applied that decoding unconditionally, which
+silently collapsed `\\` to `\` — e.g. a replacement containing `r"\\."` was
+written as `r"\."`, disabling the guard it was meant to add. The
+`tpu_version` in the invocation header identifies released builds, but note
+that a dev build of the fix reports the pre-release version, so version alone
+is not decisive. If you need certainty, probe once: replace a scratch string
+with `\\` and read it back — two characters means verbatim (fixed), one means
+the old behaviour, in which case route through `replacement_format: "base64"`.
 
 Note the CLI differs on purpose: `tpu replace` interprets `\n` in the
 replacement by default (sed/perl/ripgrep convention); pass
