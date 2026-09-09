@@ -1,0 +1,23 @@
+# cargo-mutants configuration — see https://mutants.rs/
+#
+# M11-3: use nextest instead of bare `cargo test` as the mutant test runner.
+# nextest runs each test in its own OS process and (per .config/nextest.toml)
+# forcibly terminates any single test that runs past ~60s, so a mutation that
+# creates a genuine hang shows up as a fast, normal test *failure* (a caught
+# mutant) instead of a `cargo mutants` TIMEOUT classification that costs its
+# own ~112-119s auto-computed budget per mutant. See crates/tpu/CHECKLIST.md
+# Milestone 11 (M11-2/M11-3) for the fuller rationale and the specific sites
+# this was evaluated against.
+#
+# CAUTION: nextest does not run doctests. This workspace currently has zero
+# runnable doctests (only ```text```/```rust,ignore``` fences — verified by
+# grep before adopting nextest here), so no mutant coverage is lost today.
+# If a real ```rust``` doctest is ever added, re-check whether it is the only
+# test catching some mutant before relying solely on this config.
+test_tool = "nextest"
+
+# Select the `[profile.mutants]` profile from .config/nextest.toml, which
+# restores nextest's default fail-fast-on-first-failure behaviour (cargo
+# mutants only needs one failing test to know a mutant was caught, so exiting
+# early is a meaningful speedup across a run of many hundreds of mutants).
+additional_cargo_test_args = ["--profile=mutants"]

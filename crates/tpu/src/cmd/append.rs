@@ -1,13 +1,13 @@
 // Copyright (c) 2026, Michael Grier
 
-//! `tpu append` — append UTF-8/LF text to an existing file, preserving its
-//! native encoding, BOM, and dominant line-ending convention.
+//! `tpu append` — append UTF-8/LF text to an existing file, applying Git
+//! worktree policy or preserving its detected native format.
 //!
 //! The file must already exist; for new files use `tpu write` instead.
 //! The appended text (UTF-8/LF) is concatenated to the decoded content of the
-//! existing file, the combined result is re-encoded in the original encoding,
-//! the line endings are denormalised to match (or to the override), and the
-//! output is written atomically.
+//! existing file, the combined result is re-encoded, its line endings follow
+//! an explicit override, definite Git policy, or the detected convention, and
+//! the output is written atomically.
 //!
 //! ## Write-time mojibake guard
 //!
@@ -20,12 +20,9 @@
 //! Pass [`WritePolicy::permissive`] / `--allow-mojibake` /
 //! `"allow_mojibake": true` to override.
 
-use std::{fs, io::Write, path::Path, sync::Arc};
+use std::{fs, io::Write, path::Path};
 
-use harrier::{
-    encoding::{LineEnding, SourceConfig},
-    source::Source,
-};
+use harrier::encoding::LineEnding;
 
 use crate::{
     IoMode,
@@ -38,8 +35,7 @@ use crate::{
 /// * `file`                 — path to the file to append to (must already exist)
 /// * `new_text`             — UTF-8/LF text to append
 /// * `line_ending_override` — when `Some`, denormalise all line endings in the
-///   combined output to this style instead of the
-///   detected dominant ending of the existing file
+///   combined output to this style instead of Git policy or the detected ending
 /// * `diff_out`             — when `Some`, emit a unified diff of the change
 ///   to this writer and return without modifying the
 ///   file (dry-run / preview mode)
@@ -66,29 +62,32 @@ pub fn run(
     let f = crate::retry_io(|| fs::File::open(file))?;
     let file_len = f.metadata()?.len();
 
+    let git_policy = crate::git::policy_for_path(file)?;
     let (encoding, detected_le, had_bom, decoded_text) = if file_len == 0 {
-        // Empty file: default to UTF-8/LF with no BOM.
-        (encoding_rs::UTF_8, LineEnding::Lf, false, String::new())
+        (
+            git_policy
+                .working_tree_encoding
+                .as_ref()
+                .map_or(encoding_rs::UTF_8, |worktree| worktree.encoding),
+            LineEnding::Lf,
+            false,
+            String::new(),
+        )
     } else {
         drop(f);
-
-        let branch = crate::open_as_branch(file, io_mode)?;
-        let len = branch.byte_len();
-        let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-        let encoding = source.encoding();
-        let le = source.line_ending();
-        let bom_len = source.bom_len();
-        let had_bom = bom_len > 0;
-
-        // Decode content, skipping the BOM bytes.
-        let lines_iter = source.as_lines()?;
-        let view = lines_iter.view_range(bom_len as u64..len)?;
-        let (cow, _) = encoding.decode_without_bom_handling(&view.bytes);
-        (encoding, le, had_bom, cow.into_owned())
+        let decoded = crate::read_text_file(file, io_mode)?;
+        (
+            decoded.encoding,
+            decoded.line_ending,
+            decoded.bom_len > 0,
+            decoded.text,
+        )
     };
 
-    let target_le = line_ending_override.unwrap_or(detected_le);
     let combined = format!("{decoded_text}{new_text}");
+    let target_le = line_ending_override
+        .or_else(|| git_policy.line_ending_for_text(&combined))
+        .unwrap_or(detected_le);
 
     // Mojibake write-time guard.  Compare decoded old vs. combined new in
     // UTF-8 char space.  Done here so dry-run also reports the issue.
@@ -105,23 +104,8 @@ pub fn run(
         return Ok(());
     }
 
-    // ── Encode the combined text into the target encoding ─────────────────────
-    //
-    // encoding_rs::UTF_16LE and UTF_16BE are decode-only per the WHATWG
-    // Encoding spec; handle them manually so the byte sequence is correct.
-    let encoded: Vec<u8> = if encoding == encoding_rs::UTF_16LE {
-        combined
-            .encode_utf16()
-            .flat_map(|cu| cu.to_le_bytes())
-            .collect()
-    } else if encoding == encoding_rs::UTF_16BE {
-        combined
-            .encode_utf16()
-            .flat_map(|cu| cu.to_be_bytes())
-            .collect()
-    } else {
-        encoding.encode(&combined).0.into_owned()
-    };
+    let encoded = crate::encoding::encode_text_strict(&combined, encoding)
+        .map_err(|error| format!("append: {}: {error}", file.display()))?;
 
     // ── Denormalise LF → target line ending ───────────────────────────────────
     let encoded_bytes = match target_le {
@@ -131,7 +115,7 @@ pub fn run(
     };
 
     // ── Re-prepend BOM if the original file had one ───────────────────────────
-    let output_bytes: Vec<u8> = if had_bom {
+    let output_bytes: Vec<u8> = if git_policy.write_bom(had_bom) {
         let bom: &[u8] = crate::encoding::bom_bytes_for(encoding);
         let mut v = Vec::with_capacity(bom.len() + encoded_bytes.len());
         v.extend_from_slice(bom);

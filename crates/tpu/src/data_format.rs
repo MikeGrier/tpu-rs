@@ -58,6 +58,14 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
             .map_err(|c| format!("invalid hex digit {c:?} at position {}", i * 2))?;
         let lo = hex_digit(chunk[1])
             .map_err(|c| format!("invalid hex digit {c:?} at position {}", i * 2 + 1))?;
+        // Mutation testing note: `|` here (and every other bit-packing `|`
+        // in this file's decode_base64/encode_base64) has no test that can
+        // catch a mutation to `^`. `hi << 4` and `lo` are shifted into
+        // disjoint bit ranges by construction (that's the whole point of a
+        // bit-packing shift), so for every value either operand can take,
+        // OR and XOR compute the identical result -- confirmed by
+        // hand-mutating and re-running the full test suite (see
+        // crates/tpu/CHECKLIST.md Milestone 11, M11-10).
         bytes.push((hi << 4) | lo);
     }
     Ok(bytes)
@@ -262,12 +270,13 @@ pub fn encode_base64_pem(data: &[u8]) -> String {
         return flat;
     }
     let mut out = String::with_capacity(flat.len() + (flat.len() / 64) * 2 + 2);
-    let mut pos = 0;
-    while pos < flat.len() {
-        let end = (pos + 64).min(flat.len());
-        out.push_str(&flat[pos..end]);
+    // `chunks(64)` walks the (all-ASCII) base64 alphabet in fixed 64-byte
+    // spans with no manual position counter to mutate into an infinite
+    // loop; every chunk boundary is also a valid UTF-8 boundary since every
+    // byte in `flat` is single-byte ASCII.
+    for chunk in flat.as_bytes().chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap());
         out.push_str("\r\n");
-        pos = end;
     }
     out
 }
@@ -443,6 +452,79 @@ mod tests {
     fn b64_err_bad_padding_order() {
         // '=' at position 2 without '=' at position 3 is invalid.
         assert!(decode_base64("AA=A").is_err());
+    }
+
+    /// A `=` in a position where padding is never checked (chunk index 0 or
+    /// chunk index 1) must produce the *padding-specific* error message, not
+    /// the generic invalid-character one -- pins `b64_val`'s `b'=' =>
+    /// Err(...)` match arm against being deleted (which would fall through
+    /// to the generic `_` arm's different message text).
+    #[test]
+    fn b64_err_unexpected_padding_at_chunk_index_one_has_padding_message() {
+        let err = decode_base64("A=AA").unwrap_err();
+        assert!(err.contains("unexpected"), "got: {err}");
+        assert!(err.contains("padding"), "got: {err}");
+    }
+
+    /// Exact per-character-class values, pinned directly (not via a
+    /// round-trip, which could hide a matching encode/decode mutation).
+    #[test]
+    fn b64_val_exact_values_for_every_character_class() {
+        assert_eq!(b64_val(b'A', 0).unwrap(), 0);
+        assert_eq!(b64_val(b'Z', 0).unwrap(), 25);
+        assert_eq!(b64_val(b'a', 0).unwrap(), 26);
+        assert_eq!(b64_val(b'z', 0).unwrap(), 51);
+        assert_eq!(b64_val(b'0', 0).unwrap(), 52);
+        assert_eq!(b64_val(b'9', 0).unwrap(), 61);
+        assert_eq!(b64_val(b'+', 0).unwrap(), 62);
+        assert_eq!(b64_val(b'/', 0).unwrap(), 63);
+    }
+
+    /// Pins the exact error-message position for an invalid character at
+    /// each of the four chunk indices, in the *second* group (group index 1)
+    /// so a `*` -> `/` mutation on the position arithmetic (equivalent to
+    /// `*` -> `+` only for group 0) is also caught.
+    #[test]
+    fn b64_err_position_pinned_for_each_chunk_index_in_second_group() {
+        let cases = [
+            ("AAAA#AAA", 4), // invalid char at chunk[0] of group 1
+            ("AAAAA#AA", 5), // invalid char at chunk[1] of group 1
+            ("AAAAAA#A", 6), // invalid char at chunk[2] of group 1
+            ("AAAAAAA#", 7), // invalid char at chunk[3] of group 1
+        ];
+        for (input, expected_pos) in cases {
+            let err = decode_base64(input).unwrap_err();
+            assert!(
+                err.contains(&format!("position {expected_pos}")),
+                "input={input:?} expected position {expected_pos}, got: {err}"
+            );
+        }
+    }
+
+    // ── encode_base64 ─────────────────────────────────────────────────────────
+    //
+    // RFC 4648 test vectors, asserted directly (not via round-trip: a
+    // matching bit-packing mutation in both encode and decode could cancel
+    // out and still pass a round-trip test).
+
+    #[test]
+    fn encode_base64_empty() {
+        assert_eq!(encode_base64(b""), "");
+    }
+
+    #[test]
+    fn encode_base64_rfc4648_vectors() {
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foob"), "Zm9vYg==");
+        assert_eq!(encode_base64(b"fooba"), "Zm9vYmE=");
+        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn encode_base64_mz_header() {
+        assert_eq!(encode_base64(&[0x4D, 0x5A]), "TVo=");
     }
 
     // ── Encoded ──────────────────────────────────────────────────────────────

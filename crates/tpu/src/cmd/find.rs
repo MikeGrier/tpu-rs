@@ -32,10 +32,8 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 
-use harrier::{encoding::SourceConfig, lines::LineTerminator, source::Source};
 use regex::Regex;
 
 use crate::IoMode;
@@ -143,6 +141,13 @@ pub fn expand_paths(path_specs: &[&str]) -> Result<Vec<PathBuf>, Box<dyn std::er
 /// to `warnings_out` instead of aborting the whole expansion. The caller
 /// can then route those warnings to its [`crate::shell::Shell`] (NDJSON
 /// `{"reason":"warning"}` records or stderr notes).
+/// Whether `spec` contains any glob metacharacter (`*`, `?`, `[`, `{`).
+/// Split out as its own function so each metacharacter's independent
+/// contribution to the `||` chain is directly testable.
+fn spec_is_glob(spec: &str) -> bool {
+    spec.contains('*') || spec.contains('?') || spec.contains('[') || spec.contains('{')
+}
+
 pub fn expand_paths_with_policy(
     path_specs: &[&str],
     glob: Option<&str>,
@@ -152,8 +157,7 @@ pub fn expand_paths_with_policy(
     let mut paths: Vec<PathBuf> = Vec::new();
 
     for &spec in path_specs {
-        let is_glob =
-            spec.contains('*') || spec.contains('?') || spec.contains('[') || spec.contains('{');
+        let is_glob = spec_is_glob(spec);
 
         if let Some(g) = glob {
             // `glob` mode: every spec is either a directory (walked and
@@ -332,10 +336,11 @@ fn run_single_file(
     }
     drop(f);
 
-    let branch = crate::open_as_branch(file, io_mode)?;
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-    let mut iter = source.as_lines()?;
-    let encoding = iter.encoding();
+    let decoded = crate::read_text_file(file, io_mode)?;
+    let mut file_lines: Vec<&str> = decoded.text.split('\n').collect();
+    if file_lines.last() == Some(&"") {
+        file_lines.pop();
+    }
 
     // Ring buffer for before-context: at most `lines_before` entries.
     // Even lines emitted as matches or after-context are pushed so the
@@ -351,20 +356,9 @@ fn run_single_file(
     // has been written yet.  Used for separator logic and de-duplication.
     let mut last_output_num: Option<usize> = None;
 
-    loop {
-        let (line_bytes, terminator) = match iter.next() {
-            None => break,
-            Some(item) => item,
-        };
+    for line in file_lines {
         line_num += 1;
-
-        // Decode from source encoding to UTF-8 and strip the normalised LF
-        // terminator so the match target is the bare line content.
-        let (cow, _had_errors) = encoding.decode_without_bom_handling(&line_bytes);
-        let text: String = match terminator {
-            LineTerminator::Ending(_) => cow.strip_suffix('\n').unwrap_or(&cow).to_owned(),
-            LineTerminator::End => cow.into_owned(),
-        };
+        let text = line.to_owned();
 
         let is_match = line_matches(&text, regexes, all_match, invert);
 
@@ -958,6 +952,42 @@ mod tests {
             d_count, 1,
             "line 'd' should appear exactly once; output:\n{out}"
         );
+        // The two match groups are bridged exactly by shared context (no
+        // gap), so no "--" separator must appear -- pins
+        // `first_to_emit > last + 1` at the exact non-gap boundary against
+        // a `>=`/`==` mutation on `>`, or a `-`/`*` mutation on `+`, either
+        // of which would emit a spurious separator here.
+        assert!(
+            !out.contains("--"),
+            "adjacent (context-bridged) groups must not get a '--' separator; output:\n{out}"
+        );
+    }
+
+    #[test]
+    fn after_context_emits_exactly_the_requested_count() {
+        // -A 1 with a single match must emit exactly one after-context
+        // line -- pins `after_remaining > 0` against a `<` mutation, which
+        // would emit zero after-context lines instead of one.
+        let content = ten_line_file();
+        let (out, _) = search_bytes(
+            &content,
+            &["line 5$"],
+            true,
+            true,
+            false,
+            false,
+            0,
+            1,
+            false,
+            false,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines.len(),
+            2,
+            "expected exactly 2 lines (match + 1 after-context); output:\n{out}"
+        );
+        assert!(lines[1].contains("line 6"), "output:\n{out}");
     }
 
     #[test]
@@ -979,6 +1009,94 @@ mod tests {
         assert!(
             out.contains("--"),
             "expected '--' separator; output:\n{out}"
+        );
+    }
+
+    /// Same non-adjacent-groups scenario as above, but using `-B` (before
+    /// context) alone with no `-A`. Pins the first operand of `lines_before
+    /// > 0 || lines_after > 0` against a `<` mutation: since `lines_before`
+    /// is a `usize`, `< 0` is always false, so with `lines_after == 0` the
+    /// whole separator-detection block would be wrongly skipped entirely.
+    #[test]
+    fn separator_emitted_between_non_adjacent_groups_before_context_only() {
+        let content = ten_line_file();
+        let (out, _) = search_bytes(
+            &content,
+            &["line 2$|line 8$"],
+            true,
+            true,
+            false,
+            false,
+            1,
+            0,
+            false,
+            false,
+        );
+        assert!(
+            out.contains("--"),
+            "expected '--' separator with -B alone; output:\n{out}"
+        );
+    }
+
+    /// Two matches close enough that before-context fully bridges the gap
+    /// (no separator expected) -- pins the `.find(|(n,_)| ... *n > last)`
+    /// comparison that computes `first_to_emit` against `==`/`<` mutations.
+    /// Under either mutation, no buffered line matches the (nonexistent)
+    /// predicate, so `first_to_emit` wrongly falls back to the *current*
+    /// match's own line number, which is far enough past `last` to trigger
+    /// a spurious separator.
+    #[test]
+    fn no_separator_when_before_context_bridges_the_gap() {
+        let content = ten_line_file();
+        let (out, _) = search_bytes(
+            &content,
+            &["line 3$|line 6$"],
+            true,
+            true,
+            false,
+            false,
+            2,
+            0,
+            false,
+            false,
+        );
+        assert!(
+            !out.contains("--"),
+            "before-context should bridge the gap with no separator; output:\n{out}"
+        );
+    }
+
+    /// The de-duplication check in the before-context emission loop
+    /// (`*n > last`) must skip lines at or before the last emitted line
+    /// (already shown), not re-emit them, while still emitting genuinely
+    /// new lines. Pins `>` against a `<` mutation: with `-B 4` and matches
+    /// on lines 3 and 5, the before buffer for the second match holds
+    /// [1, 2, 3, 4] and `last == 3` (from the first match); a `<` mutation
+    /// would re-emit line 1 as a duplicate (and update `last` backwards to
+    /// 1 in the process) while wrongly skipping the genuinely new line 4.
+    #[test]
+    fn before_context_skips_lines_at_or_before_last_emitted() {
+        let content = ten_line_file();
+        let (out, _) = search_bytes(
+            &content,
+            &["line 3$|line 5$"],
+            true,
+            true,
+            false,
+            false,
+            4,
+            0,
+            false,
+            false,
+        );
+        let lines: Vec<&str> = out.lines().collect();
+        // Context lines always carry a "N-" prefix (grep convention),
+        // regardless of the `numbers` flag; only the match line's own
+        // numbering depends on it.
+        assert_eq!(
+            lines,
+            vec!["1-line 1", "2-line 2", "line 3", "4-line 4", "line 5"],
+            "output:\n{out}"
         );
     }
 
@@ -1250,5 +1368,17 @@ mod tests {
             msg.contains("glob metacharacters") && msg.contains("pick one form"),
             "got: {msg}"
         );
+    }
+
+    /// Each glob metacharacter must independently trigger `is_glob`, not
+    /// just some conjunction of them -- pins each `||` join against a
+    /// mutation to `&&`.
+    #[test]
+    fn spec_is_glob_detects_each_metacharacter_independently() {
+        assert!(spec_is_glob("a*b"));
+        assert!(spec_is_glob("a?b"));
+        assert!(spec_is_glob("a[b]"));
+        assert!(spec_is_glob("a{b}"));
+        assert!(!spec_is_glob("a_plain_path.txt"));
     }
 }

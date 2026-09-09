@@ -18,9 +18,7 @@
 //! so the resulting file inherits the standard write-time mojibake guard,
 //! atomic .bak handling, and encoding-preservation behaviour.
 
-use std::{collections::BTreeMap, fs, path::Path, sync::Arc};
-
-use harrier::{encoding::SourceConfig, source::Source};
+use std::{collections::BTreeMap, fs, path::Path};
 
 use crate::{
     IoMode,
@@ -180,15 +178,7 @@ pub fn load_template_file(
     file: &Path,
     io_mode: IoMode,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let branch = crate::open_as_branch(file, io_mode)?;
-    let len = branch.byte_len();
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-    let bom_len = source.bom_len();
-    let encoding = source.encoding();
-    let lines_iter = source.as_lines()?;
-    let view = lines_iter.view_range(bom_len as u64..len)?;
-    let (cow, _) = encoding.decode_without_bom_handling(&view.bytes);
-    Ok(cow.into_owned())
+    Ok(crate::read_text_file(file, io_mode)?.text)
 }
 
 /// Parse a `KEY=VALUE` argument. The value may contain `=` characters.
@@ -246,17 +236,7 @@ pub fn run(
 
     let (rendered, report) = render_str(template, vars, missing)?;
 
-    // If the destination does not exist yet, create the parent directory so
-    // template-driven scaffolds can write into fresh trees.
-    if !output.exists() {
-        if let Some(parent) = output.parent() {
-            if !parent.as_os_str().is_empty() && !parent.exists() {
-                fs::create_dir_all(parent).map_err(|e| {
-                    format!("render: cannot create parent {}: {e}", parent.display())
-                })?;
-            }
-        }
-    }
+    ensure_parent_dir_for_new_output(output)?;
 
     crate::cmd::write::run(
         output,
@@ -269,6 +249,41 @@ pub fn run(
         policy,
     )?;
     Ok(report)
+}
+
+/// Create `output`'s parent directory if it doesn't exist yet, so
+/// template-driven scaffolds can write into fresh trees.
+///
+/// A no-op when `output` already exists (its parent must already exist too)
+/// or when `output`'s parent is empty (a bare relative filename in the
+/// current directory, which has no directory component to create).
+///
+/// Split out from `run` as its own function -- rather than an inline `if`
+/// chain -- so it is directly unit-testable against the real filesystem.
+/// Testing this only through `run`'s public interface cannot distinguish a
+/// broken guard here from correct behaviour: the downstream
+/// `crate::cmd::write::run` → `atomic_write` *also* creates the
+/// destination's parent directory as its own safety net (see the comment on
+/// `atomic_write`'s own test), so a mutated/no-op guard here would still
+/// leave the end-to-end `run()` behaviour looking correct.
+fn ensure_parent_dir_for_new_output(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Mutation testing note: the inner `&&` has no test that can catch a
+    // mutation to `||`, because `fs::create_dir_all` is a no-op (returns
+    // `Ok(())`) for both edge cases this guard exists to skip -- an
+    // already-existing directory *and* an empty path -- confirmed directly
+    // (`create_dir_all(Path::new(""))` == `Ok(())` on this platform). There
+    // is no input for which `&&` and `||` produce an externally observable
+    // difference; not pursued (see crates/tpu/CHECKLIST.md Milestone 11,
+    // M11-9).
+    if !output.exists()
+        && let Some(parent) = output.parent()
+        && !parent.as_os_str().is_empty()
+        && !parent.exists()
+    {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("render: cannot create parent {}: {e}", parent.display()))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -338,5 +353,314 @@ mod tests {
         assert!(parse_var("FOO").is_err());
         assert!(parse_var("=bar").is_err());
         assert!(parse_var("BAD KEY=v").is_err());
+    }
+
+    /// Pins each half of the `||` character-class check independently --
+    /// underscore and hyphen must each be accepted on their own, not just
+    /// alongside an alphanumeric character.
+    #[test]
+    fn parse_var_key_accepts_underscore_and_hyphen() {
+        assert_eq!(parse_var("_=v").unwrap(), ("_".into(), "v".into()));
+        assert_eq!(parse_var("-=v").unwrap(), ("-".into(), "v".into()));
+        assert_eq!(parse_var("a_b-c=v").unwrap(), ("a_b-c".into(), "v".into()));
+    }
+
+    // ── render_str: repeated / counted substitution behaviour ────────────────
+
+    /// A token used twice must be substituted twice (`substitutions == 2`)
+    /// but counted once in `missing`/`referenced` -- pins the dedup guard
+    /// (`k == key`) against being mutated to `!=` (which would push the same
+    /// missing key every time it's seen, and double-count `referenced`).
+    #[test]
+    fn render_str_repeated_missing_token_deduplicates_missing_list() {
+        let v = vars(&[]);
+        let (_, r) = render_str("{{X}} and {{X}} again", &v, MissingPolicy::Empty).unwrap();
+        assert_eq!(r.missing, vec!["X".to_string()]);
+        assert_eq!(r.referenced, 1);
+        // Substitution count still reflects both occurrences.
+        assert_eq!(r.substitutions, 2);
+    }
+
+    /// Pins `report.substitutions += 1` in the `MissingPolicy::Empty` arm
+    /// against a `*=` mutation, using two *distinct* missing tokens so the
+    /// exact count (not just the output string) is asserted.
+    #[test]
+    fn render_str_empty_policy_counts_each_missing_substitution() {
+        let v = vars(&[]);
+        let (out, r) = render_str("[{{A}}][{{B}}]", &v, MissingPolicy::Empty).unwrap();
+        assert_eq!(out, "[][]");
+        assert_eq!(r.substitutions, 2);
+    }
+
+    // ── render_str: escape-sequence and token-start boundary conditions ──────
+
+    /// A `\{{` escape at the very end of the template (nothing after it) must
+    /// not read past the end of the buffer -- pins the `i + 2 < bytes.len()`
+    /// bounds check.
+    #[test]
+    fn render_str_escape_at_end_of_template() {
+        let v = vars(&[]);
+        let (out, _) = render_str("a\\{{", &v, MissingPolicy::Error).unwrap();
+        assert_eq!(out, "a{{");
+    }
+
+    /// A trailing lone `{` (not a real `{{` token start) must be emitted
+    /// literally, not misidentified as a token start -- pins the
+    /// `i + 1 < bytes.len()` bounds check on the token-start scan.
+    #[test]
+    fn render_str_trailing_lone_open_brace_is_literal() {
+        let v = vars(&[]);
+        let (out, _) = render_str("a{", &v, MissingPolicy::Error).unwrap();
+        assert_eq!(out, "a{");
+    }
+
+    /// A non-ASCII (multi-byte UTF-8) character in literal text must be
+    /// emitted intact -- pins `i += ch.len_utf8()` against a mutation that
+    /// advances by the wrong amount (which would either split the character
+    /// or loop without making progress).
+    #[test]
+    fn render_str_multibyte_literal_text_is_preserved() {
+        let v = vars(&[("X", "1")]);
+        let (out, _) = render_str("héllo {{X}} wörld", &v, MissingPolicy::Error).unwrap();
+        assert_eq!(out, "héllo 1 wörld");
+    }
+
+    /// Several escape sequences and multi-byte characters in a row must all
+    /// advance correctly -- if a mutation ever turned any advance into a
+    /// no-op, this would either loop forever (now safely terminated and
+    /// reported as a failure by nextest's per-test timeout; see
+    /// crates/tpu/CHECKLIST.md Milestone 11 M11-3) or emit the wrong output.
+    #[test]
+    fn render_str_many_escapes_and_multibyte_chars_in_sequence() {
+        let v = vars(&[]);
+        let (out, _) = render_str("\\{{\\{{\\{{ é é é", &v, MissingPolicy::Error).unwrap();
+        assert_eq!(out, "{{{{{{ é é é");
+    }
+
+    /// Token names may contain `_`/`-` (not just alphanumerics) -- pins each
+    /// half of the character-class `||` independently, and an invalid
+    /// character (space) must still be rejected.
+    #[test]
+    fn render_str_token_name_accepts_underscore_and_hyphen() {
+        let v = vars(&[("a_b-c", "ok")]);
+        let (out, _) = render_str("{{a_b-c}}", &v, MissingPolicy::Error).unwrap();
+        assert_eq!(out, "ok");
+    }
+
+    #[test]
+    fn render_str_token_name_with_invalid_character_errors() {
+        let v = vars(&[]);
+        assert!(render_str("{{bad name}}", &v, MissingPolicy::Error).is_err());
+    }
+
+    #[test]
+    fn render_str_empty_placeholder_errors() {
+        let v = vars(&[]);
+        assert!(render_str("{{}}", &v, MissingPolicy::Error).is_err());
+    }
+
+    // ── find_close boundary conditions ────────────────────────────────────────
+
+    #[test]
+    fn find_close_finds_close_at_exact_end_of_buffer() {
+        // "}}" occupies the final two bytes -- `from + 1 == bytes.len() - 1`.
+        let bytes = b"x}}";
+        assert_eq!(find_close(bytes, 1), Some(1));
+    }
+
+    /// A single trailing `}` (not a real close) must not be misread as `}}`
+    /// -- pins the `j + 1 < bytes.len()` bounds check.
+    #[test]
+    fn find_close_single_trailing_brace_is_not_found() {
+        let bytes = b"x}";
+        assert_eq!(find_close(bytes, 1), None);
+    }
+
+    #[test]
+    fn find_close_skips_several_non_matching_bytes_first() {
+        let bytes = b"abcdef}}";
+        assert_eq!(find_close(bytes, 0), Some(6));
+    }
+
+    // ── run(): template-source selection and parent-directory creation ──────
+
+    #[test]
+    fn run_selects_stdin_template_when_only_stdin_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        let v = vars(&[("X", "1")]);
+        let report = run(
+            &out,
+            None,
+            None,
+            Some("hi {{X}}"),
+            &v,
+            MissingPolicy::Error,
+            crate::IoMode::Buffered,
+            crate::mojibake::WritePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(report.substitutions, 1);
+        assert_eq!(fs::read_to_string(&out).unwrap(), "hi 1");
+    }
+
+    #[test]
+    fn run_errors_when_no_template_source_is_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        let v = vars(&[]);
+        let err = run(
+            &out,
+            None,
+            None,
+            None,
+            &v,
+            MissingPolicy::Error,
+            crate::IoMode::Buffered,
+            crate::mojibake::WritePolicy::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("must supply"));
+    }
+
+    /// Pins `if !output.exists() { if let Some(parent) = ... }` and the
+    /// nested `!parent.as_os_str().is_empty() && !parent.exists()` guard: a
+    /// deeply-nested, not-yet-existing parent directory must be created so
+    /// the render succeeds.
+    #[test]
+    fn run_creates_missing_nested_parent_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("a").join("b").join("c").join("out.txt");
+        let v = vars(&[("X", "1")]);
+        run(
+            &out,
+            Some("{{X}}"),
+            None,
+            None,
+            &v,
+            MissingPolicy::Error,
+            crate::IoMode::Buffered,
+            crate::mojibake::WritePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&out).unwrap(), "1");
+    }
+
+    /// When the output's parent already exists, `run` must not error trying
+    /// to (re)create it.
+    #[test]
+    fn run_succeeds_when_parent_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        let v = vars(&[("X", "1")]);
+        run(
+            &out,
+            Some("{{X}}"),
+            None,
+            None,
+            &v,
+            MissingPolicy::Error,
+            crate::IoMode::Buffered,
+            crate::mojibake::WritePolicy::default(),
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(&out).unwrap(), "1");
+    }
+
+    /// A bare relative filename (no directory component) has an *empty*
+    /// `.parent()` -- must not attempt (and fail on) creating a directory
+    /// named `""`. Each `#[test]` is its own process under nextest, so
+    /// changing the current directory here cannot affect any other test.
+    #[test]
+    fn run_bare_relative_output_with_empty_parent_does_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let result = {
+            let out = Path::new("bare.txt");
+            let v = vars(&[("X", "1")]);
+            run(
+                out,
+                Some("{{X}}"),
+                None,
+                None,
+                &v,
+                MissingPolicy::Error,
+                crate::IoMode::Buffered,
+                crate::mojibake::WritePolicy::default(),
+            )
+        };
+        std::env::set_current_dir(prev).unwrap();
+        result.unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.path().join("bare.txt")).unwrap(),
+            "1"
+        );
+    }
+
+    // ── ensure_parent_dir_for_new_output: tested directly, not just through
+    // `run`, because `crate::cmd::write::run`'s own `atomic_write` also
+    // creates the parent directory as a safety net -- a broken guard here
+    // would still look correct end-to-end. ──────────────────────────────────
+
+    #[test]
+    fn ensure_parent_dir_creates_missing_nested_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("a").join("b").join("out.txt");
+        assert!(!out.parent().unwrap().exists());
+        ensure_parent_dir_for_new_output(&out).unwrap();
+        assert!(out.parent().unwrap().exists());
+    }
+
+    #[test]
+    fn ensure_parent_dir_is_a_no_op_when_output_already_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.txt");
+        fs::write(&out, b"x").unwrap();
+        ensure_parent_dir_for_new_output(&out).unwrap();
+    }
+
+    #[test]
+    fn ensure_parent_dir_is_a_no_op_for_bare_relative_filename() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path()).unwrap();
+        let result = ensure_parent_dir_for_new_output(Path::new("bare.txt"));
+        std::env::set_current_dir(prev).unwrap();
+        result.unwrap();
+    }
+
+    // ── render_str / find_close: index-arithmetic boundary conditions ───────
+
+    /// A trailing `\{` with no room left for a second `{` must not read past
+    /// the end of the buffer -- pins `i + 2 < bytes.len()` (and its `i + 2`
+    /// operand) against mutations that would let the out-of-bounds
+    /// `bytes[i + 2]` read execute and panic.
+    #[test]
+    fn render_str_escape_with_no_room_for_second_brace_does_not_panic() {
+        let v = vars(&[]);
+        let (out, _) = render_str("a\\{", &v, MissingPolicy::Error).unwrap();
+        assert_eq!(out, "a\\{");
+    }
+
+    /// A single `{` not followed by a second `{` must be emitted literally,
+    /// and any following stray `}}` must *not* be treated as its close --
+    /// pins the second `bytes[i + 1]` read (the "is the next byte also `{`"
+    /// check) against a mutation that compares a byte to itself (always
+    /// true whenever the first check already matched).
+    #[test]
+    fn render_str_single_open_brace_not_doubled_is_literal() {
+        let v = vars(&[]);
+        let (out, _) = render_str("{X}}", &v, MissingPolicy::Error).unwrap();
+        assert_eq!(out, "{X}}");
+    }
+
+    /// Pins `find_close`'s `bytes[j + 1]` read against the same
+    /// compare-to-itself mutation: a single `}` not followed by a second
+    /// `}` must not be mistaken for the close.
+    #[test]
+    fn find_close_single_brace_not_doubled_is_skipped() {
+        let bytes = b"x}y}}";
+        assert_eq!(find_close(bytes, 0), Some(3));
     }
 }

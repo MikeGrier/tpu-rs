@@ -733,3 +733,819 @@ this milestone removes.  Reproduced end-to-end over stdio before fixing.
       builds before 3.0.0", with an explicit note that a dev build reports the
       pre-release version and a one-shot behavioural probe as the decisive
       check.
+
+---
+
+## Milestone 11 — Mutation-testing coverage: Tier 2 (protocol & core-loop hot paths)
+
+**Theme:** a `cargo mutants` run against the full workspace (2026-09-08) found
+444 unique missed mutants and 36 unique timeouts (raw totals were ~1.6x
+inflated by two appended runs into one `mutants.out`; always dedupe before
+trusting a count). Files were bucketed into three tiers by missed-mutant
+count. Tier 1 (`git.rs`, `cmd/doctor.rs`, `mojibake.rs`, `cmd/copy.rs` — the
+highest-impact files) is complete; `tpu-mcp/src/tools.rs` (also Tier 1) is
+partially done — its pure helper functions are covered, but the `&&`/`||`/`!`
+argument-combination mutants inside the MCP `call_*` endpoint handlers
+(`call_write_file`, `call_replace_in_file` x6, `call_edit_file` x4,
+`call_find` x5, `call_render_file` x4, `call_count_file` x3,
+`call_copy_file`'s `Write` impl, `render_changed_regions`, `stamp_and_verify`)
+remain and are tracked as a carry-over, not part of this milestone.
+
+This milestone covers Tier 2: the next six highest-count files (125 missed
+mutants combined), which cluster around two themes — manual index-stepping
+loops (the same category responsible for most of the 36 timeouts) and the
+MCP stdio worker protocol (`tpu-mcp/src/main.rs` + `worker.rs`), which are
+best fixed together since they share the same request/response shape.
+
+**Cross-cutting groundwork (do first, applies to every file below):**
+
+- [x] M11-1: Re-run `cargo mutants` into a fresh `--output` directory (not an
+      appended `mutants.out`) before starting and after this milestone lands,
+      so the before/after score is trustworthy. **Complete.**
+      **Before:** `cargo mutants -f crates/tpu-mcp/src/worker.rs -f
+      crates/tpu-mcp/src/main.rs -f crates/tpu/src/lib.rs -f
+      crates/tpu/src/encoding.rs -f crates/tpu/src/cmd/render.rs -f
+      crates/tpu/src/data_format.rs -o mutants.out.tier2-before --no-shuffle
+      -j 6` (bare `cargo test`, started *before* any M11-2/M11-3 changes)
+      finished in 2h: **849 mutants tested: 185 missed, 596 caught, 32
+      unviable, 36 timeouts**. This run's copy of the source predates the
+      M11-2 fixes (confirmed: its `timeout.txt` still lists `retry_io`'s
+      three now-fixed mutants at lib.rs:390-391), which empirically confirms
+      `cargo mutants` copies the source tree once at invocation start — live
+      edits made to the working tree *after* a run starts do not leak into
+      that run's results, so it was safe to keep editing
+      `lib.rs`/`worker.rs`/`main.rs` for M11-2 while this "before" run
+      executed in the background.
+      **After:** the same six-file scope, now via `.cargo/mutants.toml`'s
+      default `test_tool = "nextest"` (M11-3), run once every per-file item
+      (M11-5 through M11-10) had landed: **716 mutants tested: 16 missed, 656
+      caught, 38 unviable, 0 timeouts.** (Mutant counts aren't directly
+      comparable 1:1 across runs — refactors that removed loop-stepping
+      variables, e.g. M11-7's/M11-8's iterator rewrites, also remove the
+      mutation sites those variables offered — but the shape of the change
+      is unambiguous: missed mutants dropped by 91% (185 → 16) and every one
+      of the 36 pre-existing timeouts is gone (36 → 0), the direct payoff of
+      M11-3's nextest adoption.) Every one of the 16 remaining missed
+      mutants is individually documented in M11-5 through M11-10 as either
+      mathematically/behaviourally equivalent or a platform-coverage gap —
+      none are unaccounted for:
+      | file | before (missed/timeout) | after (missed/timeout) |
+      |---|---|---|
+      | `crates/tpu/src/encoding.rs` | 48 / 8 | 0 / 0 |
+      | `crates/tpu/src/cmd/render.rs` | 40 / 8 | 1 / 0 |
+      | `crates/tpu/src/data_format.rs` | 37 / 4 | 7 / 0 |
+      | `crates/tpu-mcp/src/main.rs` | 29 / 2 | 1 / 0 |
+      | `crates/tpu-mcp/src/worker.rs` | 16 / 4 | 2 / 0 |
+      | `crates/tpu/src/lib.rs` | 15 / 10 | 6 / 0 |
+      Both outputs preserved at `mutants.out.tier2-before/` and
+      `mutants.out.tier2-after/` (gitignored, ~100-150MB each) for anyone
+      who wants to inspect the raw reports directly.
+- [x] M11-2: Decide the `mutants::skip` policy for sites that will hang under
+      *any* test correctly exercising their real failure path, because the
+      loop bound or response write is removed with no independent cap.
+      **Decision, per site** (the milestone's original wording undersold two
+      of these as simple `mutants::skip` candidates and mischaracterized
+      `IoWorker::call`'s id-matching as "fast-but-uncovered" — both were
+      re-verified against the raw `timeout_unique.txt` report before fixing):
+      - `retry_io`'s `attempt < MAX_RETRIES && is_transient_io_error(&e)`
+        guard (mutated to `true`/`&&`→`||`/`attempt+=1`→`*=1`) is a **genuine
+        infinite loop** given a persistently-failing closure, but `retry_io`
+        is a pure function with no subprocess involved — fixed by wrapping
+        the three affected `retry_io_tests` in a bounded-timeout background
+        thread (`run_with_timeout`, `mpsc::channel` + `recv_timeout`) so each
+        now fails in ~2s instead of hanging 112s+. No skip needed.
+      - `worker.rs`'s `write_response` and `main.rs`'s `send_response`/
+        `send_error` mutated to `()` cause the parent's `read_line` to block
+        forever on a real subprocess round trip, but all three are already
+        generic over `impl io::Write` — fixed by adding direct unit tests
+        against an in-memory `Vec<u8>` buffer (no subprocess, no possibility
+        of hanging). No skip needed.
+      - `main.rs`'s notification-vs-request `v.is_null()` check was likewise
+        fixable directly: extracted into a pure `request_id(Option<Value>)
+        -> Option<Value>` helper with direct unit tests (`None`, explicit
+        `null`, a non-null falsy `0`, and ordinary values). No skip needed.
+      - `IoWorker::call`'s response-id matching (`worker.rs`) is a **genuine
+        cumulative-slowdown timeout**, not a fast bug: any mutation to its
+        `n==0`/`resp_id!=id` checks misclassifies every real round trip as
+        "worker dead", triggering a bounded (~1.7-2s) respawn+backoff on
+        *every* call; the existing `tests/io_worker_chaos.rs` chaos suite
+        makes dozens of real round trips per test, so the cumulative cost
+        exceeds cargo-mutants' ~112s auto-timeout even though no single call
+        hangs forever. Faking this at the unit level would require mocking
+        concrete `ChildStdin`/`ChildStdout` types. **Accepted** via
+        `#[cfg_attr(test, mutants::skip)]` on the whole method — verified
+        zero already-caught mutants are sacrificed by this skip. Required
+        adding `mutants = "0.0.4"` as a **regular** (not dev-) dependency of
+        `tpu-mcp`, since `cfg_attr(test, mutants::skip)` must still parse in
+        all profiles cargo-mutants builds; cargo-mutants does not evaluate
+        the `test` cfg condition itself — the mere syntactic presence of the
+        attribute is what triggers the skip.
+      - `IoWorkerHandle::try_call`'s `!have_worker` site was left undecorated
+        at the time this decision was made (function-level skip would have
+        sacrificed 3 other already-caught mutants; `mutants::exclude_re`
+        isn't published yet — max published version 0.0.4, needs 0.0.5+).
+        **Update after M11-3 landed:** this site is now caught anyway,
+        without any further code change. Once M11-3 adopted nextest as the
+        test tool, the same cumulative-slowdown that made
+        `IoWorker::call`'s mutants time out now gets forcibly terminated by
+        nextest's per-test `slow-timeout` (60s cap) and reported as a normal
+        test failure — verified in the M11-5/6/7 comprehensive re-run (see
+        M11-5). No further action needed here.
+- [x] M11-3: Evaluate installing `cargo-nextest` with a configured
+      slow-timeout / terminate-after profile, both so real-world hangs fail
+      fast in ordinary `cargo test`/CI runs and so `cargo mutants` can be
+      pointed at nextest as its test runner instead of bare `cargo test`.
+      **Adopted.** nextest runs each test in its own OS process, so it can
+      forcibly terminate a single hung test (via Windows job objects / a
+      Unix process-group SIGTERM-then-SIGKILL) instead of the whole test
+      binary blocking forever the way bare `cargo test` does. Added
+      `.config/nextest.toml` with `[profile.default]` (`fail-fast = false`,
+      matching `ci.yml`'s prior `--no-fail-fast` policy; `slow-timeout =
+      { period = "20s", terminate-after = 3 }`, i.e. a 60s forced-termination
+      cap) and `[profile.mutants]` (inherits the same `slow-timeout`, restores
+      nextest's own fail-fast-on-first-failure default). Thresholds were
+      chosen from real data: `cargo nextest run` with no config measured the
+      slowest legitimate test in the workspace at ~8.2s
+      (`tpu-mcp::io_worker_chaos::chaos_kill_between_writes_all_succeed`,
+      real subprocess kill/respawn cycles), so 60s gives ~7x margin before a
+      real test is ever mistakenly killed, while remaining well below
+      `cargo-mutants`' own auto-computed per-mutant timeout (observed
+      ~112-119s on bare `cargo test`) — so nextest's own termination, not
+      cargo-mutants' fallback, is what ends a hung mutant test.
+      **Validated empirically**, not just configured: a temporary test
+      containing a genuine `loop { sleep(100ms) }` was run under
+      `--profile mutants` with a deliberately tightened `slow-timeout =
+      { period = "2s", terminate-after = 1 }` and confirmed to be forcibly
+      terminated and reported as a failing (`TIMEOUT`) test at ~2.1s instead
+      of hanging — then both the probe test and the tightened config were
+      reverted. A real `cargo mutants -f crates/tpu/src/cmd/count.rs
+      --test-tool=nextest` end-to-end run (42 mutants, a file untouched by
+      Tier 2) also completed cleanly: 42 caught, 0 missed, 0 timeouts.
+      Added `.cargo/mutants.toml` with `test_tool = "nextest"` and
+      `additional_cargo_test_args = ["--profile=mutants"]` so this is now the
+      default for every future `cargo mutants` invocation in this workspace
+      (M11-1's "after" run, all of Milestone 12, and beyond) without needing
+      the flag repeated on the command line. `ci.yml`'s `build-test` and
+      `build-test-windows` jobs now install nextest
+      (`taiki-e/install-action@nextest`) and run `cargo nextest run
+      --workspace --locked` instead of bare `cargo test --no-fail-fast`,
+      followed by a `cargo test --doc --workspace --locked` step, since
+      **nextest does not run doctests** (a known, deliberate nextest
+      limitation — see nextest-rs/nextest#16). This workspace currently has
+      zero runnable doctests (only ` ```text` /` ```rust,ignore` ` fences,
+      confirmed by grep before making this change), so `cargo mutants
+      --test-tool=nextest` loses no coverage today; re-check this if a real
+      ` ```rust` ` doctest is ever added, since cargo-mutants does not run
+      doctests itself even when using the default `cargo test` tool.
+      Full workspace `cargo nextest run`: 3 688 tests passed, 0 skipped, in
+      ~50s; `cargo fmt --check` clean.
+- [ ] M11-4: Where a manual `while i < len { …; i += 1 }` loop can be
+      refactored to an iterator-based loop without changing behaviour, prefer
+      that refactor over adding a test — it removes the mutation site (and
+      the timeout) entirely rather than merely covering it. Only fall back to
+      a direct fast unit test (or a documented skip) where the raw index is
+      load-bearing. Applied three times so far: `TextLayout::analyze` in
+      M11-7 (byte stream, `bytes.iter().enumerate()`), and
+      `replace_u16_pairs`/`normalize_bytes_to_lf`/`normalize_u16_to_lf` in
+      M11-8 (`chunks_exact(2)` for the 2-byte-unit functions, `enumerate()`
+      for the byte-oriented one) — all four eliminated their `+=` timeout
+      mutants outright rather than merely covering them, and M11-8's file
+      went from 24 missed/4 timeouts to a perfect 0 missed/0 timeouts. The
+      same manual-index-loop pattern still exists, unaddressed, in
+      cmd/render.rs (M11-9).
+
+**Per-file work items:**
+
+- [x] M11-5: `crates/tpu-mcp/src/worker.rs` (16 missed in the M11-1
+      baseline). **Complete.** `write_response` closed by 4 direct
+      in-memory-buffer unit tests. `IoWorker::call`'s response-id matching
+      accepted via `#[cfg_attr(test, mutants::skip)]` (M11-2). The retry
+      loop's `+`/`-`/`+=`/`>=` arithmetic (max-attempts computation, backoff
+      indexing, the retry/give-up boundary) was extracted into two pure,
+      directly-tested functions (`max_attempts`, `decide_retry` returning a
+      `RetryDecision` enum) shared by both retry sites, plus
+      `should_log_retry_success`; this is the same "extract testable pure
+      logic" refactor M11-4 recommends for loops, applied here to
+      subprocess-adjacent retry bookkeeping instead. `IoWorkerHandle::
+      try_call`'s `!have_worker` site — previously left undecorated pending
+      `mutants::exclude_re` — is now caught automatically by M11-3's nextest
+      adoption (see M11-2's update note) with no further code change.
+      `WorkerCallError::is_worker_dead` mutated to `true` is accepted as
+      equivalent: with only two variants (`PipeBroken`, `Protocol`) and both
+      matched as dead, the function is behaviourally always-`true` today by
+      construction; pinned with a direct test of the *intended* semantics
+      rather than chasing the unkillable mutant. `IoWorker::drop` mutated to
+      `()` is accepted as not practically testable: dropping `IoWorker` also
+      drops its `stdin: ChildStdin` field right after, which alone makes a
+      healthy worker exit via EOF on its own read loop, so the explicit
+      `kill()`/`wait()` is only observably necessary for an *unresponsive*
+      worker — confirmed by hand-mutating `drop()` to `()` and re-running
+      `drop_terminates_the_child_process` (still passes). Distinguishing
+      this would need either a flaky race (checking immediately after
+      `drop()` returns, since only the real `wait()` makes that instant
+      deterministic) or new test-only instrumentation to make a worker
+      ignore stdin EOF on purpose; not pursued. Verified via a real scoped
+      `cargo mutants` run (see M11-7's verification note): 2 missed (both
+      documented above), 0 timeouts.
+- [x] M11-6: `crates/tpu-mcp/src/main.rs` (29 missed in the M11-1 baseline).
+      **Complete.** `v.is_null()` extracted into a pure `request_id` helper;
+      `send_response`/`send_error` closed via direct in-memory-buffer tests
+      (M11-2). `code::PARSE_ERROR`/`METHOD_NOT_FOUND`/`INVALID_PARAMS`
+      (negative-literal deletion) pinned with an exact-value test.
+      `dispatch`'s `"ping"`/`"shutdown"`/unknown-method match arms covered
+      with direct calls asserting the exact `ResponseBody`. `log_info`/
+      `log_warn` mutated to `()` closed the same way as `send_response`.
+      `parse_config`'s CLI-argument loop was extracted into a pure
+      `apply_arg(&mut ArgFlags, &str)` function (mirroring M11-5's retry-loop
+      extraction), directly tested for every flag (`--verify-delay-ms=`,
+      `--default-on-error=`, `--progress-detail=`, `--quiet`,
+      `--eol-normalize`, the worker sentinel args, and an unrecognised arg).
+      `parse_config`'s env-var-driven defaults (`TPU_MCP_QUIET`,
+      `TPU_MCP_NO_IO_WORKER`, `TPU_EOL_NORMALIZE`, `TPU_DEFAULT_ERROR_MODE`,
+      `TPU_PROGRESS_DETAIL`) are covered by tests that mutate real process
+      env vars directly, serialised behind a `Mutex` (`ENV_VAR_TEST_LOCK`) so
+      they are correct under *both* nextest's per-test-process isolation
+      *and* plain `cargo test`'s default multithreaded-single-process model
+      (confirmed by hand-testing under both runners — the unguarded version
+      raced and failed intermittently under plain `cargo test`). One mutant
+      accepted as equivalent: `apply_arg`'s `s == worker::WORKER_ARG` branch
+      body is empty (a documented no-op), so mutating `==` to `!=` produces
+      identical behaviour for every possible input. Verified via a real
+      scoped `cargo mutants` run: 1 missed (documented above), 0 timeouts.
+- [x] M11-7: `crates/tpu/src/lib.rs` (23 missed in the original noisy
+      report; 15 missed + 10 timeouts in the clean M11-1 baseline).
+      **Complete.** The `retry_io` boundary mutants and its three timeout
+      mutants were already closed by M11-2. `TextLayout::analyze`'s manual
+      byte-stepping loop was refactored to an iterator-driven walk (per
+      M11-4) — the loop no longer has a manual index to mutate into an
+      infinite loop, only a lookahead `bytes.get(idx + 1)` expression, which
+      is directly tested (8 new tests covering every terminator kind, the
+      CRLF-guard boundary, and the trailing-line arithmetic). `WriteLock`/
+      lock-file logic: `lock_sidecar_path`'s exact 255-char boundary is
+      pinned by a boundary test; `open_lock_file`'s access/share-mode flags
+      are pinned by a new test that actually reads and writes through the
+      returned handle (rather than relying on a side effect like
+      delete-on-close, which this Windows version turns out to honour even
+      with a bit missing from the mask) — this caught the one *not*
+      equivalent bitflag mutant (`|`→`&` on the second `access_mode`
+      operator, which collapses to `GENERIC_READ` alone because `&` binds
+      tighter than `|` in Rust, canceling `GENERIC_WRITE & DELETE` to `0`);
+      `acquire_write_lock`'s contention-wait boundary (`>=` vs `<` on
+      `LOCK_WAIT_CAP`) is pinned by a real two-thread contention test.
+      Four mutants accepted as equivalent: the remaining `|`→`^` bitflag
+      swaps (both `access_mode` and `share_mode`, both operator positions)
+      are mathematically identical to `|` because every operand is a
+      disjoint single-bit (or already-disjoint) constant — confirmed by
+      hand-mutating each and re-running the full `write_lock_tests` module
+      (all pass regardless). `WriteLock::drop` mutated to `()` is accepted
+      as equivalent for the same reason as `IoWorker::drop` above: the
+      `file: fs::File` field's own drop closes the handle (releasing the OS
+      lock) immediately after the custom `drop()` body returns, whether or
+      not that body does anything — confirmed by hand-mutating and
+      re-running the full `write_lock_tests` module. One mutant is a
+      platform-coverage gap, not a missing test: the `#[cfg(not(windows))]`
+      variant of `open_lock_file`'s whole-function-replace mutant is inside
+      code that is not compiled at all when `cargo mutants` runs on this
+      Windows machine, so no test on this platform can ever observe a
+      difference; would need a Linux/macOS `cargo mutants` run to validate.
+      **Verification methodology:** every fix in M11-5/6/7 above was
+      confirmed by a real scoped `cargo mutants -f crates/tpu/src/lib.rs -f
+      crates/tpu-mcp/src/worker.rs -f crates/tpu-mcp/src/main.rs` run (using
+      the nextest test tool per M11-3) against the fully-edited source,
+      not just by hand-mutating individual sites: **138 mutants tested, 115
+      caught, 9 missed (all 9 documented above as equivalent or a platform
+      gap), 14 unviable, 0 timeouts** (down from the M11-1 baseline's 849
+      mutants across all six Tier 2 files scoring 185 missed / 36 timeouts
+      — not a directly comparable subset, but illustrative of the drop from
+      dozens of missed/timeout mutants in these three files to a
+      single-digit, fully-accounted-for residual).
+- [x] M11-8: `crates/tpu/src/encoding.rs` (24 missed / 4 timeouts in the
+      original noisy report; 24 missed / 4 timeouts unique, deduplicated in
+      the M11-1 baseline). **Complete — perfect score.** All four functions
+      (`replace_u16_pairs`, `normalize_bytes_to_lf`, `normalize_u16_to_lf`,
+      `apply_line_ending_to_all`) had zero direct unit tests before this
+      item. `replace_u16_pairs` refactored from a manual `while i+1 <
+      len() { …; i += 2 }` loop to `bytes.chunks_exact(2)` +
+      `.remainder()` (per M11-4) — eliminates its `i += 2` timeout mutant
+      structurally. `normalize_bytes_to_lf` refactored to the same
+      iterator-driven-walk pattern used for `TextLayout::analyze` in M11-7
+      (`bytes.iter().enumerate()`, one extra `.next()` to consume a paired
+      LF) — eliminates its `i += 1`/`i += 2` timeout mutant and collapses
+      the CRLF lookahead from a 3-part bounds-checked condition to one
+      `bytes.get(idx + 1) == Some(&0x0A)` comparison. `normalize_u16_to_lf`
+      refactored the same way but with `chunks_exact(2)` for 2-byte code
+      units, using `chunks.clone().next()` to peek the following unit
+      without consuming it — eliminates its two `+=` timeout mutants
+      (main-loop stepping and the CRLF-unit-pair stepping) and collapses
+      the CRLF-unit lookahead from a 3-condition bounds-checked `&&` chain
+      to a single 2-condition comparison. Added 6 tests for
+      `normalize_bytes_to_lf` (empty, lone LF, CRLF pair, lone CR not
+      followed by LF, trailing lone CR, mixed terminators) and 7 for
+      `normalize_u16_to_lf` (the same cases plus an odd-trailing-byte case,
+      since UTF-16 has an extra malformed-input path single-byte streams
+      don't). `apply_line_ending_to_all`'s `b == 0x0A` → `0x0D` remap
+      (target = `Cr`, non-UTF-16 path) pinned by one direct test. **Real
+      scoped `cargo mutants -f crates/tpu/src/encoding.rs` run (nextest
+      tool): 122 mutants tested, 112 caught, 0 missed, 10 unviable, 0
+      timeouts** — every viable mutant in the file is now caught.
+- [x] M11-9: `crates/tpu/src/cmd/render.rs` (20 missed / 4 timeouts unique
+      in the M11-1 baseline). **Complete.** Unlike M11-7/M11-8, `render_str`
+      and `find_close`'s loop indices turned out to be genuinely load-bearing
+      per M11-4's own exception clause: `render_str`'s single loop advances
+      by three *different* amounts depending on what it finds (an escape
+      sequence, a resolved token span, or one UTF-8 scalar's byte width) and
+      slices the original `template` string by exact byte offset for the
+      `MissingPolicy::Leave` case, so an iterator-based rewrite would be a
+      much larger, riskier change for uncertain benefit — especially now
+      that M11-3's nextest adoption already provides a safety net (a
+      mutation that did create a genuine infinite loop would be terminated
+      and reported as a failure, not silently missed or an unbounded hang).
+      Went with comprehensive direct tests instead (14 new tests covering
+      escape-sequence and token-start boundary conditions, multi-byte UTF-8
+      literal text, repeated/counted substitution semantics, and two
+      compare-byte-to-itself bugs this uncovered: `bytes[i]==b'{' &&
+      bytes[i+1]==b'{'` mutated so the second read becomes `bytes[i]` again
+      -- trivially true whenever the first check already passed -- turns
+      every lone `{` into a false token start; the same pattern exists in
+      `find_close`). `parse_var`'s and the token-name validator's `||`
+      character-class checks pinned by accept/reject tests for `_`/`-`
+      specifically (not just alongside an alphanumeric). `run`'s `(None,
+      None, Some(s))`/`(None, None, None)` match arms covered by direct
+      calls. The parent-directory-creation guard was extracted into its own
+      `ensure_parent_dir_for_new_output` function (mirroring M11-5/6's
+      pure-logic extractions) and tested directly, because testing it only
+      through `run`'s public interface can't distinguish a broken guard from
+      correct behaviour: the downstream `crate::cmd::write::run` →
+      `atomic_write` also creates the destination's parent directory as its
+      own safety net. One mutant accepted as equivalent: the inner `&&`
+      (`!parent.as_os_str().is_empty() && !parent.exists()`) mutated to `||`
+      has no distinguishing input, because `fs::create_dir_all` returns
+      `Ok(())` as a no-op for both edge cases the guard exists to skip (an
+      already-existing directory, confirmed via the existing idempotency
+      behaviour of `create_dir_all`, and an empty path, confirmed directly:
+      `create_dir_all(Path::new(""))` == `Ok(())` on this platform) --
+      there is no input for which `&&` and `||` differ observably. **Real
+      scoped `cargo mutants -f crates/tpu/src/cmd/render.rs` run (nextest
+      tool): 184 mutants tested, 182 caught, 1 missed (documented above),
+      0 unviable, 0 timeouts.**
+- [x] M11-10: `crates/tpu/src/data_format.rs` (19 missed / 2 timeouts unique
+      in the M11-1 baseline). **Complete.** `encode_base64_pem`'s manual
+      `while pos < flat.len() { ...; pos = end; }` loop (its only timeout
+      source) refactored to `flat.as_bytes().chunks(64)` per M11-4,
+      eliminating the position-arithmetic mutation sites outright; already
+      had extensive boundary tests (exact-48-bytes, 49-bytes-wraps, and
+      others) from before this milestone, so this was a pure structural fix
+      with no new tests needed. Added exact-value tests (no round-trips, per
+      this item's original warning) for: `b64_val`'s value for every
+      character class (`A`-`Z`, `a`-`z`, `0`-`9`, `+`, `/`); `b64_val`'s
+      `b'=' => Err(...)` match arm against being deleted (asserted the
+      *exact* padding-specific error message text, which differs from the
+      generic-invalid-character arm's text); `decode_base64`'s per-chunk-
+      index position arithmetic in its error messages (one test per chunk
+      index 0-3, each with the invalid character in the *second* base64
+      group so a `*` -> `/` mutation is distinguishable from `*` -> `+`,
+      which only coincide at group 0); `encode_base64`'s RFC 4648 test
+      vectors (`f`/`fo`/`foo`/`foob`/`fooba`/`foobar`). Seven mutants
+      accepted as equivalent, all following one underlying principle: every
+      `|` in this file's bit-packing code combines values already shifted
+      into disjoint bit ranges (that is what a bit-packing shift *is*), so
+      OR and XOR compute byte-for-byte identical results for every input --
+      confirmed by hand-mutating `decode_hex`'s `(hi << 4) | lo` and
+      re-running the file's full test suite (178 tests, all pass regardless
+      of `|` vs `^`), then generalising to the other six `|` sites in
+      `decode_base64` and `encode_base64` by the same reasoning rather than
+      re-verifying each individually. **Real scoped `cargo mutants -f
+      crates/tpu/src/data_format.rs` run (nextest tool): 268 mutants tested,
+      246 caught, 14 missed (7 unique, matching the equivalence above
+      exactly), 8 unviable, 0 timeouts.**
+
+**Status:** ✅ Complete. Every item (M11-1 through M11-10) is done. M11-4
+(the general loop-refactor principle) was applied four times total (M11-7
+once, M11-8 three times), and deliberately *not* applied in M11-9, whose
+loop index turned out to be genuinely load-bearing per M11-4's own
+exception clause.
+
+M11-2: `retry_io`'s three timeout mutants fixed via a bounded-timeout
+background thread; `worker.rs`'s `write_response` and `main.rs`'s
+`send_response`/`send_error`/`v.is_null()` fixed via direct in-memory-buffer
+unit tests; `IoWorker::call` accepted as a documented `mutants::skip` (zero
+already-caught mutants sacrificed). `try_call`'s `!have_worker` site, noted
+at the time as the one undecorated holdout, turned out to be resolved for
+free once M11-3 landed (see M11-2's update note and M11-5).
+
+M11-3: `cargo-nextest` installed and configured (`.config/nextest.toml`,
+`.cargo/mutants.toml`); `ci.yml` switched to `cargo nextest run` + `cargo
+test --doc`; empirically validated that nextest's per-test termination
+converts a genuine hang into a fast reported failure, and that `cargo
+mutants --test-tool=nextest` runs cleanly end-to-end.
+
+M11-5/6/7 (worker.rs, main.rs, lib.rs): re-verified via a real scoped
+`cargo mutants` run against the fully-edited source: **138 mutants tested,
+115 caught, 9 missed, 14 unviable, 0 timeouts.** All 9 remaining missed
+mutants are individually documented as either mathematically equivalent
+(disjoint-bitmask `|`/`^` swaps in `open_lock_file`, `WriteLock`/
+`IoWorker`'s `Drop` impls given their fields' own drops, an empty-bodied
+`apply_arg` branch, `is_worker_dead`'s current always-true semantics) or a
+platform-coverage gap (the `#[cfg(not(windows))]` variant of
+`open_lock_file`, uncompiled and therefore untestable on this Windows
+machine). `TextLayout::analyze` was refactored to an iterator-driven walk
+(M11-4), eliminating its timeout mutants outright.
+
+M11-8 (encoding.rs): re-verified via a real scoped `cargo mutants` run:
+**122 mutants tested, 112 caught, 0 missed, 10 unviable, 0 timeouts** — a
+perfect score, up from 24 missed / 4 timeouts in the M11-1 baseline. Three
+functions (`replace_u16_pairs`, `normalize_bytes_to_lf`,
+`normalize_u16_to_lf`) refactored to iterator/`chunks_exact`-driven walks
+per M11-4, eliminating their timeout mutants outright; a fourth
+(`apply_line_ending_to_all`) pinned with a direct test. All four functions
+had zero direct unit tests before this item.
+
+M11-9 (cmd/render.rs): re-verified via a real scoped `cargo mutants` run:
+**184 mutants tested, 182 caught, 1 missed, 0 unviable, 0 timeouts.** The
+one missed mutant (`&&` vs `||` on a directory-creation guard) is
+documented as equivalent given `fs::create_dir_all`'s no-op behaviour on
+both edge cases the guard exists to skip. Along the way, found and fixed a
+real "compare a byte to itself" bug pattern (a `+1` index mutated so a
+lookahead re-reads the byte just matched, which is trivially still true) in
+both `render_str` and `find_close`.
+
+M11-10 (data_format.rs): re-verified via a real scoped `cargo mutants` run:
+**268 mutants tested, 246 caught, 14 missed (7 unique), 8 unviable, 0
+timeouts.** All 7 unique missed mutants are `|` vs `^` swaps in bit-packing
+expressions, all following the same disjoint-bit-range equivalence
+established in M11-7/M11-8's lock-file work, spot-verified once by hand
+(178 tests unaffected) rather than re-verified per site.
+`encode_base64_pem`'s manual position-tracking loop (its only timeout
+source) refactored to `chunks(64)` per M11-4.
+
+M11-1 (before/after comparison across all six Tier 2 files): **before**
+849 mutants tested, 185 missed, 596 caught, 32 unviable, 36 timeouts;
+**after** (same six files, now via nextest per M11-3) 716 mutants tested,
+16 missed, 656 caught, 38 unviable, **0 timeouts**. Missed mutants down 91%
+(185 → 16); every one of the 36 timeouts is gone. All 16 remaining missed
+mutants are individually documented in M11-5 through M11-10 as
+mathematically/behaviourally equivalent or a platform-coverage gap — see
+M11-1 for the full per-file table.
+
+Full workspace: `cargo nextest run` 3 823 tests passed, 0 skipped, ~35s;
+`cargo fmt --check` and `cargo clippy --all-targets` both clean (no new
+warnings from this milestone's work; a handful of pre-existing warnings
+elsewhere in the workspace, unrelated to these changes, remain untouched).
+
+---
+
+## Milestone 12 — Mutation-testing coverage: Tier 3 (remaining files)
+
+**Theme:** the fourteen lowest-count files from the same 2026-09-08
+`cargo mutants` run (87 missed mutants combined, 1–14 per file). Individually
+low-impact, but the same two families as Tier 2 — boolean-logic argument
+combinations and boundary conditions on counting/limiting logic — recur
+throughout, so the fixes are mechanically similar once the Tier 2 patterns
+are established.
+
+- [x] M12-1: `crates/tpu/src/main.rs` (14 missed). **Complete.** Extracted
+      `WORKER_STACK_SIZE`, `eol_advisory_enabled_for`, and
+      `eol_normalize_requested` as directly-testable pure functions (M11-4
+      style). The three `if diff && !diff_buf.is_empty()` sites (write/
+      replace/edit) needed `--message-format=json` tests specifically,
+      because `HumanOutput::emit_json` only ever writes the (possibly-empty)
+      `rendered` field directly to stdout — an empty diff collapses to zero
+      bytes either way, making the `&&`/`||` mutation unobservable in human
+      mode — while `JsonOutput::emit_json` always writes a full NDJSON
+      envelope regardless of content emptiness. Discovered and filled a
+      complete gap: zero `doctor` CLI integration tests existed at all;
+      added six covering `format=json`, `--fix peel|all`, `--quiet`, and the
+      clean/dirty exit-code boundary. Also discovered and filled a second
+      gap: zero `setup --inject` CLI tests existed; added tests for all
+      three verb outcomes ("block appended" / "already up to date" / "block
+      replaced") pinning the `Commands::Setup` dispatch's `if !updated`
+      against a `delete !` mutation. One mutant accepted as equivalent: the
+      binary-mode `diff && !binary` guard's `&&`, mutated to `||`, is
+      unobservable because `cmd::edit::run`'s binary branch unconditionally
+      discards `diff_out` (`let _ = diff_out;`), so `diff_buf` stays empty
+      regardless of whether it was ever `Some` — confirmed by tracing every
+      downstream read site.
+- [x] M12-2: `crates/tpu/src/test_fixtures.rs` (11 missed). **Complete.**
+      Added direct value-assertion tests for `latin1_fragment()` and
+      `double_cafe()` (previously only checked for UTF-8 validity, never
+      their actual content) and two boundary tests for the file's private
+      `b64()` decoder's short-chunk handling (`chunk.len() > 2` / `> 3`,
+      pinning both the boundary and an adjacent `+`/`*`/`==`/`!=` cluster by
+      forcing an out-of-bounds panic under the mutated comparison). Three
+      mutants accepted as equivalent, all bit-packing `|`-vs-`^` swaps or a
+      `>`-vs-`>=` boundary masked by a `.get(2)`/`.get(3)` `None` default:
+      `b64`'s `(b[0]<<2)|(b[1]>>4)`, `(b[2]<<6)|b[3]`, and the `chunk.len() >
+      2 && ...unwrap_or(&b'=') != b'='` guard (for `chunk.len()==2`, the only
+      length where `>`/`>=` differ, the second half of the `&&` is masked to
+      `false` by the `None` default either way).
+- [x] M12-3: `crates/tpu/src/cmd/find.rs` (10 missed). **Complete.**
+      Extracted `spec_is_glob` from `expand_paths_with_policy`'s inline
+      4-way `||` chain (M11-4 style) with a direct per-metacharacter test.
+      `run_single_file`'s separator/de-duplication logic needed three new
+      tests discovered only via a real scoped re-run (the original fix
+      pass under-covered this area): `-B`-alone (no `-A`) non-adjacent
+      groups still need a `--` separator, pinning `lines_before > 0` against
+      a `<` mutation (always false for a `usize`) that would otherwise be
+      masked whenever `lines_after > 0` is also true; a bridging-gap case
+      pinning the `.find(|(n,_)| ... *n > last)` computation of
+      `first_to_emit` against `==`/`<` mutations (either wrongly falls back
+      to the *current* match's own line number, which is far enough past
+      `last` to trigger a spurious separator); and an older-context
+      de-duplication case (`-B 4`, matches on lines 3 and 5) pinning the
+      *emission* loop's identical `*n > last` check against a `<` mutation,
+      which would re-emit an already-shown line as a duplicate while
+      skipping the genuinely new one. One mutant accepted as equivalent:
+      `first_to_emit`'s `>` vs `>=` — the before-context buffer is always a
+      contiguous run of line numbers, so whenever `last` falls inside it,
+      `>` finds `last+1` and `>=` finds `last` itself; both are `<= last+1`,
+      so the separator check `first_to_emit > last + 1` is `false` under
+      both interpretations and there is no reachable input where they
+      diverge.
+- [x] M12-4: `crates/tpu/src/cmd/edit.rs` (9 missed / 1 timeout). **Complete.**
+      The timeout source (`line_range_to_source_bytes_with_encoding`'s
+      manual `while i + newline_width <= view.bytes.len()` loop) needed no
+      refactor: it was simply never exercised by any existing test, so the
+      infinite loop a `+=`-style mutation would cause never manifested
+      either way; it remains a plain loop but is now covered directly (see
+      below), and cargo-nextest's per-test kill would catch a genuine hang
+      regardless (M11-3). New direct tests: `run_line`'s `decoded.bom_len >
+      0` (BOM preservation across an edit, pinning `>` against `<`, which is
+      always false for a `usize`); the `total_lines` calculation's `else`
+      arm (a file *without* a trailing newline), previously untested by any
+      fixture, pinning both the `+ 1` and the `== b'\n'` mutations via an
+      `--insert` at exactly `total_lines + 1`; the patch-overlap check's
+      `w[0].end > w[1].start` at the exact byte-adjacent boundary (two
+      deletes whose ranges touch but don't overlap); and
+      `line_range_to_normalized_bytes`'s / `line_range_to_source_bytes_with_
+      encoding`'s duplicated `start_line == 0 || end_line == 0` guard,
+      pinned by a numeric start past an `EOF_SENTINEL` end on an empty file
+      (only `end_line` resolves to `0`, so `&&` wrongly defers to the next
+      check and reports the wrong line number in the error message).
+      `line_range_to_source_bytes_with_encoding`'s UTF-16LE-vs-UTF-16BE
+      newline-width `||` was tested directly (bypassing the always-UTF-8
+      public wrapper) by hand-constructing a `View` over raw UTF-16LE bytes.
+      `parse_line_range`'s `lo > hi` boundary pinned by an explicit
+      equal-pair range (`"5-5"`).
+- [x] M12-5: `crates/tpu/src/cmd/describe.rs` (9 missed). **Complete.** This
+      module had zero tests of any kind (it's implemented but not yet wired
+      into the CLI, `#[allow(dead_code)]`). Added a full `mod tests`:
+      `LineEndingSeen::as_str`'s five outcomes ("None"/"LF"/"CRLF"/"CR"/
+      "Mixed") each asserted individually by exact string (not just
+      "not None"), which is what's needed to catch both a whole-
+      function-replace mutant and a single-match-arm deletion (a deleted
+      arm falls through to the `_ => "Mixed"` catch-all, which still looks
+      like a plausible string unless every expected value is checked); and
+      `run`'s `decoded.bom_len > 0` pinned the same way as M12-4's
+      analogous case (BOM'd vs. plain file).
+- [x] M12-6: `crates/tpu/src/cmd/head.rs` (8 missed). **Complete.**
+      `run_lines`'s `is_last_selected = i + 1 == take` and `had_terminator =
+      !is_last_selected || take < all_lines.len() || file_ends_with_newline`
+      needed two precisely-chosen direct tests (no existing fixture lacked
+      a trailing newline): requesting *all* lines of a file with no
+      trailing newline (pins `==`/`+`/`!`/the `<` boundary all at once,
+      since a mutated `is_last_selected` or a `<=` on `take < len` both
+      wrongly add a terminator to the file's true last line) and requesting
+      *fewer* lines than exist (pins the same `<` from the other side, and
+      the `||` joining it to `!is_last_selected`, since only that middle
+      term is true here). `run_bytes`'s `file_len == 0 || n == 0` guard is
+      accepted as equivalent: memory-mapping a genuinely empty file with
+      `memmap2` does not error on this platform (confirmed empirically — a
+      direct test with the early return effectively disabled still passes,
+      because `read_raw_bytes` succeeds with an empty `Vec` and the
+      subsequent `take = n.min(0) = 0` truncation produces identical empty
+      output either way).
+- [x] M12-7: `crates/tpu/src/cmd/setup.rs` (7 missed). **Complete.** This
+      module had zero CLI-level `setup --inject` tests at all. Added seven:
+      the three verb outcomes ("block appended"/"already up to date"/"block
+      replaced", also fixing M12-1's `main.rs` dispatch gap), an empty
+      existing file (must not add a leading blank line), a file already
+      ending in a single `\n` and one with no trailing newline at all (both
+      must still get exactly one blank line of separator — pinning the
+      inner `!out.ends_with('\n')` and outer `!out.ends_with("\n\n")` guards
+      independently), and an out-of-order `END_MARKER`-before-`BEGIN_MARKER`
+      file (must error, not silently "replace" — pinning the `e > b` match
+      guard against a `replace guard with true` mutation). Two mutants
+      accepted as equivalent: the parent-directory-creation guard's `!` on
+      `if !parent.as_os_str().is_empty()`, redundant with `atomic_write`'s
+      own parent-directory creation inside `cmd::write::run` (identical
+      reasoning to M11-9's `render.rs` finding); and the `e > b` guard's `>`
+      vs `>=`, unreachable because `BEGIN_MARKER` and `END_MARKER` are
+      distinct fixed strings that can never be found at the same offset, so
+      `e == b` is a structurally impossible input.
+- [x] M12-8: `crates/tpu/src/cmd/write.rs` (7 missed). **Complete.**
+      `detect_target`'s `source.bom_len() > 0` pinned the same way as
+      M12-4/M12-5 (direct unit tests against a hand-constructed `View`/
+      temp file, bypassing the fact that `write_bom` for `OutputEncoding::
+      Preserve` only consults `source_had_bom` when a git-attributes
+      `working-tree-encoding` is configured — untestable through `run`'s
+      public interface outside a real git repo). `encode_new_file_content`'s
+      `bom_policy == BomPolicy::Force` tested via `tpu create --utf8
+      --bom=force`/`--utf8` (this function, not `run`, is `create`'s code
+      path for brand-new files). Two `diff_out.is_some() && file.exists()`
+      guards (in `run` and `run_binary`) needed a `--diff` invocation
+      against a target that does not yet exist, which no prior test
+      covered — without the guard, both would attempt `fs::read` on a
+      nonexistent file and fail outright. One mutant accepted as
+      equivalent: `run`'s inner `policy.reject_introduced_mojibake &&
+      file.exists()` (the first, non-diff-related term of `need_old_bytes`)
+      has no distinguishing input, because its only reader
+      (`old_decoded`, used solely inside `if policy.reject_introduced_
+      mojibake`) is gated by the identical flag, and `old_bytes.is_some()`'s
+      other reader (the diff-emission `if let (Some(out), Some(old))`) is
+      already forced by `diff_out.is_some()` regardless of this term.
+- [x] M12-9: `crates/tpu/src/cmd/tail.rs` (4 missed). **Complete.** Same
+      pattern as M12-6, simplified because `tail` always selects a suffix
+      ending at the file's true last line (no `take < all_lines.len()`
+      term needed): one direct test requesting fewer lines than exist in a
+      file with no trailing newline pins `i + 1 == take` and `delete !`
+      together. `run_bytes`'s `file_len == 0 || n == 0` is accepted as
+      equivalent for the identical reason as M12-6's `head.rs` case.
+      **Investigated and resolved a false lead:** a first verification pass
+      (run concurrently with an unrelated, resource-heavy background
+      mutants sweep) reported this file's other three `run_bytes` mutants
+      (`135:17`/`135:27`'s `==`, `141:29`'s `-`) as `TIMEOUT` at the full
+      258s budget. A clean, uncontended re-run resolved all three to
+      `caught` with no timeouts at all — confirming the apparent hangs were
+      system-load artifacts from running two `cargo mutants` invocations
+      simultaneously, not a real infinite-loop risk in `redwing::
+      materialize_range`. Lesson for future scoped runs: don't run more
+      than one `cargo mutants` invocation at a time on this machine, even
+      across disjoint file sets, or slow-but-finite mutated code paths can
+      spuriously exceed the timeout budget under contention.
+- [x] M12-10: `crates/tpu/src/walk.rs` (3 missed / 1 timeout). **Complete.**
+      The timeout source (`CqItem::Terminal(_) => break` match-arm
+      deletion, which would spin the `loop { match ring.wait_pop() {...} }`
+      forever once the ring signals end-of-stream) needed no fix at all:
+      cargo-nextest's per-test kill (M11-3) already converts the resulting
+      hang into a fast, ordinary test failure — confirmed by a real scoped
+      run showing `0 timeouts`. Two mutants accepted as equivalent, both
+      requiring tracing into the `globazog` engine's internals rather than
+      writing a test: `.result_shape(MetaMask::TYPE | MetaMask::REPARSE)`'s
+      `|` (both `^` and `&` mutations) has no distinguishing input, because
+      `Query::fetch_mask()` unions `result_shape` with
+      `required_fields(&self.descend)`, and `descend` already includes a
+      `Leaf::IsReparse` entry (added independently, to skip reparse points
+      while walking directories) whose own `required_fields` mapping
+      already forces `MetaMask::REPARSE` into the fetch mask regardless of
+      `result_shape` — and separately, `entry_type`/`is_reparse` are always
+      populated at the OS-directory-entry layer (`sys/win.rs`,
+      `sys/linux.rs`) unconditionally, never gated by the fetch mask at
+      all, only the "extra stat" fields (size/mtime/attrs) are; and the
+      `CqItem::ContainerEnd(e) => { containers.remove(&e.id); }` match-arm
+      deletion is a pure memory-bound optimisation (`ContainerId` is a
+      monotonically-increasing `NonZeroU64` counter, so ID reuse — the only
+      way a stale cached path could cause an actual correctness bug — would
+      require exhausting a 64-bit counter within one process), with zero
+      observable effect on any test of a realistic size.
+- [x] M12-11: `crates/tpu/src/escape.rs` (2 missed / 6 timeout unique).
+      **Complete.** All 6 timeout mutants (`decode`'s five `i += 1` arms
+      and `decode_bytes`'s equivalent) needed no fix: they were already
+      exercised by pre-existing tests (`decode_lf_escape`, `decode_tab_
+      escape`, etc.), and cargo-nextest's per-test kill (M11-3) already
+      converts the resulting hang into a fast failure — confirmed missing
+      from a real scoped run entirely (0 timeouts). Added direct
+      `to_string()` tests for all four `DecodeError` variants, asserting
+      exact message text (not just non-empty), which is what's needed to
+      catch a whole-function-`Display::fmt`-replace mutant that returns
+      `Ok(Default::default())` (writes nothing, producing an empty string
+      that a looser check wouldn't catch). One mutant accepted as
+      equivalent: `decode_hex_digits`'s `value = (value << 4) | digit`, the
+      same disjoint-bit-packing `|`-vs-`^` equivalence established
+      throughout M11 (`value << 4` always has its low 4 bits zeroed by the
+      shift, and `digit` is always a 4-bit hex nibble, so the two operands
+      never share a set bit).
+- [x] M12-12: `crates/tpu/src/cmd/validate.rs`, `crates/tpu/src/cmd/read.rs`,
+      `crates/tpu/src/cmd/create.rs` (1 missed each). **Complete.** Three
+      independent instances of the same `lo > hi` / `lo == 0 || hi == 0`-
+      adjacent boundary pattern already fixed repeatedly across M11/M12:
+      `validate.rs`'s `byte_slice` and `read.rs`'s `parse_bytes_arg` each
+      needed one explicit equal-pair test (`byte_slice(bytes, 3, 3)` /
+      `parse_bytes_arg("5-5")`) pinning `>` against `>=`.  `create.rs`'s
+      `e.kind() == std::io::ErrorKind::AlreadyExists` (in the closure
+      mapping `atomic_create_new`'s I/O error to a user message) could not
+      be reached with a *non*-AlreadyExists error through `run`'s public
+      interface alone — the earlier `try_exists()` advisory check intercepts
+      the common case, and no other reachable I/O failure bypasses it — so
+      the mapping closure was extracted into a directly-testable
+      `map_atomic_create_error` function (M11-4/M12-4 style) and pinned with
+      two direct calls using synthetic `std::io::Error` values of different
+      kinds.
+
+**Per-file scoped `cargo mutants` re-verification (nextest tool), each
+against the fully-edited source:**
+
+| File | Before (missed/timeout) | After (missed/timeout) |
+|---|---|---|
+| `main.rs` | 14 / 0 | 1 / 0 (equivalent) |
+| `test_fixtures.rs` | 11 / 0 | 3 / 0 (equivalent) |
+| `cmd/find.rs` | 10 / 0 | 1 / 0 (equivalent) |
+| `cmd/edit.rs` | 9 / 1 | 0 / 0 |
+| `cmd/describe.rs` | 9 / 0 | 0 / 0 |
+| `cmd/head.rs` | 8 / 0 | 1 / 0 (equivalent) |
+| `cmd/setup.rs` | 7 / 0 | 2 / 0 (equivalent) |
+| `cmd/write.rs` | 7 / 0 | 1 / 0 (equivalent) |
+| `cmd/tail.rs` | 4 / 0 | 1 / 0 (equivalent) |
+| `walk.rs` | 3 / 1 | 2 / 0 (equivalent) |
+| `escape.rs` | 2 / 6 | 1 / 0 (equivalent) |
+| `cmd/validate.rs` | 1 / 0 | 0 / 0 |
+| `cmd/read.rs` | 1 / 0 | 0 / 0 |
+| `cmd/create.rs` | 1 / 0 | 0 / 0 |
+| **Total** | **87 / 8** | **14 / 0** |
+
+All 14 remaining missed mutants are individually documented above as
+mathematically/behaviourally equivalent — no observable difference exists
+between the original and mutated code for any reachable input. All 8
+original timeout sources are gone: two were resolved for free by
+cargo-nextest's per-test kill (M11-3, `walk.rs`'s `CqItem::Terminal`
+deletion and `escape.rs`'s six manual-loop-counter mutants), and the one
+new set of apparent timeouts encountered mid-milestone (`tail.rs`, 3
+mutants) turned out to be a resource-contention artifact from running two
+`cargo mutants` invocations concurrently, not a real hang — resolved to 0
+timeouts on an uncontended re-run.
+
+Verification was split across a comprehensive combined scoped run (all
+fourteen files together, mirroring M11-1's methodology: 1,220 mutants
+tested in 3h, 1,159 caught, 30 missed, 27 unviable, 4 timeouts) plus a
+separate clean re-run of `cmd/find.rs` and `cmd/tail.rs` alone (186
+mutants, 174 caught, 4 missed, 8 unviable, 0 timeouts) — the combined run's
+snapshot of those two files predated the final round of test additions
+made to them, and its concurrent unrelated load produced the `tail.rs`
+timeout artifact described above. The per-file table and equivalence
+documentation above reflect the final, clean numbers.
+
+Full workspace: `cargo nextest run` all tests passed, 0 skipped; `cargo fmt
+--check` and `cargo clippy --all-targets` both clean (no new warnings from
+this milestone's work; the pre-existing `line_range_to_source_bytes`/`_
+with_encoding` dead-code warning in `cmd/edit.rs`'s `--bin` build predates
+this session — that pair is genuinely unused by any production code path,
+only by its own test suite, and `pub fn line_range_to_source_bytes` is kept
+as a documented, stable helper for future callers).
+
+**Status:** ✅ Complete. Every item (M12-1 through M12-12) is done. Missed
+mutants across all fourteen Tier 3 files down from 87 to 14 (all
+individually documented as equivalent), and every one of the 8 original
+timeouts is gone (2 resolved for free by cargo-nextest's per-test kill from
+M11-3, 6 likewise, and one newly-encountered set of 3 apparent timeouts
+traced to a contention artifact and confirmed absent on an uncontended
+re-run).
+
+---
+
+## Milestone 13 — Mutation-testing coverage: `tpu-mcp/src/tools.rs` carry-over
+
+**Theme:** the one piece of Tier 1 left unfinished when Milestone 11 was
+scoped down to Tier 2 (see Milestone 11's intro). `tools.rs`'s *pure* helper
+functions are already fully covered (done, no further action needed):
+`tool_names`, `diff_separator`, `is_binary_selector`, `hex_nibble`,
+`is_windows_drive_path`, `flatten_validate_pairs`,
+`mojibake_policy_from_args`, `ServerConfig::to_wire`/`from_wire` round-trips,
+`current_version`. What remains is the harder, more expensive-per-mutant
+category deliberately deferred out of Milestone 11: `&&`/`||`/`!`
+argument-combination logic inside the MCP `call_*` endpoint handlers
+themselves, which can only be exercised at the MCP-protocol level (spinning
+up the `tpu-mcp` worker and sending real requests), not via a plain unit
+test — the same reason `tpu-mcp/src/main.rs` and `worker.rs`'s protocol
+layer in Milestone 11 needed a different testing style than the `tpu` CLI's
+Tier 2/3 files.
+
+**Baseline:** 67 missed mutants (2026-09-08 `cargo mutants` run, Tier 1,
+already deduplicated), all in `crates/tpu-mcp/src/tools.rs`, clustered in:
+
+- [ ] M13-1: `call_write_file` — `&&`/`||`/`!` argument-combination mutants
+      in its option handling.
+- [ ] M13-2: `call_replace_in_file` (6 missed) — boolean-logic mutants
+      across its `count`/`dry_run`/`diff` and related flag combinations.
+- [ ] M13-3: `call_edit_file` (4 missed) — boolean-logic mutants in its op
+      dispatch / diff / validate handling.
+- [ ] M13-4: `call_find` (5 missed) — boolean-logic mutants in its
+      context/count/invert flag combinations.
+- [ ] M13-5: `call_render_file` (4 missed) — boolean-logic mutants in its
+      template/token-handling options.
+- [ ] M13-6: `call_count_file` (3 missed) — boolean-logic mutants in its
+      counting-mode options.
+- [ ] M13-7: `call_copy_file`'s `Write` impl — boolean-logic mutant(s) in
+      its output-formatting logic.
+- [ ] M13-8: `render_changed_regions` — `-=`/`+=` manual-index mutants
+      around lines ~3991/3994 (candidate for an M11-4-style iterator
+      refactor rather than a direct test, if the loop turns out to have the
+      same timeout-proneness as the Tier 2 manual-loop cases).
+- [ ] M13-9: `stamp_and_verify` — one boundary-condition mutant.
+- [ ] M13-10: Final verification — a scoped `cargo mutants -f
+      crates/tpu-mcp/src/tools.rs` run (nextest tool) confirming the
+      before/after missed-mutant count, matching the before/after table
+      style used in Milestones 11 and 12; document any mutants accepted as
+      equivalent with the same rigor.
+
+**Approach (carried over from M11/M12 methodology):** get a fresh deduped
+missed-mutant list for this file specifically (line numbers in the
+2026-09-08 baseline may have drifted since), read each site, prefer
+MCP-request-level integration tests (this file's own test suite already has
+the scaffolding for constructing and sending requests to a running worker),
+watch for the same recurring patterns already seen twice now — an operand
+that's only ever tested in combination with another truthy operand,
+disjoint-bitmask `|`-vs-`^` equivalence, and boundary conditions masked by
+an unrelated early guard — and verify empirically with a real scoped
+`cargo mutants` run rather than assuming a fix works from inspection alone.
+
+**Status:** Not started.
+

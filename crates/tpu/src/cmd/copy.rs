@@ -440,11 +440,10 @@ fn copy_one(
             }
             Ok(())
         };
-    if dst.exists() && opts.overwrite {
-        return do_atomic_copy(&mut *report, shell);
-    }
-    // New file: also use temp+rename to avoid leaving a corrupt partial file
-    // if the copy fails after the destination has been created/opened.
+    // The `dst.exists() && !opts.overwrite` case already returned above, so
+    // by construction here either `dst` doesn't exist or `overwrite` is
+    // true; either way the copy proceeds identically via temp+rename to
+    // avoid leaving a corrupt partial file behind.
     do_atomic_copy(&mut *report, shell)
 }
 
@@ -488,4 +487,305 @@ fn rename_replacing(from: &Path, to: &Path) -> std::io::Result<()> {
 
 fn is_glob(spec: &str) -> bool {
     spec.contains('*') || spec.contains('?') || spec.contains('[') || spec.contains('{')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+        let p = dir.join(name);
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    fn shell() -> Shell {
+        Shell::from_write(Box::new(Vec::new()))
+    }
+
+    // ── normalize_lexical ────────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_lexical_resolves_parent_and_current_dir_components() {
+        assert_eq!(
+            normalize_lexical(Path::new("a/b/../c")),
+            PathBuf::from("a/c")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("a/./b/./c")),
+            PathBuf::from("a/b/c")
+        );
+        assert_eq!(
+            normalize_lexical(Path::new("other/../src/dst")),
+            PathBuf::from("src/dst"),
+            "the exact scenario this function exists to handle"
+        );
+    }
+
+    // ── canon_nearest ────────────────────────────────────────────────────────
+
+    #[test]
+    fn canon_nearest_of_existing_path_is_its_canonical_form() {
+        let tmp = TempDir::new().unwrap();
+        let p = write(tmp.path(), "a.txt", b"x");
+        assert_eq!(canon_nearest(&p), fs::canonicalize(&p).unwrap());
+    }
+
+    #[test]
+    fn canon_nearest_of_nonexistent_tail_canonicalises_existing_ancestor() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("real")).unwrap();
+        let nonexistent = tmp.path().join("real").join("does_not_exist").join("x");
+        let result = canon_nearest(&nonexistent);
+        let expected = fs::canonicalize(tmp.path().join("real"))
+            .unwrap()
+            .join("does_not_exist")
+            .join("x");
+        assert_eq!(result, expected);
+    }
+
+    // ── is_same_file ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_same_file_true_for_identical_path_false_for_different_files() {
+        let tmp = TempDir::new().unwrap();
+        let a = write(tmp.path(), "a.txt", b"x");
+        let b = write(tmp.path(), "b.txt", b"x");
+        assert!(is_same_file(&a, &a));
+        assert!(!is_same_file(&a, &b));
+    }
+
+    #[test]
+    fn is_same_file_true_via_different_relative_paths_to_same_file() {
+        let tmp = TempDir::new().unwrap();
+        let a = write(tmp.path(), "a.txt", b"x");
+        let via_dot = tmp.path().join(".").join("a.txt");
+        assert!(is_same_file(&a, &via_dot));
+    }
+
+    #[test]
+    fn is_same_file_false_when_one_path_does_not_exist() {
+        let tmp = TempDir::new().unwrap();
+        let a = write(tmp.path(), "a.txt", b"x");
+        let missing = tmp.path().join("missing.txt");
+        assert!(!is_same_file(&a, &missing));
+    }
+
+    // ── is_glob ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_glob_recognizes_each_indicator_character_independently() {
+        assert!(is_glob("a*.txt"));
+        assert!(is_glob("a?.txt"));
+        assert!(is_glob("a[1].txt"));
+        assert!(is_glob("a{1}.txt"));
+        assert!(!is_glob("plain.txt"));
+    }
+
+    // ── run: glob destination-must-be-a-directory guard ─────────────────────
+
+    #[test]
+    fn glob_copy_rejects_existing_non_directory_destination() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "src/a.txt", b"x");
+        let dest = write(tmp.path(), "dest_file.txt", b"already a file");
+        let source = tmp.path().join("src").join("*.txt");
+        let err = run(
+            &source.to_string_lossy(),
+            &dest,
+            CopyOptions::default(),
+            &mut shell(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("requires DEST to be a directory"));
+    }
+
+    // ── run: destination-inside-source recursion guard ──────────────────────
+
+    #[test]
+    fn recursive_copy_rejects_destination_strictly_inside_source() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        fs::create_dir(&src).unwrap();
+        write(tmp.path(), "src/a.txt", b"x");
+        // dest is a proper subdirectory of src: `starts_with` is true but
+        // the paths are not `==` -- this is the case that distinguishes
+        // `||` from `&&` in the guard.
+        let dest = src.join("nested_dest");
+        let err = run(
+            &src.to_string_lossy(),
+            &dest,
+            CopyOptions {
+                recursive: true,
+                ..Default::default()
+            },
+            &mut shell(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("would loop indefinitely"));
+    }
+
+    // ── run: single-file destination parent-directory creation ──────────────
+
+    #[test]
+    fn single_file_copy_creates_missing_parent_directories() {
+        let tmp = TempDir::new().unwrap();
+        let src = write(tmp.path(), "a.txt", b"hello");
+        let dest = tmp.path().join("newdir").join("sub").join("a.txt");
+        assert!(!dest.parent().unwrap().exists());
+        let report = run(
+            &src.to_string_lossy(),
+            &dest,
+            CopyOptions::default(),
+            &mut shell(),
+        )
+        .unwrap();
+        assert_eq!(report.copied, 1);
+        assert_eq!(fs::read(&dest).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn single_file_copy_to_bare_filename_does_not_error_on_empty_parent() {
+        // A destination with no directory component at all has an empty
+        // `parent()`; `create_dir_all` must not be attempted for it.
+        let tmp = TempDir::new().unwrap();
+        let src = write(tmp.path(), "a.txt", b"hello");
+        let prev = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = run(
+            &src.to_string_lossy(),
+            Path::new("bare_dest.txt"),
+            CopyOptions::default(),
+            &mut shell(),
+        );
+        std::env::set_current_dir(prev).unwrap();
+        let report = result.unwrap();
+        assert_eq!(report.copied, 1);
+    }
+
+    // ── run: single-file copy always fails fast regardless of on_error ──────
+
+    #[test]
+    fn single_file_copy_propagates_errors_even_in_warn_mode() {
+        // The single-file (non-glob) path forces `on_error: Fail` for its
+        // inner `copy_one` call regardless of the caller's own `on_error`,
+        // since there is no "next entry" to continue on to.
+        let tmp = TempDir::new().unwrap();
+        let missing_src = tmp.path().join("does_not_exist.txt");
+        let dest = tmp.path().join("dest.txt");
+        let err = run(
+            &missing_src.to_string_lossy(),
+            &dest,
+            CopyOptions {
+                on_error: OnError::Warn,
+                ..Default::default()
+            },
+            &mut shell(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("does_not_exist.txt"));
+    }
+
+    // ── run / copy_one: report counter precision ─────────────────────────────
+
+    #[test]
+    fn glob_copy_report_counts_are_exact() {
+        let tmp = TempDir::new().unwrap();
+        write(tmp.path(), "src/a.txt", b"1");
+        write(tmp.path(), "src/b.txt", b"2");
+        write(tmp.path(), "src/c.txt", b"3");
+        let dest = tmp.path().join("dest");
+        let source = tmp.path().join("src").join("*.txt");
+        let report = run(
+            &source.to_string_lossy(),
+            &dest,
+            CopyOptions::default(),
+            &mut shell(),
+        )
+        .unwrap();
+        assert_eq!(report.copied, 3);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(report.warnings, 0);
+    }
+
+    #[test]
+    fn glob_copy_matching_nothing_is_an_error() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        let dest = tmp.path().join("dest");
+        let source = tmp.path().join("src").join("*.txt");
+        let err = run(
+            &source.to_string_lossy(),
+            &dest,
+            CopyOptions::default(),
+            &mut shell(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("matched no files"));
+    }
+
+    #[test]
+    fn copy_one_skips_existing_destination_without_overwrite() {
+        let tmp = TempDir::new().unwrap();
+        let src = write(tmp.path(), "a.txt", b"new");
+        let dest = write(tmp.path(), "b.txt", b"old");
+        let mut report = CopyReport::default();
+        copy_one(
+            &src,
+            &dest,
+            &CopyOptions::default(),
+            &mut shell(),
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.copied, 0);
+        assert_eq!(fs::read(&dest).unwrap(), b"old", "must not overwrite");
+    }
+
+    #[test]
+    fn copy_one_overwrites_when_requested() {
+        let tmp = TempDir::new().unwrap();
+        let src = write(tmp.path(), "a.txt", b"new");
+        let dest = write(tmp.path(), "b.txt", b"old");
+        let mut report = CopyReport::default();
+        copy_one(
+            &src,
+            &dest,
+            &CopyOptions {
+                overwrite: true,
+                ..Default::default()
+            },
+            &mut shell(),
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(report.copied, 1);
+        assert_eq!(report.skipped, 0);
+        assert_eq!(fs::read(&dest).unwrap(), b"new");
+    }
+
+    #[test]
+    fn copy_one_same_file_is_skipped_not_copied() {
+        let tmp = TempDir::new().unwrap();
+        let a = write(tmp.path(), "a.txt", b"x");
+        let mut report = CopyReport::default();
+        copy_one(
+            &a,
+            &a,
+            &CopyOptions {
+                overwrite: true,
+                ..Default::default()
+            },
+            &mut shell(),
+            &mut report,
+        )
+        .unwrap();
+        assert_eq!(report.skipped, 1);
+        assert_eq!(report.copied, 0);
+    }
 }

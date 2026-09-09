@@ -22,17 +22,16 @@ use tpu::IoMode;
 // the lib and bin crate contexts) can use `crate::open_as_branch` etc.
 pub use tpu::git;
 pub use tpu::{
-    atomic_create_new, atomic_write, open_as_branch, read_raw_bytes, recover_stranded_backup,
-    retry_io,
+    atomic_create_new, atomic_write, open_as_branch, open_source, read_raw_bytes, read_text_file,
+    recover_stranded_backup, retry_io, source_from_branch, source_from_branch_with_policy,
 };
 
 /// Resolve the line-ending override for a mutating write
 /// (`write`/`replace`/`edit`/`append`).
 ///
 /// Thin wrapper over [`tpu::git::resolve_write_override`] (shared with
-/// `tpu-mcp`): an explicit `--line-ending` always wins; otherwise, when
-/// git-EOL normalisation is enabled (`--eol-normalize` + `--git-root`), the
-/// override is git's expected convention for `file`.
+/// `tpu-mcp`): parses an explicit `--line-ending`; otherwise mutating commands
+/// discover and apply complete Git policy themselves.
 fn resolve_write_line_ending(
     explicit: Option<&str>,
     file: &std::path::Path,
@@ -102,29 +101,23 @@ struct Cli {
     )]
     on_error: String,
 
-    /// Opt in to git-aware line-ending checks against the repository rooted
-    /// at this directory (no upward discovery is performed).
+    /// Pin read-side Git EOL checks and `doctor` to this repository.
     ///
-    /// When set, read-side commands (`read`/`readex`/`head`/`tail`) emit a
+    /// Repository discovery is automatic when this option is omitted. When
+    /// set, read-side commands (`read`/`readex`/`head`/`tail`) emit a
     /// `note: <path>: line endings (...) differ from git's expected ...`
     /// advisory whenever a file's on-disk line endings disagree with what
     /// git would materialise for that path (per `.gitattributes` and
-    /// `core.autocrlf` / `core.eol`).  `tpu doctor --git-root <DIR>` reports
-    /// and (with `--fix`) repairs such mismatches.  This is entirely opt-in:
-    /// without this flag, no git state is consulted.
+    /// `core.autocrlf` / `core.eol`). `tpu doctor` reports and (with `--fix`)
+    /// repairs such mismatches.
     #[arg(long, global = true, value_name = "DIR")]
     git_root: Option<PathBuf>,
 
     /// Normalise line endings to git's expected convention on mutating
     /// writes (`write`/`replace`/`edit`/`append`).
     ///
-    /// Off by default.  Only takes effect when `--git-root <DIR>` is also
-    /// supplied and the caller did not pass an explicit `--line-ending`.
-    /// When enabled, the target file's line endings are denormalised to
-    /// whatever git would materialise for that path (per `.gitattributes`
-    /// and `core.autocrlf` / `core.eol`).  Can also be enabled via the
-    /// `TPU_EOL_NORMALIZE` environment variable (forwarded by the VS Code
-    /// extension's `tpu-mcp.normalizeLineEndings` setting).
+    /// Retained for compatibility. Definite Git policy is now discovered and
+    /// applied automatically unless the caller passes `--line-ending`.
     #[arg(long, global = true)]
     eol_normalize: bool,
 
@@ -303,9 +296,9 @@ enum Commands {
         #[arg(long)]
         diff: bool,
 
-        /// Override the output line ending.  Without this flag the file's
-        /// dominant line-ending convention is preserved.  Conflicts with
-        /// --binary (binary mode does no line-ending processing).
+        /// Override the output line ending. Without this flag definite Git
+        /// policy applies, or the file's dominant convention is preserved.
+        /// Conflicts with --binary (binary mode does no line-ending processing).
         #[arg(long, conflicts_with = "binary", value_name = "ENDING",
               value_parser = ["lf", "crlf", "cr"])]
         line_ending: Option<String>,
@@ -319,20 +312,20 @@ enum Commands {
         allow_mojibake: bool,
     },
 
-    /// Create a NEW file, writing UTF-8/LF text to it.
+    /// Create a NEW text file.
     ///
     /// Like `write`, but fails if the target path already exists so an
     /// existing file is never overwritten; use `write` to overwrite.  Parent
     /// directories are created as needed.
     ///
-    /// New files are UTF-8 with LF line endings by default.  Use --utf8 to
-    /// force UTF-8 output and --bom to control a UTF-8 BOM, and --line-ending
-    /// to force CRLF/CR.
+    /// Git `working-tree-encoding` and definite EOL policy apply automatically;
+    /// otherwise new files use UTF-8/LF. Use --utf8 or --line-ending to
+    /// override those defaults.
     Create {
         /// File to create.  Must not already exist.
         file: PathBuf,
 
-        /// Force UTF-8 output encoding (the default for new files).
+        /// Force UTF-8 output encoding.
         #[arg(long)]
         utf8: bool,
 
@@ -353,9 +346,8 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         data: Option<String>,
 
-        /// Override the output line ending.  Without this flag the new file
-        /// uses LF (or git's convention when --eol-normalize and --git-root
-        /// are in effect).
+        /// Override the output line ending. Without this flag definite Git
+        /// policy applies, or LF is used outside a repository.
         #[arg(long, value_name = "ENDING", value_parser = ["lf", "crlf", "cr"])]
         line_ending: Option<String>,
 
@@ -446,8 +438,8 @@ enum Commands {
         #[arg(long, conflicts_with = "count")]
         dry_run: bool,
 
-        /// Override the output line ending.  Without this flag the file's
-        /// dominant line-ending convention is preserved.
+        /// Override the output line ending. Without this flag definite Git
+        /// policy applies, or the file's dominant convention is preserved.
         #[arg(long, value_name = "ENDING", value_parser = ["lf", "crlf", "cr"])]
         line_ending: Option<String>,
 
@@ -519,8 +511,9 @@ enum Commands {
         #[arg(long)]
         diff: bool,
 
-        /// Override the output line ending in text mode.  Without this flag
-        /// the file's dominant line-ending convention is preserved.
+        /// Override the output line ending in text mode. Without this flag
+        /// definite Git policy applies, or the file's dominant convention is
+        /// preserved.
         /// Conflicts with --binary.
         #[arg(long, conflicts_with = "binary", value_name = "ENDING",
               value_parser = ["lf", "crlf", "cr"])]
@@ -700,12 +693,11 @@ enum Commands {
         dest_header: Option<String>,
     },
 
-    /// Append content to an existing file, preserving its encoding and line endings.
+    /// Append content to an existing text file.
     ///
-    /// The file's native encoding (UTF-8, UTF-16LE/BE, Windows-1252, …) and
-    /// dominant line-ending convention are detected and the new content is
-    /// re-encoded to match before being appended atomically.  The original file
-    /// is renamed to <file>.bak before the new content is written.
+    /// Git worktree encoding and definite EOL policy apply automatically;
+    /// otherwise the file's detected encoding and dominant line ending are
+    /// preserved. The original file is renamed to <file>.bak before writing.
     ///
     /// When --data is omitted, content is read from stdin (UTF-8/LF).
     Append {
@@ -735,9 +727,9 @@ enum Commands {
         #[arg(long)]
         diff: bool,
 
-        /// Override the line ending used for the appended content and the
-        /// re-encoded combined file.  Without this flag the file's dominant
-        /// line-ending convention is used.
+        /// Override the line ending used for the combined file. Without this
+        /// flag definite Git policy applies, or the file's dominant convention
+        /// is preserved.
         #[arg(long, value_name = "ENDING", value_parser = ["lf", "crlf", "cr"])]
         line_ending: Option<String>,
 
@@ -935,8 +927,7 @@ enum Commands {
         ///          better.
         ///
         ///   eol  — normalise the line endings of any git-EOL-mismatched
-        ///          file to git's expected convention.  Requires
-        ///          `--git-root <DIR>`.
+        ///          file to git's expected convention.
         ///
         ///   all  — apply both `peel` and `eol`.
         ///
@@ -1044,13 +1035,17 @@ enum Commands {
     },
 }
 
+/// Worker-thread stack size: 16 MiB, generous headroom for clap's
+/// stack-heavy debug-time argument validation on a command tree this large.
+const WORKER_STACK_SIZE: usize = 16 * 1024 * 1024;
+
 fn main() {
     // clap's argument parsing and debug-time validation are stack-heavy for a
     // command tree this large; in debug builds that can overflow Windows'
     // small (1 MiB) main-thread stack.  Run everything on a worker thread with
     // a generous stack so the tool stays robust as more subcommands are added.
     let worker = std::thread::Builder::new()
-        .stack_size(16 * 1024 * 1024)
+        .stack_size(WORKER_STACK_SIZE)
         .spawn(real_main)
         .expect("spawn tpu worker thread");
     if worker.join().is_err() {
@@ -1107,6 +1102,20 @@ fn real_main() {
     }
 }
 
+/// Whether to print the automatic Git line-ending advisory: enabled outside
+/// JSON mode, where stderr must stay silent so the NDJSON stream on stdout
+/// isn't corrupted by an interleaved warning line.
+fn eol_advisory_enabled_for(json_mode: bool) -> bool {
+    !json_mode
+}
+
+/// Whether EOL normalization is requested, via either the `--eol-normalize`
+/// flag or the `TPU_EOL_NORMALIZE` env var (kept for compatibility with
+/// older callers).
+fn eol_normalize_requested(cli_flag: bool, env_var_set: bool) -> bool {
+    cli_flag || env_var_set
+}
+
 fn run(
     cli: Cli,
     shell: &mut Shell,
@@ -1120,19 +1129,15 @@ fn run(
     let mojibake_advisory_enabled = !cli.no_mojibake_warning
         && std::env::var_os("TPU_NO_MOJIBAKE_WARNING").is_none()
         && !json_mode;
-    // Opt-in git line-ending advisory root.  Silenced in JSON mode (stderr is
-    // quiet there and the note would otherwise be lost).  `None` disables all
-    // git-aware read-side checks.
-    let eol_advisory_root: Option<PathBuf> = if json_mode {
-        None
-    } else {
-        cli.git_root.clone()
-    };
-    // Write-time line-ending normalisation (default off).  Enabled by the
-    // `--eol-normalize` flag or the `TPU_EOL_NORMALIZE` environment variable
-    // (the VS Code extension forwards its `tpu-mcp.normalizeLineEndings` setting
-    // this way).  Only takes effect when `--git-root` is also supplied.
-    let eol_normalize = cli.eol_normalize || std::env::var_os("TPU_EOL_NORMALIZE").is_some();
+    // Git line-ending advisories are automatic outside JSON mode. An explicit
+    // root remains supported for callers that need to pin repository context.
+    let eol_advisory_enabled = eol_advisory_enabled_for(json_mode);
+    // Kept for compatibility with existing callers; Git policy is now applied
+    // automatically by the shared resolver and command implementations.
+    let eol_normalize = eol_normalize_requested(
+        cli.eol_normalize,
+        std::env::var_os("TPU_EOL_NORMALIZE").is_some(),
+    );
     let on_error_mode = match cli.on_error.as_str() {
         "fail" => cmd::copy::OnError::Fail,
         _ => cmd::copy::OnError::Warn,
@@ -1221,8 +1226,12 @@ fn run(
                     IoMode::Mmap,
                     notes,
                 )?;
-                if let Some(ref root) = eol_advisory_root {
-                    let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                if eol_advisory_enabled {
+                    if let Some(ref root) = cli.git_root {
+                        let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                    } else {
+                        let _ = tpu::git::emit_eol_advisory_auto(&mut notes_buf, &file);
+                    }
                 }
                 if !notes_buf.is_empty() {
                     let _ = shell.err().write_all(&notes_buf);
@@ -1651,8 +1660,12 @@ fn run(
                         None
                     };
                     cmd::tail::run(&file, mode, &mut buf, IoMode::Mmap, notes)?;
-                    if let Some(ref root) = eol_advisory_root {
-                        let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                    if eol_advisory_enabled {
+                        if let Some(ref root) = cli.git_root {
+                            let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                        } else {
+                            let _ = tpu::git::emit_eol_advisory_auto(&mut notes_buf, &file);
+                        }
                     }
                     if !notes_buf.is_empty() {
                         let _ = shell.err().write_all(&notes_buf);
@@ -1696,8 +1709,12 @@ fn run(
                         None
                     };
                     cmd::head::run(&file, mode, &mut buf, IoMode::Mmap, notes)?;
-                    if let Some(ref root) = eol_advisory_root {
-                        let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                    if eol_advisory_enabled {
+                        if let Some(ref root) = cli.git_root {
+                            let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                        } else {
+                            let _ = tpu::git::emit_eol_advisory_auto(&mut notes_buf, &file);
+                        }
                     }
                     if !notes_buf.is_empty() {
                         let _ = shell.err().write_all(&notes_buf);
@@ -1776,8 +1793,12 @@ fn run(
                     IoMode::Mmap,
                     notes,
                 )?;
-                if let Some(ref root) = eol_advisory_root {
-                    let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                if eol_advisory_enabled {
+                    if let Some(ref root) = cli.git_root {
+                        let _ = tpu::git::emit_eol_advisory(&mut notes_buf, root, &file);
+                    } else {
+                        let _ = tpu::git::emit_eol_advisory_auto(&mut notes_buf, &file);
+                    }
                 }
                 if !notes_buf.is_empty() {
                     let _ = shell.err().write_all(&notes_buf);
@@ -2061,18 +2082,6 @@ fn run(
             };
             let fix_eol = matches!(fix.as_deref(), Some("eol") | Some("all"));
 
-            // `--fix=eol`/`--fix=all` can only normalise line endings against a
-            // repository's expected convention, which requires `--git-root`.
-            // Without it the eol portion would silently do nothing, so reject
-            // the combination up front (mirrors the tpu-mcp `tpu_doctor` guard).
-            if fix_eol && cli.git_root.is_none() {
-                return Err(format!(
-                    "doctor: --fix={} normalises line endings and requires --git-root <DIR>",
-                    fix.as_deref().unwrap_or("eol")
-                )
-                .into());
-            }
-
             // Buffer the doctor output and route it through the standard
             // `Output` channel so JSON / human modes both work uniformly.
             let mut buf: Vec<u8> = Vec::new();
@@ -2250,7 +2259,28 @@ fn parse_data_length(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_data_length;
+    use super::{
+        WORKER_STACK_SIZE, eol_advisory_enabled_for, eol_normalize_requested, parse_data_length,
+    };
+
+    #[test]
+    fn worker_stack_size_is_16_mib() {
+        assert_eq!(WORKER_STACK_SIZE, 16 * 1024 * 1024);
+    }
+
+    #[test]
+    fn eol_advisory_enabled_outside_json_mode() {
+        assert!(eol_advisory_enabled_for(false));
+        assert!(!eol_advisory_enabled_for(true));
+    }
+
+    #[test]
+    fn eol_normalize_requested_each_operand_independently() {
+        assert!(!eol_normalize_requested(false, false));
+        assert!(eol_normalize_requested(true, false));
+        assert!(eol_normalize_requested(false, true));
+        assert!(eol_normalize_requested(true, true));
+    }
 
     // ── Decimal inputs ────────────────────────────────────────────────────────
 

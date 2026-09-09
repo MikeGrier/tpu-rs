@@ -120,7 +120,7 @@
                 "tpu-mcp.normalizeLineEndings": {
                     "type": "boolean",
                     "default": false,
-                    "markdownDescription": "When enabled, mutating tools (`tpu_write_file`, `tpu_replace_in_file`, `tpu_edit_file`, `tpu_append_file`) given a `git_root` argument denormalise line endings to git's expected convention for the target path (per `.gitattributes` / `core.autocrlf` / `core.eol`) unless an explicit `line_ending` is supplied. **Off by default** so writes never silently rewrite line endings without opt-in. Detection on reads and `tpu_doctor` reporting/repair are always available via the per-call `git_root` argument and are not affected by this setting. Forwarded to the server via the `TPU_EOL_NORMALIZE` environment variable."
+                    "markdownDescription": "Legacy compatibility setting. TPU now automatically discovers Git worktree policy and applies definite `.gitattributes` / `core.autocrlf` / `core.eol` line endings unless an explicit `line_ending` is supplied."
                 }
             }
         }

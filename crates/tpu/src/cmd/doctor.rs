@@ -86,7 +86,7 @@
 //! exit decision lives in `main.rs`.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     error::Error,
     fs,
     io::Write,
@@ -94,10 +94,8 @@ use std::{
     sync::Arc,
 };
 
-use harrier::{
-    encoding::{LineEnding, SourceConfig},
-    source::Source,
-};
+#[cfg(test)]
+use harrier::encoding::LineEnding;
 use serde_json::json;
 
 use crate::{
@@ -192,8 +190,7 @@ pub struct DoctorIssue {
     /// `true` once the file has been rewritten with `peel_suggested`.
     pub repaired: bool,
     /// `Some(_)` when the file's on-disk line endings disagree with git's
-    /// expected working-tree convention for that path.  Only populated when a
-    /// `git_root` was supplied to [`run_with_policy`].
+    /// expected working-tree convention for that path.
     pub eol_mismatch: Option<EolMismatch>,
     /// `true` once the file's line endings have been normalised to git's
     /// expectation under `--fix=eol` / `--fix=all`.
@@ -408,6 +405,10 @@ fn load_gitignore(root: &Path) -> Option<GlobMatcher> {
 
 /// Run encoding + mojibake diagnostics for a single file.
 ///
+/// `git_policy` must already be resolved for `path` (see
+/// [`git::resolve_policies`]) — this function performs no gitoxide calls of
+/// its own, which is what makes it safe to invoke from parallel workers.
+///
 /// Returns `Ok(None)` for a clean file (and the file is not included in
 /// the report), `Ok(Some(issue))` when there is anything to report, and
 /// `Err` for I/O / open failures.
@@ -415,10 +416,10 @@ fn diagnose_file(
     path: &Path,
     io_mode: IoMode,
     guess: bool,
-    git: Option<&git::GitEol>,
+    git_policy: &git::FilePolicy,
 ) -> Result<Option<DoctorIssue>, Box<dyn Error>> {
     let branch = crate::open_as_branch(path, io_mode)?;
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
+    let source = crate::source_from_branch_with_policy(path, Arc::clone(&branch), git_policy)?;
     let encoding = source.encoding();
 
     // Read raw bytes through the same I/O mode so behaviour is identical
@@ -427,18 +428,7 @@ fn diagnose_file(
     let bom_len = source.bom_len();
     let body = &raw[bom_len.min(raw.len())..];
 
-    // Git line-ending mismatch is an independent diagnostic class: it is
-    // evaluated against the raw bytes and is orthogonal to mojibake.  Best
-    // effort — any git error yields `None`.  UTF-16 is skipped entirely:
-    // its line endings are multi-byte (e.g. `0D 00 0A 00`), so the byte-level
-    // CR/LF statistics are unreliable and `apply_eol_fix` cannot repair them
-    // anyway — reporting a mismatch we can neither trust nor fix would only
-    // mislead.
-    let eol_mismatch = if is_utf16(encoding.name()) {
-        None
-    } else {
-        git.and_then(|g| g.detect(path, &raw).ok().flatten())
-    };
+    let eol_mismatch = git::detect_with_policy(git_policy, &raw);
 
     // ── UTF-8 preference guard ──────────────────────────────────────────
     //
@@ -458,7 +448,8 @@ fn diagnose_file(
     // bail out if the body contains a NUL byte — real UTF-8 text never does,
     // but UTF-16/binary content does.
     let detected_name = encoding.name();
-    let prefer_utf8 = detected_name != "UTF-8"
+    let prefer_utf8 = git_policy.working_tree_encoding.is_none()
+        && detected_name != "UTF-8"
         && !detected_name.starts_with("UTF-16")
         && !body.contains(&0u8)
         && std::str::from_utf8(body).is_ok();
@@ -704,21 +695,35 @@ fn annotate_replacement_char_matches(
 
 /// Apply `peel_suggested` to the file via [`crate::cmd::write::run`].
 ///
-/// The peeled string is, by construction, *recovered UTF-8 text* (the
-/// reverse of "valid UTF-8 misread as Windows-1252").  It is therefore
-/// written with [`OutputEncoding::Utf8`] rather than `Preserve`: re-encoding
-/// recovered UTF-8 back into the file's *previously detected* encoding is
-/// exactly the lossy step that can turn characters absent from that code
-/// page (box-drawing, arrows, …) into `U+FFFD`.  Writing UTF-8 keeps the
-/// repair lossless and idempotent.  Updates `issue.repaired` on success.
-fn apply_peel(issue: &mut DoctorIssue, io_mode: IoMode) -> Result<(), Box<dyn Error>> {
+/// `git_policy` must already be resolved for `issue.path` (see
+/// [`git::resolve_policies`]); this avoids re-resolving it here for the
+/// `output_encoding` decision and the post-write re-check. Note that
+/// [`crate::cmd::write::run`] itself still resolves policy once more
+/// internally to perform the actual write — that single-file write path is
+/// shared with every other mutating command and is unaffected by this
+/// function's multi-file caller.
+///
+/// The peeled string is recovered Unicode text. A declared Git worktree
+/// encoding remains authoritative and is encoded strictly; otherwise UTF-8
+/// keeps the repair lossless and idempotent. Updates `issue.repaired` and
+/// `issue.eol_repaired` when automatic Git policy changes both concerns.
+fn apply_peel(
+    issue: &mut DoctorIssue,
+    io_mode: IoMode,
+    git_policy: &git::FilePolicy,
+) -> Result<(), Box<dyn Error>> {
     let Some(peeled) = issue.peel_suggested.clone() else {
         return Ok(());
+    };
+    let output_encoding = if git_policy.working_tree_encoding.is_some() {
+        OutputEncoding::Preserve
+    } else {
+        OutputEncoding::Utf8
     };
     crate::cmd::write::run(
         &issue.path,
         &peeled,
-        OutputEncoding::Utf8,
+        output_encoding,
         BomPolicy::default(),
         None,
         None,
@@ -726,39 +731,25 @@ fn apply_peel(issue: &mut DoctorIssue, io_mode: IoMode) -> Result<(), Box<dyn Er
         mojibake::WritePolicy::permissive(),
     )?;
     issue.repaired = true;
+    if issue.eol_mismatch.is_some() {
+        let repaired = crate::read_raw_bytes(&issue.path, io_mode)?;
+        issue.eol_repaired = git::detect_with_policy(git_policy, &repaired).is_none();
+    }
     Ok(())
-}
-
-/// Whether a harrier encoding name denotes a UTF-16 variant (`UTF-16LE` /
-/// `UTF-16BE`).  Centralised so the detection-skip in [`diagnose_file`] and the
-/// repair-skip in [`apply_eol_fix`] stay in lock-step: UTF-16's multi-byte line
-/// endings make the byte-level EOL pass both unreliable to detect and unsafe to
-/// rewrite.
-fn is_utf16(encoding_name: &str) -> bool {
-    encoding_name.starts_with("UTF-16")
 }
 
 /// Normalise a git-EOL-mismatched file's line endings to git's expected
 /// convention, preserving its encoding, BOM, and all other bytes.
-///
-/// The transform operates at the byte level and is only correct for
-/// ASCII-transparent encodings (UTF-8, Windows-1252, Shift-JIS, …) where the
-/// `0x0D` / `0x0A` line-ending bytes never appear inside a multi-byte
-/// character.  UTF-16 never reaches the rewrite path: [`diagnose_file`] skips
-/// it during detection (`eol_mismatch` is always `None`), so UTF-16 EOL
-/// mismatches are neither reported nor repaired.  The `is_utf16` guard below
-/// is therefore a belt-and-suspenders no-op that keeps the two code paths in
-/// lock-step.  Sets `issue.eol_repaired` only when bytes were actually
-/// rewritten.
+/// Sets `issue.eol_repaired` only when bytes were actually rewritten.
 fn apply_eol_fix(issue: &mut DoctorIssue, io_mode: IoMode) -> Result<(), Box<dyn Error>> {
     let Some(mismatch) = issue.eol_mismatch else {
         return Ok(());
     };
-    if is_utf16(issue.encoding_detected) {
-        return Ok(());
-    }
     let raw = crate::read_raw_bytes(&issue.path, io_mode)?;
-    let converted = normalize_eol_bytes(&raw, mismatch.expected);
+    let encoding = encoding_rs::Encoding::for_label(issue.encoding_detected.as_bytes())
+        .ok_or_else(|| format!("doctor: unknown encoding {}", issue.encoding_detected))?;
+    let converted =
+        crate::encoding::apply_line_ending_to_all(raw.clone(), encoding, mismatch.expected);
     if converted == raw {
         // No bytes changed — don't claim a repair (keeps the "N repaired"
         // count and the `[NORMALIZED]` tag honest).
@@ -784,40 +775,6 @@ fn apply_eol_fix(issue: &mut DoctorIssue, io_mode: IoMode) -> Result<(), Box<dyn
     }
     issue.eol_repaired = true;
     Ok(())
-}
-
-/// Rewrite every line ending in `bytes` to `target`, leaving all other bytes
-/// (including any BOM) untouched.  CRLF, lone CR, and lone LF are all coalesced
-/// to a single `target` terminator.
-fn normalize_eol_bytes(bytes: &[u8], target: LineEnding) -> Vec<u8> {
-    let term: &[u8] = match target {
-        LineEnding::Lf => b"\n",
-        LineEnding::CrLf => b"\r\n",
-        LineEnding::Cr => b"\r",
-    };
-    let mut out = Vec::with_capacity(bytes.len() + 8);
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\r' => {
-                out.extend_from_slice(term);
-                if bytes.get(i + 1) == Some(&b'\n') {
-                    i += 2;
-                } else {
-                    i += 1;
-                }
-            }
-            b'\n' => {
-                out.extend_from_slice(term);
-                i += 1;
-            }
-            b => {
-                out.push(b);
-                i += 1;
-            }
-        }
-    }
-    out
 }
 
 // ── Public entry point ──────────────────────────────────────────────────────
@@ -848,10 +805,35 @@ pub fn run(
 /// Variant of [`run`] that accepts an explicit walk-error policy and a
 /// sink for per-entry warnings (for inaccessible directories).
 ///
-/// `git_root`, when `Some`, opts in to git-aware line-ending diagnostics
-/// against the repository rooted there (no upward discovery).  `fix_eol`
-/// additionally normalises any mismatched file's line endings to git's
-/// expected convention (a no-op when `git_root` is `None`).
+/// Git policy is discovered automatically for every file. `git_root` is
+/// retained as a compatibility-only hint and does not override nearest-repo
+/// discovery. `fix_eol` normalises mismatches to each file's Git policy.
+///
+/// ## Processing model
+///
+/// This follows the enumerate → resolve → parallelize pipeline documented on
+/// [`git::resolve_policies`]:
+///
+/// 1. [`expand_paths_with_policy`] enumerates the matched files.
+/// 2. [`git::resolve_policies`] resolves each file's Git policy
+///    **sequentially**, in enumeration order — every gitoxide call this
+///    function makes happens here, on this one thread.
+/// 3. Per-file diagnosis ([`diagnose_file`]) runs against the resulting
+///    owned policies, in parallel across [`std::thread::available_parallelism`]
+///    workers when there is more than one file to diagnose. Each worker
+///    reads only its own pre-resolved [`git::FilePolicy`] values and never
+///    calls back into gitoxide.
+/// 4. Repair (`--fix=peel` / `fix_eol`) runs sequentially afterward, over the
+///    already-diagnosed issues, reusing the same resolved policies.
+///
+/// As documented on [`git::resolve_policies`], policy is resolved
+/// independently per path with no whole-batch `.gitattributes` snapshot: a
+/// concurrent attribute edit during a large scan may cause some files in the
+/// same call to see different policy than others. A per-file policy
+/// resolution failure is downgraded to a warning (falling back to
+/// [`git::FilePolicy::default`] — i.e. "no Git policy applies") rather than
+/// aborting the scan; Git policy is an enhancement to diagnosis, not a
+/// precondition for it.
 #[allow(clippy::too_many_arguments)]
 pub fn run_with_policy(
     path_specs: &[&str],
@@ -860,7 +842,7 @@ pub fn run_with_policy(
     io_mode: IoMode,
     on_error: crate::cmd::copy::OnError,
     warnings_out: &mut Vec<String>,
-    git_root: Option<&Path>,
+    _git_root: Option<&Path>,
     fix_eol: bool,
 ) -> Result<DoctorReport, Box<dyn Error>> {
     let default = ["."];
@@ -870,24 +852,75 @@ pub fn run_with_policy(
         path_specs
     };
 
-    // Open the repository once (best effort).  A failure to open is downgraded
-    // to a warning so the rest of the scan proceeds without git awareness.
-    let git = match git_root {
-        Some(root) => match git::GitEol::open(root) {
-            Ok(g) => g,
-            Err(e) => {
-                warnings_out.push(format!("doctor: git root {}: {e}", root.display()));
-                None
-            }
-        },
-        None => None,
-    };
-
     let files = expand_paths_with_policy(specs, on_error, warnings_out)?;
     let mut report = DoctorReport::default();
 
-    for path in &files {
-        match diagnose_file(path, io_mode, options.guess, git.as_ref()) {
+    // ── Phase 1: sequential Git policy enrichment ─────────────────────────
+    //
+    // Every gitoxide call for this whole invocation happens in this single,
+    // sequential pass. Its output is plain owned data (`FilePolicy` is
+    // `Send + Sync`, holding no gitoxide handle), so phase 2 below can safely
+    // process files in parallel without any locking.
+    let policies: HashMap<PathBuf, git::FilePolicy> = git::resolve_policies(files.iter().cloned())
+        .into_iter()
+        .map(|resolved| {
+            let policy = resolved.policy.unwrap_or_else(|e| {
+                warnings_out.push(format!(
+                    "doctor: {}: git policy resolution failed ({e}); proceeding without Git policy",
+                    resolved.path.display()
+                ));
+                git::FilePolicy::default()
+            });
+            (resolved.path, policy)
+        })
+        .collect();
+
+    // ── Phase 2: per-file diagnosis, parallel-capable ─────────────────────
+    //
+    // Each slot in `outcomes` is written by exactly one thread, into a
+    // disjoint sub-slice obtained via `chunks_mut` — no mutex is needed for
+    // workers to report their results. Order is preserved (`outcomes[i]`
+    // always corresponds to `files[i]`), which keeps human/JSON output
+    // deterministic regardless of how work was scheduled.
+    let mut outcomes: Vec<Option<Result<Option<DoctorIssue>, String>>> =
+        (0..files.len()).map(|_| None).collect();
+
+    let worker_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(files.len().max(1));
+
+    let diagnose_slot = |path: &PathBuf, slot: &mut Option<Result<Option<DoctorIssue>, String>>| {
+        let git_policy = policies.get(path).cloned().unwrap_or_default();
+        *slot = Some(
+            diagnose_file(path, io_mode, options.guess, &git_policy).map_err(|e| e.to_string()),
+        );
+    };
+
+    if worker_count <= 1 {
+        for (path, slot) in files.iter().zip(outcomes.iter_mut()) {
+            diagnose_slot(path, slot);
+        }
+    } else {
+        let chunk_size = files.len().div_ceil(worker_count).max(1);
+        std::thread::scope(|scope| {
+            for (file_chunk, outcome_chunk) in files
+                .chunks(chunk_size)
+                .zip(outcomes.chunks_mut(chunk_size))
+            {
+                let diagnose_slot = &diagnose_slot;
+                scope.spawn(move || {
+                    for (path, slot) in file_chunk.iter().zip(outcome_chunk.iter_mut()) {
+                        diagnose_slot(path, slot);
+                    }
+                });
+            }
+        });
+    }
+
+    // ── Phase 3: sequential fold into the report ──────────────────────────
+    for (path, outcome) in files.iter().zip(outcomes) {
+        match outcome.expect("every file index is written exactly once in phase 2") {
             Ok(Some(issue)) => {
                 report.total_files_scanned += 1;
                 report.issues.push(issue);
@@ -917,35 +950,20 @@ pub fn run_with_policy(
         );
     }
 
+    // ── Phase 4: repair (sequential; reuses phase 1's resolved policies) ──
     if options.fix == DoctorFix::Peel {
         for issue in &mut report.issues {
-            if !issue.mojibake_matches.is_empty()
-                && issue.peel_suggested.is_some()
-                && let Err(e) = apply_peel(issue, io_mode)
-                && options.format == DoctorFormat::Human
-            {
-                writeln!(
-                    out,
-                    "doctor: peel-fix failed for {}: {}",
-                    issue.path.display(),
-                    e
-                )?;
+            if !issue.mojibake_matches.is_empty() && issue.peel_suggested.is_some() {
+                let git_policy = policies.get(&issue.path).cloned().unwrap_or_default();
+                apply_peel(issue, io_mode, &git_policy)?;
             }
         }
     }
 
     if fix_eol {
         for issue in &mut report.issues {
-            if issue.eol_mismatch.is_some()
-                && let Err(e) = apply_eol_fix(issue, io_mode)
-                && options.format == DoctorFormat::Human
-            {
-                writeln!(
-                    out,
-                    "doctor: eol-fix failed for {}: {}",
-                    issue.path.display(),
-                    e
-                )?;
+            if issue.eol_mismatch.is_some() {
+                apply_eol_fix(issue, io_mode)?;
             }
         }
     }
@@ -1220,6 +1238,240 @@ mod tests {
     }
 
     #[test]
+    fn expand_paths_direct_call_delegates_to_fail_policy() {
+        // `expand_paths` is `#[allow(dead_code)]` (documented as invoked only
+        // from external integration tests); call it directly so its own
+        // return value -- not just `expand_paths_with_policy`'s -- is
+        // pinned by a unit test.
+        let tmp = TempDir::new().unwrap();
+        let p = write(&tmp, "real.txt", b"hello");
+        let s = p.to_str().unwrap().to_owned();
+        let result = expand_paths(&[s.as_str()]).unwrap();
+        assert_eq!(result, vec![p]);
+    }
+
+    #[test]
+    fn expand_paths_recognizes_each_glob_character_independently() {
+        // Each of the four glob-indicator characters must independently
+        // trigger glob handling (rather than a literal-filename lookup)
+        // even when used alone -- a pattern containing only that one
+        // character must resolve via the walker (`Ok`, even if empty),
+        // not fail with "cannot stat" the way a literal (non-existent)
+        // filename would.
+        let tmp = TempDir::new().unwrap();
+        for spec in ["a?.txt", "a[1].txt", "a{1}.txt", "a*.txt"] {
+            let full = tmp.path().join(spec);
+            let full_s = full.to_string_lossy().to_string();
+            let mut warnings = Vec::new();
+            let result = expand_paths_with_policy(
+                &[full_s.as_str()],
+                crate::cmd::copy::OnError::Fail,
+                &mut warnings,
+            );
+            assert!(
+                result.is_ok(),
+                "glob spec {spec:?} should be recognised as a glob, not a literal \
+                 filename lookup, got: {result:?}"
+            );
+        }
+
+        // `*` and `?` are additionally verified end-to-end against a real
+        // match, since their semantics are unambiguous single-char/wildcard
+        // matches regardless of the underlying glob dialect's bracket
+        // conventions.
+        write(&tmp, "a1.txt", b"x");
+        for spec in ["a?.txt", "a*.txt"] {
+            let full_s = tmp.path().join(spec).to_string_lossy().to_string();
+            let mut warnings = Vec::new();
+            let result = expand_paths_with_policy(
+                &[full_s.as_str()],
+                crate::cmd::copy::OnError::Fail,
+                &mut warnings,
+            )
+            .unwrap();
+            assert_eq!(result, vec![tmp.path().join("a1.txt")], "spec {spec:?}");
+        }
+    }
+
+    #[test]
+    fn expand_paths_warn_mode_single_missing_path_still_errors() {
+        // A *single* explicit path has nothing else to fall back on, so
+        // Warn mode must still surface the stat failure as an error rather
+        // than silently downgrading it to a warning and returning an empty
+        // list.
+        let mut warnings = Vec::new();
+        let result = expand_paths_with_policy(
+            &["definitely_does_not_exist_single"],
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        );
+        assert!(result.is_err());
+        assert!(warnings.is_empty(), "no warning; this must be a hard error");
+    }
+
+    #[test]
+    fn expand_paths_empty_existing_directory_succeeds_with_zero_files() {
+        // A legitimately empty (but existing) directory is not the same as
+        // "every path was inaccessible" -- it must succeed with an empty
+        // list, not be conflated with the all-warned-and-skipped error case.
+        let tmp = TempDir::new().unwrap();
+        let empty_dir = tmp.path().join("empty");
+        fs::create_dir(&empty_dir).unwrap();
+        let s = empty_dir.to_string_lossy().to_string();
+        let mut warnings = Vec::new();
+        let result = expand_paths_with_policy(
+            &[s.as_str()],
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+        )
+        .unwrap();
+        assert_eq!(result, Vec::<PathBuf>::new());
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn run_with_policy_empty_directory_succeeds_with_no_issues() {
+        // Companion, end-to-end: `run_with_policy` itself must not treat a
+        // genuinely-empty directory scan as "nothing could be scanned".
+        let tmp = TempDir::new().unwrap();
+        let empty_dir = tmp.path().join("empty");
+        fs::create_dir(&empty_dir).unwrap();
+        let s = empty_dir.to_string_lossy().to_string();
+        let mut warnings = Vec::new();
+        let report = run_with_policy(
+            &[s.as_str()],
+            DoctorOptions::default(),
+            &mut Vec::new(),
+            IoMode::Buffered,
+            crate::cmd::copy::OnError::Warn,
+            &mut warnings,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(report.total_files_scanned, 0);
+        assert!(report.issues.is_empty());
+    }
+
+    #[test]
+    fn diagnose_file_respects_declared_working_tree_encoding_over_sniffed_utf8() {
+        // Box-drawing-heavy content that is nonetheless valid UTF-8 would
+        // normally trigger the `prefer_utf8` override when no Git policy
+        // applies. A declared `working-tree-encoding` must suppress that
+        // override and keep the declared encoding's name in the report.
+        let tmp = TempDir::new().unwrap();
+        let p = write(&tmp, "a.txt", "café\n".as_bytes());
+        let policy = git::FilePolicy {
+            working_tree_encoding: Some(git::WorktreeEncoding {
+                label: "windows-1252".into(),
+                encoding: encoding_rs::WINDOWS_1252,
+                bom: git::WorktreeBom::Unspecified,
+            }),
+            ..git::FilePolicy::default()
+        };
+        let issue = diagnose_file(&p, IoMode::Buffered, false, &policy).unwrap();
+        // Valid UTF-8 decoded as windows-1252 turns "é" into mojibake, so
+        // this is expected to be flagged -- what matters here is which
+        // encoding name is reported.
+        let encoding_detected = issue.map(|i| i.encoding_detected).unwrap_or("UTF-8");
+        assert_eq!(encoding_detected, "windows-1252");
+    }
+
+    #[test]
+    fn run_with_policy_counts_eol_repair_without_peel_fix_requested() {
+        // `total_repaired` must be computed when only `fix_eol` is
+        // requested (no `--fix=peel`), i.e. the guard must be `||`, not
+        // `&&` -- an eol-only fix run must still see its own repairs
+        // counted.
+        let repo = init_repo_with_attrs("*.txt text eol=crlf\n");
+        let p = write(&repo, "note.txt", b"alpha\nbeta\n");
+        let path_str = p.to_string_lossy().to_string();
+
+        let report = run_with_policy(
+            &[&path_str],
+            DoctorOptions {
+                quiet: true,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+            IoMode::Buffered,
+            crate::cmd::copy::OnError::Fail,
+            &mut Vec::new(),
+            None,
+            true, // fix_eol, but options.fix stays DoctorFix::None
+        )
+        .unwrap();
+
+        assert_eq!(report.total_repaired, 1);
+        assert_eq!(fs::read(&p).unwrap(), b"alpha\r\nbeta\r\n");
+    }
+
+    // ── annotate_matches / annotate_replacement_char_matches ────────────────
+
+    #[test]
+    fn annotate_matches_handles_match_at_very_end_of_text() {
+        // The main per-char loop only ever *sees* offsets it streams past;
+        // a match whose byte_offset equals the total length (defensive,
+        // "shouldn't happen for our patterns") is handled by a second pass
+        // after the loop.
+        let text = "abc";
+        let raw = vec![mojibake::Match {
+            byte_offset: text.len(),
+            pattern: Pattern::Latin1,
+        }];
+        let out = annotate_matches(text, &raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].line, 1);
+        assert_eq!(out[0].col, 4); // one past the 3 chars "abc"
+    }
+
+    #[test]
+    fn annotate_matches_reports_precise_positions_across_multiple_lines() {
+        // "line1\nline2\ncafÃ©\n": three lines; the mojibake starts on line
+        // 3 at column 4 (after "caf").
+        let text = "line1\nline2\ncafÃ©\n";
+        let offset = text.rfind('Ã').unwrap();
+        let raw = vec![mojibake::Match {
+            byte_offset: offset,
+            pattern: Pattern::Latin1,
+        }];
+        let out = annotate_matches(text, &raw);
+        assert_eq!(out[0].line, 3);
+        assert_eq!(out[0].col, 4);
+    }
+
+    #[test]
+    fn annotate_replacement_char_matches_reports_precise_multiline_positions_and_eof() {
+        // Three matches: one mid-first-line (pins col accumulation), one
+        // at the start of the second line (pins the line+=1/col=1 reset),
+        // and one at the exact end of the text (pins the EOF second pass).
+        let text = "a\u{FFFD}b\n\u{FFFD}cd";
+        // byte offsets: a=0, FFFD=1(3 bytes), b=4, \n=5, FFFD=6(3 bytes), c=9, d=10
+        let raw = vec![
+            mojibake::ReplacementCharMatch {
+                byte_offset: 1,
+                context: String::new(),
+                suggested: None,
+            },
+            mojibake::ReplacementCharMatch {
+                byte_offset: 6,
+                context: String::new(),
+                suggested: None,
+            },
+            mojibake::ReplacementCharMatch {
+                byte_offset: text.len(),
+                context: String::new(),
+                suggested: None,
+            },
+        ];
+        let out = annotate_replacement_char_matches(text, &raw);
+        assert_eq!(out.len(), 3);
+        assert_eq!((out[0].line, out[0].col), (1, 2));
+        assert_eq!((out[1].line, out[1].col), (2, 1));
+        assert_eq!((out[2].line, out[2].col), (2, 4));
+    }
+
+    #[test]
     fn binary_extensions_skipped() {
         assert!(is_binary_extension(Path::new("foo.png")));
         assert!(is_binary_extension(Path::new("foo.PNG")));
@@ -1269,7 +1521,7 @@ mod tests {
     fn diagnose_clean_utf8_file_returns_none() {
         let tmp = TempDir::new().unwrap();
         let p = write(&tmp, "clean.txt", "hello world\n".as_bytes());
-        let res = diagnose_file(&p, IoMode::Buffered, false, None).unwrap();
+        let res = diagnose_file(&p, IoMode::Buffered, false, &git::FilePolicy::default()).unwrap();
         assert!(res.is_none());
     }
 
@@ -1279,7 +1531,7 @@ mod tests {
         // Two lines; mojibake is on line 2 at column 5 (0-indexed bytes
         // include "first\n" = 6 bytes before the 'c' of 'caf').
         let p = write(&tmp, "bad.txt", "first\ncafÃ©\n".as_bytes());
-        let issue = diagnose_file(&p, IoMode::Buffered, false, None)
+        let issue = diagnose_file(&p, IoMode::Buffered, false, &git::FilePolicy::default())
             .unwrap()
             .expect("flagged");
         assert!(issue.valid_in_detected_encoding);
@@ -1302,7 +1554,7 @@ mod tests {
         // assertion is only that *if* it's not valid in its encoding,
         // we report it correctly.  If harrier picks Win-1252 then the
         // bytes are valid and the test is moot — assert with that in mind.
-        let res = diagnose_file(&p, IoMode::Buffered, false, None).unwrap();
+        let res = diagnose_file(&p, IoMode::Buffered, false, &git::FilePolicy::default()).unwrap();
         if let Some(issue) = res
             && !issue.valid_in_detected_encoding
         {
@@ -1315,7 +1567,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let body = format!("// {}\nthis line has cafÃ© in it\n", mojibake::ALLOW_MARKER);
         let p = write(&tmp, "ok.txt", body.as_bytes());
-        let res = diagnose_file(&p, IoMode::Buffered, false, None).unwrap();
+        let res = diagnose_file(&p, IoMode::Buffered, false, &git::FilePolicy::default()).unwrap();
         assert!(res.is_none());
     }
 
@@ -1331,7 +1583,7 @@ mod tests {
         bytes.extend_from_slice(format!("// {}\n", mojibake::ALLOW_MARKER).as_bytes());
         bytes.extend_from_slice(b"broken\xFFhere\n");
         let p = write(&tmp, "marked-but-invalid.txt", &bytes);
-        let issue = diagnose_file(&p, IoMode::Buffered, false, None)
+        let issue = diagnose_file(&p, IoMode::Buffered, false, &git::FilePolicy::default())
             .unwrap()
             .expect("encoding-invalid file must still be flagged despite the marker");
         assert!(!issue.valid_in_detected_encoding);
@@ -1342,7 +1594,7 @@ mod tests {
     fn empty_file_is_clean() {
         let tmp = TempDir::new().unwrap();
         let p = write(&tmp, "empty.txt", b"");
-        let res = diagnose_file(&p, IoMode::Buffered, false, None).unwrap();
+        let res = diagnose_file(&p, IoMode::Buffered, false, &git::FilePolicy::default()).unwrap();
         assert!(res.is_none());
     }
 
@@ -1756,11 +2008,8 @@ mod tests {
     }
 
     #[test]
-    fn git_eol_skips_utf16_even_with_fix() {
+    fn git_eol_repairs_utf16_with_fix() {
         let repo = init_repo_with_attrs("*.txt text eol=lf\n");
-        // UTF-16LE BOM + "a\r\nb\r\n".  A naive byte scan would see the
-        // `0D 00 0A 00` pairs and flag a CRLF-vs-LF mismatch, but UTF-16 line
-        // endings are multi-byte and must be skipped entirely.
         let mut bytes = vec![0xFF, 0xFE];
         for ch in "a\r\nb\r\n".chars() {
             bytes.push(ch as u8);
@@ -1781,17 +2030,178 @@ mod tests {
             IoMode::Buffered,
             crate::cmd::copy::OnError::Fail,
             &mut warnings,
-            Some(repo.path()),
+            None,
             true, // --fix=eol requested
         )
         .unwrap();
 
-        assert!(
-            report.issues.iter().all(|i| i.eol_mismatch.is_none()),
-            "UTF-16 file must never be flagged for an EOL mismatch"
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.path == p)
+            .expect("UTF-16 EOL issue");
+        assert_eq!(
+            issue.eol_mismatch.map(|mismatch| mismatch.expected),
+            Some(LineEnding::Lf)
         );
-        // Bytes are left exactly as written; no `.bak` is produced.
-        assert_eq!(fs::read(&p).unwrap(), bytes);
-        assert!(!Path::new(&format!("{}.bak", p.display())).exists());
+        assert!(issue.eol_repaired);
+
+        let mut expected = vec![0xFF, 0xFE];
+        for unit in "a\nb\n".encode_utf16() {
+            expected.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(fs::read(&p).unwrap(), expected);
+        assert!(Path::new(&format!("{}.bak", p.display())).exists());
+    }
+
+    #[test]
+    fn peel_preserves_declared_utf16_and_reports_automatic_eol_repair() {
+        let repo = init_repo_with_attrs("*.txt text eol=crlf working-tree-encoding=UTF-16LE-BOM\n");
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "cafÃ©\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        let p = write(&repo, "u16.txt", &bytes);
+        let path_str = p.to_string_lossy().to_string();
+
+        let mut buf = Vec::new();
+        let mut warnings = Vec::new();
+        let report = run_with_policy(
+            &[&path_str],
+            DoctorOptions {
+                fix: DoctorFix::Peel,
+                quiet: true,
+                ..Default::default()
+            },
+            &mut buf,
+            IoMode::Buffered,
+            crate::cmd::copy::OnError::Fail,
+            &mut warnings,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let issue = report
+            .issues
+            .iter()
+            .find(|issue| issue.path == p)
+            .expect("UTF-16 mojibake issue");
+        assert!(issue.repaired);
+        assert!(issue.eol_repaired);
+
+        let mut expected = vec![0xFF, 0xFE];
+        for unit in "café\r\n".encode_utf16() {
+            expected.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(fs::read(&p).unwrap(), expected);
+        assert_eq!(fs::read(format!("{}.bak", p.display())).unwrap(), bytes);
+    }
+
+    #[test]
+    fn peel_errors_when_recovered_text_is_not_representable_in_git_encoding() {
+        let repo = init_repo_with_attrs("*.txt text working-tree-encoding=windows-1252\n");
+        let original = b"box: \xe2\x94\x80\n";
+        let p = write(&repo, "legacy.txt", original);
+        let path_str = p.to_string_lossy().to_string();
+
+        let error = run_with_policy(
+            &[&path_str],
+            DoctorOptions {
+                fix: DoctorFix::Peel,
+                quiet: true,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+            IoMode::Buffered,
+            crate::cmd::copy::OnError::Fail,
+            &mut Vec::new(),
+            None,
+            false,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("cannot be represented"));
+        assert_eq!(fs::read(&p).unwrap(), original);
+    }
+
+    /// Exercises the full enumerate → resolve → (parallel-capable) diagnose
+    /// pipeline in [`run_with_policy`] across files belonging to two
+    /// *different* repositories with different EOL policies, plus one file
+    /// outside any repository. Each file must be diagnosed against its own
+    /// repository's policy regardless of how (or whether) diagnosis was
+    /// parallelised -- this is the correctness guarantee the sequential
+    /// enrichment phase (`git::resolve_policies`) exists to provide.
+    #[test]
+    fn run_with_policy_diagnoses_each_file_against_its_own_repository() {
+        let parent = TempDir::new().unwrap();
+        let left = parent.path().join("left");
+        let right = parent.path().join("right");
+        fs::create_dir(&left).unwrap();
+        fs::create_dir(&right).unwrap();
+        gix::init(&left).expect("git init left");
+        gix::init(&right).expect("git init right");
+        for dir in [&left, &right] {
+            let cfg_path = dir.join(".git").join("config");
+            let mut cfg = fs::read_to_string(&cfg_path).unwrap_or_default();
+            cfg.push_str("\n[core]\n\tautocrlf = false\n");
+            fs::write(&cfg_path, cfg).unwrap();
+        }
+        fs::write(left.join(".gitattributes"), "*.txt text eol=lf\n").unwrap();
+        fs::write(right.join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+
+        // `left` expects LF but is CRLF: mismatch. `right` expects CRLF but
+        // is also CRLF: clean. A plain file outside both repositories has no
+        // Git policy at all and must never be flagged.
+        let left_file = left.join("a.txt");
+        fs::write(&left_file, b"alpha\r\nbeta\r\n").unwrap();
+        let right_file = right.join("b.txt");
+        fs::write(&right_file, b"alpha\r\nbeta\r\n").unwrap();
+        let outside_file = parent.path().join("c.txt");
+        fs::write(&outside_file, b"alpha\r\nbeta\r\n").unwrap();
+
+        let specs = [
+            left_file.to_string_lossy().to_string(),
+            right_file.to_string_lossy().to_string(),
+            outside_file.to_string_lossy().to_string(),
+        ];
+        let spec_refs: Vec<&str> = specs.iter().map(String::as_str).collect();
+
+        let mut warnings = Vec::new();
+        let report = run_with_policy(
+            &spec_refs,
+            DoctorOptions {
+                quiet: true,
+                ..Default::default()
+            },
+            &mut Vec::new(),
+            IoMode::Buffered,
+            crate::cmd::copy::OnError::Fail,
+            &mut warnings,
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(warnings.is_empty(), "unexpected warnings: {warnings:?}");
+        assert_eq!(report.total_files_scanned, 3);
+
+        let left_issue = report
+            .issues
+            .iter()
+            .find(|i| i.path == left_file)
+            .expect("left file flagged for its own repo's LF policy");
+        let mismatch = left_issue.eol_mismatch.expect("left file mismatch");
+        assert_eq!(mismatch.expected, LineEnding::Lf);
+        assert_eq!(mismatch.actual, LineEnding::CrLf);
+
+        assert!(
+            !report.issues.iter().any(|i| i.path == right_file),
+            "right file matches its own repo's CRLF policy; must not be flagged"
+        );
+        assert!(
+            !report.issues.iter().any(|i| i.path == outside_file),
+            "file outside any repository has no Git policy; must not be flagged"
+        );
     }
 }

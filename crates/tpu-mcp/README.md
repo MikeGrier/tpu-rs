@@ -320,32 +320,36 @@ giving a shell to an automated agent:
 
 ---
 
-## Git-aware line endings (opt-in)
+## Automatic Git worktree policy
 
-`tpu-mcp` can detect when a file's on-disk line endings differ from what git
-would materialise in the working tree for that path (per `.gitattributes`
-`text`/`eol` attributes and `core.autocrlf` / `core.eol`). This is a distinct
-condition from mojibake — the bytes are valid, but the endings produce noisy
-diffs and "whole file changed" churn.
+For files in a Git worktree, `tpu-mcp` automatically discovers the nearest
+repository and resolves `.gitattributes` through gitoxide. The resolved
+`working-tree-encoding` controls decoding, strict re-encoding, and BOM policy.
+The `text`/`eol` attributes and `core.autocrlf` / `core.eol` determine a
+definite working-tree line ending when Git provides one.
 
-Detection is **opt-in per call** via a `git_root` argument (an absolute path to
-the repository root; there is no upward auto-discovery):
+Discovery results and open repository handles are cached per tool operation, so
+a glob rooted above one or more repositories opens each worktree at most once.
+The cache is refreshed between operations so newly created nested repositories
+and configuration changes are observed. The legacy `git_root` argument remains
+available for explicit read-advisory context; encoding and mutation policy use
+nearest-repository discovery.
 
-- **Read** — pass `git_root` to `tpu_read_file`, `tpu_read_head`, or
-  `tpu_read_tail`. When the file's endings differ from git's expectation, the
-  response is prefixed with a single `note:` line; the unchanged content
-  follows.
-- **Report / repair** — call `tpu_doctor` with `git_root` to list mismatched
-  files (each flagged with an `eol_mismatch` object). Pass `fix: "eol"` to
-  normalise line endings only, or `fix: "all"` to also peel mojibake. `eol` and
-  `all` require `git_root`; the rewrite is atomic with a `<file>.bak` backup,
-  and UTF-16 files are skipped.
-- **Normalise on write (off by default)** — when the server is started with the
-  `tpu-mcp.normalizeLineEndings` setting enabled (forwarded as the
-  `TPU_EOL_NORMALIZE` environment variable; the CLI flag is `--eol-normalize`),
-  mutating tools given a `git_root` denormalise to git's expected convention
-  unless an explicit `line_ending` is supplied. This is **off by default** so
-  writes never silently rewrite endings without opt-in.
+Policy is resolved independently for each path when that path is processed.
+Multi-file and glob operations do not snapshot or lock `.gitattributes` for
+their full duration. If another process changes attributes during enumeration,
+paths resolved before and after the change may therefore use different
+policies. An unreadable or transiently invalid policy is reported as a per-file
+error rather than silently replaced with defaults.
+
+- **Read** — text tools decode using `working-tree-encoding`; read/head/tail
+  also prefix a `note:` when on-disk endings disagree with Git's expectation.
+- **Write** — text mutations strictly re-encode in the declared worktree
+  encoding, enforce its BOM rules, and normalise all line endings when Git
+  supplies a definite convention. An explicit `line_ending` takes precedence.
+- **Report / repair** — `tpu_doctor` lists mismatches with an `eol_mismatch`
+  object. `fix: "eol"` normalises endings only; `fix: "all"` also peels
+  mojibake. Repairs are atomic, retain a `<file>.bak`, and support UTF-16.
 
 ---
 
