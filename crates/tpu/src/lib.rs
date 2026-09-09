@@ -56,16 +56,227 @@ pub fn open_as_branch(path: &Path, mode: IoMode) -> Result<Arc<dyn Branch>, Box<
     match mode {
         IoMode::Mmap => {
             let f = retry_io(|| fs::File::open(path))?;
+            if f.metadata()?.len() == 0 {
+                return Ok(redwing::make_thicket_from_bytes(Vec::new()).main());
+            }
             // SAFETY: bytes are accessed read-only through the Branch API.
             let mmap = unsafe { MmapOptions::new().map(&f) }?;
             drop(f);
             Ok(redwing::make_thicket_from_mmap(mmap).main())
         }
+
         IoMode::Buffered => {
             let bytes = retry_io(|| fs::read(path))?;
             Ok(redwing::make_thicket_from_bytes(bytes).main())
         }
     }
+}
+
+/// Open a text source using Git's worktree policy when `path` belongs to a
+/// repository.
+///
+/// The nearest repository is discovered through [`git::policy_for_path`].
+/// A resolved `working-tree-encoding` becomes harrier's authoritative encoding
+/// hint, while a definite Git EOL policy becomes its line-ending default.
+pub fn open_source(path: &Path, mode: IoMode) -> Result<harrier::source::Source, Box<dyn Error>> {
+    let branch = open_as_branch(path, mode)?;
+    source_from_branch(path, branch)
+}
+
+/// Build a Git-policy-aware text source from an already-open branch.
+///
+/// Resolves policy via [`git::policy_for_path`] on every call. Multi-file
+/// pipelines that have already resolved policy up front (see
+/// [`git::resolve_policies`]) should call
+/// [`source_from_branch_with_policy`] instead, so this does not repeat a
+/// gitoxide call already made during that pipeline's sequential enrichment
+/// phase.
+pub fn source_from_branch(
+    path: &Path,
+    branch: Arc<dyn Branch>,
+) -> Result<harrier::source::Source, Box<dyn Error>> {
+    let policy = git::policy_for_path(path)?;
+    source_from_branch_with_policy(path, branch, &policy)
+}
+
+/// As [`source_from_branch`], but takes an already-resolved [`git::FilePolicy`]
+/// instead of resolving one internally. Never calls gitoxide.
+pub fn source_from_branch_with_policy(
+    path: &Path,
+    branch: Arc<dyn Branch>,
+    policy: &git::FilePolicy,
+) -> Result<harrier::source::Source, Box<dyn Error>> {
+    policy.validate_branch(path, &*branch)?;
+    let raw = redwing::materialize(&*branch)?;
+    let line_ending = policy.line_ending_for_worktree_bytes(&raw);
+    Ok(harrier::source::Source::new(
+        branch,
+        policy.source_config(line_ending),
+    )?)
+}
+
+/// Fully decoded, LF-normalised representation of a text file.
+#[derive(Debug)]
+pub struct DecodedTextFile {
+    pub text: String,
+    pub encoding: &'static encoding_rs::Encoding,
+    pub line_ending: harrier::encoding::LineEnding,
+    pub bom_len: usize,
+    pub layout: TextLayout,
+}
+
+/// Logical line and terminator metadata captured before LF normalisation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TextLayout {
+    pub line_count: u64,
+    pub has_lf: bool,
+    pub has_crlf: bool,
+    pub has_cr: bool,
+}
+
+impl TextLayout {
+    fn analyze(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let mut layout = Self::default();
+        // Iterator-driven walk (no manual index counter): the position is
+        // advanced solely by the shared `iter.next()` calls below, so there is
+        // no `i += 1`-style step to mutate into an infinite loop. The one
+        // extra `iter.next()` in the CRLF arm consumes the paired `\n` (the
+        // same two bytes the old `i += 2` used to skip).
+        let mut iter = bytes.iter().enumerate();
+        while let Some((idx, &b)) = iter.next() {
+            match b {
+                b'\r' if bytes.get(idx + 1) == Some(&b'\n') => {
+                    layout.has_crlf = true;
+                    layout.line_count += 1;
+                    iter.next();
+                }
+                b'\r' => {
+                    layout.has_cr = true;
+                    layout.line_count += 1;
+                }
+                b'\n' => {
+                    layout.has_lf = true;
+                    layout.line_count += 1;
+                }
+                _ => {}
+            }
+        }
+        if !bytes.is_empty() && !matches!(bytes.last(), Some(b'\r' | b'\n')) {
+            layout.line_count += 1;
+        }
+        layout
+    }
+}
+
+#[cfg(test)]
+mod text_layout_tests {
+    use super::*;
+
+    #[test]
+    fn analyze_empty_string_yields_default_layout() {
+        let layout = TextLayout::analyze("");
+        assert_eq!(layout, TextLayout::default());
+    }
+
+    #[test]
+    fn analyze_lone_lf() {
+        let layout = TextLayout::analyze("\n");
+        assert!(layout.has_lf);
+        assert!(!layout.has_cr);
+        assert!(!layout.has_crlf);
+        assert_eq!(layout.line_count, 1);
+    }
+
+    #[test]
+    fn analyze_lone_cr() {
+        let layout = TextLayout::analyze("\r");
+        assert!(!layout.has_lf);
+        assert!(layout.has_cr);
+        assert!(!layout.has_crlf);
+        assert_eq!(layout.line_count, 1);
+    }
+
+    #[test]
+    fn analyze_crlf_pair() {
+        let layout = TextLayout::analyze("\r\n");
+        assert!(!layout.has_lf);
+        assert!(!layout.has_cr);
+        assert!(layout.has_crlf);
+        assert_eq!(layout.line_count, 1);
+    }
+
+    /// A `\r` not immediately followed by `\n` must be classified as a lone
+    /// CR, never as CRLF -- this pins the lookahead guard
+    /// (`bytes.get(idx + 1) == Some(&b'\n')`) against a mutation that makes
+    /// it unconditionally true (which would misclassify every `\r` as CRLF
+    /// and incorrectly consume the following byte as if it were `\n`).
+    #[test]
+    fn analyze_cr_not_followed_by_lf_is_lone_cr_not_crlf() {
+        let layout = TextLayout::analyze("\ra");
+        assert!(layout.has_cr);
+        assert!(!layout.has_crlf);
+        // "\r" (line 1) + trailing unterminated "a" (line 2).
+        assert_eq!(layout.line_count, 2);
+    }
+
+    /// A file whose last byte is a terminator must not get an extra phantom
+    /// line counted for content after it (there is none) -- pins the
+    /// trailing-line guard against a mutation that drops its `!bytes.is_empty()`
+    /// half (which would otherwise only fire when the buffer is empty).
+    #[test]
+    fn analyze_trailing_newline_does_not_add_a_phantom_line() {
+        let layout = TextLayout::analyze("a\n");
+        assert_eq!(layout.line_count, 1);
+    }
+
+    /// A file with content after the last terminator gets one extra line
+    /// counted for that trailing, unterminated content.
+    #[test]
+    fn analyze_content_after_last_terminator_adds_one_line() {
+        let layout = TextLayout::analyze("a\nb");
+        assert_eq!(layout.line_count, 2);
+    }
+
+    /// Exercises every terminator kind in one buffer and pins the exact
+    /// line_count arithmetic (each terminator, plus one for the trailing
+    /// unterminated "d").
+    #[test]
+    fn analyze_mixed_line_endings_counts_each_line_and_sets_every_flag() {
+        let layout = TextLayout::analyze("a\nb\r\nc\rd");
+        assert!(layout.has_lf);
+        assert!(layout.has_crlf);
+        assert!(layout.has_cr);
+        assert_eq!(layout.line_count, 4);
+    }
+}
+
+/// Decode a complete text file according to Git/harrier policy and normalise
+/// CRLF and lone CR terminators to LF in Unicode space.
+///
+/// Unicode-space normalisation is required for UTF-16: byte-oriented line
+/// scanners cannot distinguish its interleaved CR/LF code-unit bytes safely.
+pub fn read_text_file(path: &Path, mode: IoMode) -> Result<DecodedTextFile, Box<dyn Error>> {
+    let branch = open_as_branch(path, mode)?;
+    let source = source_from_branch(path, Arc::clone(&branch))?;
+    let encoding = source.encoding();
+    let line_ending = source.line_ending();
+    let bom_len = source.bom_len();
+    let raw = redwing::materialize(&*branch)?;
+    let body = &raw[bom_len.min(raw.len())..];
+    let (decoded, had_errors) = encoding.decode_without_bom_handling(body);
+    if had_errors {
+        return Err(format!("{} is not valid {}", path.display(), encoding.name()).into());
+    }
+    let layout = TextLayout::analyze(&decoded);
+    let text = decoded.replace("\r\n", "\n").replace('\r', "\n");
+    Ok(DecodedTextFile {
+        text,
+        encoding,
+        line_ending,
+        bom_len,
+        layout,
+    })
 }
 
 /// Read raw file bytes, respecting the I/O mode.
@@ -294,6 +505,124 @@ fn is_transient_io_error(e: &io::Error) -> bool {
 }
 
 // ── Stranded-backup recovery ──────────────────────────────────────────────────
+
+#[cfg(test)]
+mod retry_io_tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Run `f` on a background thread and wait up to `timeout` for it to
+    /// finish, returning its result.
+    ///
+    /// `retry_io`'s termination guard (`attempt < MAX_RETRIES &&
+    /// is_transient_io_error(&e)`) has mutants — the guard replaced with an
+    /// unconditional `true`, `&&` replaced with `||`, and the `attempt += 1`
+    /// counter replaced with a no-op — that turn a persistently-failing
+    /// closure into a genuine infinite loop (real 25ms sleeps between
+    /// iterations, never terminating). Observing "did retry_io correctly
+    /// give up" requires a closure that keeps failing, so there is no way to
+    /// design a test for this that both (a) proves termination and (b) is
+    /// guaranteed to itself terminate quickly if that termination is broken.
+    /// Bounding the wait in a background thread converts "hang until cargo
+    /// mutants' own ~112-220s per-mutant timeout" into a fast, deterministic
+    /// test failure (a few hundred ms). The background thread is
+    /// deliberately leaked if `f` never returns; `libtest` force-exits the
+    /// process after the suite finishes, so a leaked spinning thread does
+    /// not block the test binary from exiting.
+    fn run_with_timeout<T: Send + 'static>(
+        timeout: Duration,
+        f: impl FnOnce() -> T + Send + 'static,
+    ) -> T {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(f());
+        });
+        rx.recv_timeout(timeout).unwrap_or_else(|_| {
+            panic!(
+                "operation did not complete within {timeout:?} -- retry_io's \
+                 termination guard appears to be broken (infinite retry loop)"
+            )
+        })
+    }
+
+    #[test]
+    fn retry_io_succeeds_immediately_without_retrying() {
+        let mut calls = 0;
+        let result = retry_io(|| {
+            calls += 1;
+            Ok::<_, io::Error>(42)
+        });
+        assert_eq!(result.unwrap(), 42);
+        assert_eq!(calls, 1, "a first-try success must not retry");
+    }
+
+    #[test]
+    fn retry_io_propagates_non_transient_errors_immediately() {
+        // Bounded via `run_with_timeout`: a closure that always fails is the
+        // only way to observe "does retry_io ever stop retrying", and that
+        // same closure would hang forever under the guard-replaced-with-
+        // `true` mutant (which retries regardless of transience). This is
+        // cross-platform (unlike the transient-error tests below) because
+        // that specific mutation doesn't depend on `is_transient_io_error`
+        // at all -- it can hang on any platform given any persistently
+        // failing closure.
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_inner = Arc::clone(&calls);
+        let result: io::Result<()> = run_with_timeout(Duration::from_secs(2), move || {
+            retry_io(move || {
+                calls_inner.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            })
+        });
+        assert!(result.is_err());
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a non-transient error must not be retried"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retry_io_gives_up_after_exactly_max_retries_on_transient_error() {
+        // ERROR_SHARING_VIOLATION: recognised as transient by
+        // `is_transient_io_error` on Windows. Bounded via `run_with_timeout`
+        // (see its doc comment): this closure always fails, which is the
+        // only way to pin the exact give-up count, and is exactly the shape
+        // that hangs under the guard/`&&`/attempt-counter mutants.
+        const ERROR_SHARING_VIOLATION: i32 = 32;
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_inner = Arc::clone(&calls);
+        let result: io::Result<()> = run_with_timeout(Duration::from_secs(2), move || {
+            retry_io(move || {
+                calls_inner.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(io::Error::from_raw_os_error(ERROR_SHARING_VIOLATION))
+            })
+        });
+        assert!(result.is_err());
+        // MAX_RETRIES (5) retries after the initial attempt = 6 total calls.
+        // This pins the exact retry-count boundary: an off-by-one in the
+        // `attempt < MAX_RETRIES` comparison changes this count.
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn retry_io_succeeds_once_transient_error_clears_within_budget() {
+        const ERROR_ACCESS_DENIED: i32 = 5;
+        let mut calls = 0;
+        let result = retry_io(|| {
+            calls += 1;
+            if calls < 3 {
+                Err(io::Error::from_raw_os_error(ERROR_ACCESS_DENIED))
+            } else {
+                Ok(99)
+            }
+        });
+        assert_eq!(result.unwrap(), 99);
+        assert_eq!(calls, 3);
+    }
+}
 
 /// Return the `<file>.bak` companion path used by the atomic-write swap in
 /// `cmd::write`, `cmd::replace`, `cmd::append`, and `cmd::edit`.
@@ -665,6 +994,119 @@ mod write_lock_tests {
         let g2 = acquire_write_lock(&f).expect("re-acquire after release");
         drop(g2);
     }
+
+    /// Pins the `lock_name.len() > 255` boundary exactly: a 255-char sidecar
+    /// name must still succeed, while 256 must fall back to `None`. Computed
+    /// relative to `LOCK_SUFFIX` and the platform-specific hidden-dot prefix
+    /// so the test is exact on both Windows (`OpenOptionsExt`-based) and Unix
+    /// builds, rather than assuming one platform's constant offset.
+    #[test]
+    fn lock_sidecar_path_exact_255_char_boundary() {
+        let prefix_len: usize = if cfg!(windows) { 0 } else { 1 };
+        let target_total = 255usize;
+        let name_len = target_total - prefix_len - LOCK_SUFFIX.len();
+
+        let dir = std::path::PathBuf::from("dir");
+        let at_255 = dir.join("a".repeat(name_len));
+        let sidecar = lock_sidecar_path(&at_255).expect("exactly 255 chars must still succeed");
+        assert_eq!(sidecar.file_name().unwrap().len(), 255);
+
+        let at_256 = dir.join("a".repeat(name_len + 1));
+        assert!(
+            lock_sidecar_path(&at_256).is_none(),
+            "256 chars must be rejected"
+        );
+    }
+
+    /// The sidecar is opened with `FILE_FLAG_DELETE_ON_CLOSE`.
+    ///
+    /// (Empirically, this Windows version honours delete-on-close even when
+    /// `DELETE` is absent from the requested access mask, so this test alone
+    /// does not pin that specific bit -- see
+    /// `open_lock_file_grants_read_write_and_delete_access` for the test that
+    /// does, by probing each bit's real capability directly.)
+    #[cfg(windows)]
+    #[test]
+    fn open_lock_file_sidecar_is_deleted_once_last_handle_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("d.txt");
+        fs::write(&f, b"x").unwrap();
+        let sidecar = lock_sidecar_path(&f).unwrap();
+        {
+            let _h = open_lock_file(&sidecar).unwrap();
+            assert!(
+                sidecar.exists(),
+                "sidecar should exist while a handle is open"
+            );
+        }
+        assert!(
+            !sidecar.exists(),
+            "sidecar must be auto-deleted once the last handle closes"
+        );
+    }
+
+    /// Probes each bit of `open_lock_file`'s requested access mask
+    /// (`GENERIC_READ | GENERIC_WRITE | DELETE`) via the handle's *actual*
+    /// read/write capability, rather than via a side effect (locking,
+    /// delete-on-close) that this Windows version turns out to still honour
+    /// even when a bit is missing from the mask. `&` has higher precedence
+    /// than `|` in Rust, so an operator-swap mutation on this expression can
+    /// silently drop an operand from a *different* side of the `|` than the
+    /// mutated operator's own position (e.g. `GENERIC_WRITE & DELETE`
+    /// evaluates to `0`, so `GENERIC_READ | (GENERIC_WRITE & DELETE)` reduces
+    /// to plain `GENERIC_READ`) -- reading and writing the handle directly
+    /// distinguishes this precisely regardless of which side collapsed.
+    #[cfg(windows)]
+    #[test]
+    fn open_lock_file_grants_read_write_and_delete_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("rw.txt");
+        fs::write(&f, b"x").unwrap();
+        let sidecar = lock_sidecar_path(&f).unwrap();
+        let mut h = open_lock_file(&sidecar).unwrap();
+
+        use std::io::{Read, Seek, SeekFrom, Write};
+        h.write_all(b"probe").expect("handle must be writable");
+        h.seek(SeekFrom::Start(0)).unwrap();
+        let mut buf = String::new();
+        h.read_to_string(&mut buf).expect("handle must be readable");
+        assert_eq!(buf, "probe");
+    }
+
+    /// A contended lock must be *waited out* (retried), not given up on
+    /// instantly -- pins `start.elapsed() >= LOCK_WAIT_CAP` against a `<`
+    /// mutation, which would return `None` on the very first contention
+    /// check instead of retrying until the holder releases (or the real
+    /// multi-second cap elapses).
+    #[test]
+    fn acquire_write_lock_waits_for_contended_lock_then_succeeds() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("contend.txt");
+        fs::write(&f, b"x").unwrap();
+
+        let holder = acquire_write_lock(&f).expect("first acquisition must succeed");
+        let f2 = f.clone();
+        let handle = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            drop(holder);
+            let _ = f2; // keep path alive for clarity; not otherwise used here
+        });
+
+        let start = Instant::now();
+        let second = acquire_write_lock(&f);
+        let elapsed = start.elapsed();
+        handle.join().unwrap();
+
+        assert!(
+            second.is_some(),
+            "must eventually acquire once the first lock releases"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(100),
+            "must have retried/waited for the contended lock rather than giving up \
+             immediately (elapsed={elapsed:?})"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -704,5 +1146,85 @@ mod recover_tests {
         assert!(recovered);
         assert_eq!(fs::read(&f).unwrap(), b"recovered content");
         assert!(!bak.exists(), ".bak should be consumed by recovery");
+    }
+}
+
+#[cfg(test)]
+mod git_text_policy_tests {
+    use super::*;
+
+    #[test]
+    fn read_text_file_uses_discovered_worktree_encoding() {
+        let repo = tempfile::tempdir().unwrap();
+        gix::init(repo.path()).unwrap();
+        fs::write(
+            repo.path().join(".gitattributes"),
+            "*.txt text eol=crlf working-tree-encoding=UTF-16LE-BOM\n",
+        )
+        .unwrap();
+        let file = repo.path().join("a.txt");
+        let mut bytes = vec![0xFF, 0xFE];
+        for unit in "alpha\r\n\u{03b2}\r\n".encode_utf16() {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+        fs::write(&file, bytes).unwrap();
+
+        let decoded = read_text_file(&file, IoMode::Buffered).unwrap();
+        assert_eq!(decoded.text, "alpha\n\u{03b2}\n");
+        assert_eq!(decoded.encoding, encoding_rs::UTF_16LE);
+        assert_eq!(decoded.line_ending, harrier::encoding::LineEnding::CrLf);
+        assert_eq!(decoded.bom_len, 2);
+        assert_eq!(decoded.layout.line_count, 2);
+        assert!(decoded.layout.has_crlf);
+        assert!(!decoded.layout.has_lf);
+    }
+
+    #[test]
+    fn read_text_file_rejects_missing_required_worktree_bom() {
+        let repo = tempfile::tempdir().unwrap();
+        gix::init(repo.path()).unwrap();
+        fs::write(
+            repo.path().join(".gitattributes"),
+            "*.txt working-tree-encoding=UTF-16LE-BOM\n",
+        )
+        .unwrap();
+        let file = repo.path().join("a.txt");
+        fs::write(&file, [b'a', 0, b'\n', 0]).unwrap();
+
+        let error = read_text_file(&file, IoMode::Buffered).unwrap_err();
+        assert!(error.to_string().contains("BOM requirements"));
+    }
+
+    #[test]
+    fn read_text_file_treats_worktree_encoding_as_authoritative() {
+        let repo = tempfile::tempdir().unwrap();
+        gix::init(repo.path()).unwrap();
+        fs::write(
+            repo.path().join(".gitattributes"),
+            "*.txt working-tree-encoding=windows-1252\n",
+        )
+        .unwrap();
+        let file = repo.path().join("ascii.txt");
+        fs::write(&file, b"plain ascii\n").unwrap();
+
+        let decoded = read_text_file(&file, IoMode::Buffered).unwrap();
+        assert_eq!(decoded.encoding, encoding_rs::WINDOWS_1252);
+        assert_eq!(decoded.text, "plain ascii\n");
+    }
+
+    #[test]
+    fn read_text_file_strictly_validates_declared_encoding() {
+        let repo = tempfile::tempdir().unwrap();
+        gix::init(repo.path()).unwrap();
+        fs::write(
+            repo.path().join(".gitattributes"),
+            "*.txt working-tree-encoding=UTF-8\n",
+        )
+        .unwrap();
+        let file = repo.path().join("invalid.txt");
+        fs::write(&file, [0xFF, b'\n']).unwrap();
+
+        let error = read_text_file(&file, IoMode::Buffered).unwrap_err();
+        assert!(error.to_string().contains("not valid UTF-8"));
     }
 }

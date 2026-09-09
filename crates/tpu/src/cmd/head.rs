@@ -2,12 +2,9 @@
 
 //! `tpu head` — emit the first N lines or N bytes of a file to stdout.
 
-use std::{io::Write, path::Path, sync::Arc};
+use std::{io::Write, path::Path};
 
-use harrier::{
-    encoding::{LineEnding, SourceConfig},
-    source::Source,
-};
+use harrier::encoding::LineEnding;
 
 use crate::IoMode;
 
@@ -73,16 +70,9 @@ fn run_lines(
     }
     drop(f);
 
-    let branch = crate::open_as_branch(file, io_mode)?;
-    let file_len = branch.byte_len();
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-    let bom_len = source.bom_len();
-    let encoding = source.encoding();
-    let line_ending = source.line_ending();
-    let lines_iter = source.as_lines()?;
-    // Skip BOM bytes so decoded text starts at the first content character.
-    let view = lines_iter.view_range(bom_len as u64..file_len)?;
-    let (text, _) = encoding.decode_without_bom_handling(&view.bytes);
+    let decoded = crate::read_text_file(file, io_mode)?;
+    let line_ending = decoded.line_ending;
+    let text = decoded.text;
 
     // Read-time advisory (Milestone 4).
     if let Some(notes) = notes {
@@ -145,4 +135,76 @@ fn run_bytes(
     let take = (n as usize).min(bytes.len());
     out.write_all(&bytes[..take])?;
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tmp(dir: &tempfile::TempDir, name: &str, content: &[u8]) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// Requesting exactly as many (or more) lines than exist in a file with
+    /// *no* trailing newline must not add a terminator after the last line:
+    /// `is_last_selected` is true and `take == all_lines.len()`, so every
+    /// term of `!is_last_selected || take < all_lines.len() ||
+    /// file_ends_with_newline` is false. Pins the `i + 1 == take` equality
+    /// (against `!=` and against `*`, which would make `is_last_selected`
+    /// unreachable), `take < all_lines.len()` (against `<=`), and `delete !`
+    /// (which would make the first term `is_last_selected` itself, true
+    /// here, wrongly forcing a terminator).
+    #[test]
+    fn run_lines_no_trailing_newline_all_requested_omits_final_terminator() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"aaa\nbbb\nccc");
+        let mut out: Vec<u8> = Vec::new();
+        run_lines(&p, 10, false, &mut out, crate::IoMode::Mmap, None).unwrap();
+        assert_eq!(out, b"aaa\nbbb\nccc");
+    }
+
+    /// Requesting *fewer* lines than exist in a file with no trailing
+    /// newline must still terminate the last *printed* line (more content
+    /// follows it in the source file). Pins `take < all_lines.len()`
+    /// against `==`/`>` and the `||` joining it to `!is_last_selected`
+    /// against `&&` (here `!is_last_selected` is false, so only this term
+    /// keeps the result true).
+    #[test]
+    fn run_lines_no_trailing_newline_partial_request_terminates_last_printed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"aaa\nbbb\nccc");
+        let mut out: Vec<u8> = Vec::new();
+        run_lines(&p, 2, false, &mut out, crate::IoMode::Mmap, None).unwrap();
+        assert_eq!(out, b"aaa\nbbb\n");
+    }
+
+    /// `file_len == 0 || n == 0` must short-circuit *before* attempting to
+    /// read the file, because memory-mapping a genuinely empty file is
+    /// platform-dependent (see the identical guard and comment in
+    /// `run_lines`). Pins that `||` against a `&&` mutation: a non-empty
+    /// file with `n == 0` requested must return cleanly with no output.
+    #[test]
+    fn run_bytes_zero_requested_on_nonempty_file_emits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_tmp(&dir, "f.bin", b"hello");
+        let mut out: Vec<u8> = Vec::new();
+        run_bytes(&p, 0, &mut out, crate::IoMode::Mmap).unwrap();
+        assert!(out.is_empty());
+    }
+
+    /// An empty file with a nonzero byte count requested must return
+    /// cleanly (no attempt to mmap/read the empty file). Pins the same
+    /// `||` from the other side.
+    #[test]
+    fn run_bytes_nonzero_requested_on_empty_file_emits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_tmp(&dir, "f.bin", b"");
+        let mut out: Vec<u8> = Vec::new();
+        run_bytes(&p, 5, &mut out, crate::IoMode::Mmap).unwrap();
+        assert!(out.is_empty());
+    }
 }

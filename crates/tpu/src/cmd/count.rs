@@ -9,12 +9,9 @@
 //! When `stats` is true (from `--stats` or JSON mode), encoding metadata is
 //! emitted first: the WHATWG encoding name, BOM presence, and line-ending style.
 
-use std::{fs, path::Path, sync::Arc};
+use std::{fs, path::Path};
 
-use harrier::{
-    encoding::{LineEnding, SourceConfig},
-    source::Source,
-};
+use harrier::encoding::LineEnding;
 use regex::Regex;
 
 use crate::{IoMode, output::Output};
@@ -72,33 +69,17 @@ pub fn run(
     let byte_count = fs::metadata(file)?.len();
 
     // ── Open and decode the file, capturing file metadata ────────────────────
-    let (text, enc_name, has_bom, line_ending_label): (String, &'static str, bool, &'static str) =
-        if byte_count == 0 {
-            // Empty file — no encoding can be detected; use UTF-8 defaults.
-            (String::new(), "UTF-8", false, "LF")
-        } else {
-            let branch = crate::open_as_branch(file, io_mode)?;
-            let file_len = branch.byte_len();
-            let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-            let bom_len = source.bom_len();
-            let encoding = source.encoding();
-            // Capture line_ending BEFORE as_lines() consumes `source`.
-            let line_ending = source.line_ending();
-            let lines_iter = source.as_lines()?;
-            // Skip BOM bytes so decoded text starts at the first content char.
-            let view = lines_iter.view_range(bom_len as u64..file_len)?;
-            let (cow, _) = encoding.decode_without_bom_handling(&view.bytes);
-            let text = cow.into_owned();
-
-            let enc_name: &'static str = encoding.name();
-            let has_bom = bom_len > 0;
-            let le_label: &'static str = match line_ending {
-                LineEnding::Lf => "LF",
-                LineEnding::CrLf => "CRLF",
-                LineEnding::Cr => "CR",
-            };
-            (text, enc_name, has_bom, le_label)
+    let (text, enc_name, has_bom, line_ending_label): (String, &'static str, bool, &'static str) = {
+        let decoded = crate::read_text_file(file, io_mode)?;
+        let enc_name: &'static str = decoded.encoding.name();
+        let has_bom = decoded.bom_len > 0;
+        let le_label: &'static str = match decoded.line_ending {
+            LineEnding::Lf => "LF",
+            LineEnding::CrLf => "CRLF",
+            LineEnding::Cr => "CR",
         };
+        (decoded.text, enc_name, has_bom, le_label)
+    };
 
     // ── Emit stats ────────────────────────────────────────────────────────────
     // Stats (encoding, BOM, line-ending) are emitted before metric counts.

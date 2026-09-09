@@ -19,9 +19,8 @@
 //! OFFSET and END are decimal integers or `0x`/`0X`-prefixed hex.
 //! Changing any selector prefix is a breaking CLI change.
 
-use std::{error::Error, path::Path, sync::Arc};
+use std::{error::Error, path::Path};
 
-use harrier::{encoding::SourceConfig, source::Source};
 use md5::{Digest, Md5};
 
 use crate::IoMode;
@@ -200,15 +199,7 @@ fn run_text_validator(
 /// string that would result from a terminal newline is dropped so that
 /// line counts match what an editor would report.
 fn decode_file_lines(file: &Path, io_mode: IoMode) -> Result<Vec<String>, Box<dyn Error>> {
-    let branch = crate::open_as_branch(file, io_mode)?;
-    let file_len = branch.byte_len();
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-    let bom_len = source.bom_len();
-    let encoding = source.encoding();
-    let lines = source.as_lines()?;
-    let view = lines.view_range(bom_len as u64..file_len)?;
-    let (text, _) = encoding.decode_without_bom_handling(&view.bytes);
-
+    let text = crate::read_text_file(file, io_mode)?.text;
     let mut parts: Vec<String> = text.split('\n').map(str::to_owned).collect();
     // Drop the trailing empty element produced by a terminal '\n'.
     if parts.last().map(String::is_empty).unwrap_or(false) {
@@ -577,6 +568,14 @@ mod tests {
     fn byte_slice_valid() {
         let bytes = b"hello";
         assert_eq!(byte_slice(bytes, 1, 4).unwrap(), b"ell");
+    }
+
+    // lo == hi is a valid (empty) range, not "start exceeds end". Pins
+    // `lo > hi` against a `>=` mutation.
+    #[test]
+    fn byte_slice_lo_equals_hi_is_ok_empty_slice() {
+        let bytes = b"hello";
+        assert_eq!(byte_slice(bytes, 3, 3).unwrap(), b"");
     }
 
     // ── Validator function tests (file-based) ─────────────────────────────────

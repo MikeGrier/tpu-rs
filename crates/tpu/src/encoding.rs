@@ -144,6 +144,49 @@ pub(crate) fn bom_bytes_for(encoding: &'static encoding_rs::Encoding) -> &'stati
     }
 }
 
+/// Encode UTF-8 text in `encoding` without silently substituting characters.
+///
+/// `encoding_rs` intentionally exposes UTF-16 only as decoders, so those two
+/// encodings are handled directly from Rust's UTF-16 iterator.
+pub(crate) fn encode_text_strict(
+    text: &str,
+    encoding: &'static encoding_rs::Encoding,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if encoding == encoding_rs::UTF_16LE {
+        return Ok(text
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect());
+    }
+    if encoding == encoding_rs::UTF_16BE {
+        return Ok(text
+            .encode_utf16()
+            .flat_map(|unit| unit.to_be_bytes())
+            .collect());
+    }
+    let (bytes, _, had_errors) = encoding.encode(text);
+    if had_errors {
+        return Err(format!(
+            "text contains characters that cannot be represented in {}",
+            encoding.name()
+        )
+        .into());
+    }
+    Ok(bytes.into_owned())
+}
+
+/// Decode bytes after any BOM has been removed, rejecting malformed input.
+pub(crate) fn decode_text_strict<'a>(
+    bytes: &'a [u8],
+    encoding: &'static encoding_rs::Encoding,
+) -> Result<std::borrow::Cow<'a, str>, Box<dyn std::error::Error>> {
+    let (text, had_errors) = encoding.decode_without_bom_handling(bytes);
+    if had_errors {
+        return Err(format!("file is not valid {}", encoding.name()).into());
+    }
+    Ok(text)
+}
+
 /// Scan `bytes` in 2-byte (UTF-16 code-unit) steps, replacing every
 /// occurrence of the 2-byte `needle` with `replacement`.
 ///
@@ -155,19 +198,19 @@ pub(crate) fn bom_bytes_for(encoding: &'static encoding_rs::Encoding) -> &'stati
 /// rather than silently dropped.
 pub(crate) fn replace_u16_pairs(bytes: &[u8], needle: [u8; 2], replacement: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len() + bytes.len() / 20);
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == needle[0] && bytes[i + 1] == needle[1] {
+    // `chunks_exact(2)` advances by exactly 2 bytes per code unit with no
+    // manual index counter to mutate into an infinite loop; `.remainder()`
+    // yields the (0 or 1 byte) odd trailing tail directly.
+    let chunks = bytes.chunks_exact(2);
+    let remainder = chunks.remainder();
+    for pair in chunks {
+        if pair[0] == needle[0] && pair[1] == needle[1] {
             out.extend_from_slice(replacement);
         } else {
-            out.push(bytes[i]);
-            out.push(bytes[i + 1]);
+            out.extend_from_slice(pair);
         }
-        i += 2;
     }
-    if i < bytes.len() {
-        out.push(bytes[i]);
-    }
+    out.extend_from_slice(remainder);
     out
 }
 
@@ -231,19 +274,19 @@ pub(crate) fn denormalize_lf_to_cr(
 /// bytes never take those values), so a byte-level scan is safe.
 pub(crate) fn normalize_bytes_to_lf(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == 0x0D {
+    // Iterator-driven walk (no manual index counter): position advances
+    // solely via `iter.next()`, so there is no `i += 1`-style step to
+    // mutate into an infinite loop.
+    let mut iter = bytes.iter().enumerate();
+    while let Some((idx, &b)) = iter.next() {
+        if b == 0x0D {
             // CR (lone) or CRLF → LF.
             out.push(0x0A);
-            if i + 1 < bytes.len() && bytes[i + 1] == 0x0A {
-                i += 2;
-            } else {
-                i += 1;
+            if bytes.get(idx + 1) == Some(&0x0A) {
+                iter.next(); // consume the paired LF
             }
         } else {
-            out.push(bytes[i]);
-            i += 1;
+            out.push(b);
         }
     }
     out
@@ -257,26 +300,26 @@ pub(crate) fn normalize_bytes_to_lf(bytes: &[u8]) -> Vec<u8> {
 /// a line terminator.
 pub(crate) fn normalize_u16_to_lf(bytes: &[u8], cr: [u8; 2], lf: [u8; 2]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i + 1 < bytes.len() {
-        if bytes[i] == cr[0] && bytes[i + 1] == cr[1] {
+    // `chunks_exact(2)` walks in 2-byte (code-unit) steps with no manual
+    // index counter to mutate into an infinite loop; `.remainder()` yields
+    // the (0 or 1 byte) odd trailing tail directly.
+    let mut chunks = bytes.chunks_exact(2);
+    while let Some(unit) = chunks.next() {
+        if unit[0] == cr[0] && unit[1] == cr[1] {
             // CR unit (lone) or CRLF → LF unit.
             out.extend_from_slice(&lf);
-            if i + 3 < bytes.len() && bytes[i + 2] == lf[0] && bytes[i + 3] == lf[1] {
-                i += 4;
-            } else {
-                i += 2;
+            // If the following unit is the LF unit, this was CRLF: consume
+            // it too so the pair collapses to one logical newline instead
+            // of also being (harmlessly, but redundantly) re-scanned as its
+            // own unit next iteration.
+            if chunks.clone().next() == Some(&lf) {
+                chunks.next();
             }
         } else {
-            out.push(bytes[i]);
-            out.push(bytes[i + 1]);
-            i += 2;
+            out.extend_from_slice(unit);
         }
     }
-    if i < bytes.len() {
-        // Odd trailing byte (should not occur in valid UTF-16); forward it.
-        out.push(bytes[i]);
-    }
+    out.extend_from_slice(chunks.remainder());
     out
 }
 
@@ -482,5 +525,127 @@ mod tests {
         let bytes = vec![0x41, 0x0A, 0x00, 0x01, 0x0A, 0x00];
         let out = apply_line_ending_to_all(bytes, encoding_rs::UTF_16LE, LineEnding::CrLf);
         assert_eq!(out, [0x41, 0x0A, 0x00, 0x01, 0x0D, 0x00, 0x0A, 0x00]);
+    }
+
+    // ── normalize_bytes_to_lf ─────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_bytes_to_lf_empty() {
+        assert_eq!(normalize_bytes_to_lf(b""), b"");
+    }
+
+    #[test]
+    fn normalize_bytes_to_lf_lone_lf_is_unchanged() {
+        assert_eq!(normalize_bytes_to_lf(b"a\nb"), b"a\nb");
+    }
+
+    #[test]
+    fn normalize_bytes_to_lf_crlf_pair_becomes_single_lf() {
+        assert_eq!(normalize_bytes_to_lf(b"a\r\nb"), b"a\nb");
+    }
+
+    /// A lone CR (not immediately followed by LF) must still become LF, and
+    /// the byte *after* it must be processed independently -- pins the
+    /// `bytes.get(idx + 1) == Some(&0x0A)` lookahead against a mutation that
+    /// makes it unconditionally true (which would misclassify every CR as
+    /// CRLF and wrongly consume the following byte).
+    #[test]
+    fn normalize_bytes_to_lf_lone_cr_not_followed_by_lf() {
+        assert_eq!(normalize_bytes_to_lf(b"a\rb"), b"a\nb");
+    }
+
+    #[test]
+    fn normalize_bytes_to_lf_trailing_lone_cr() {
+        assert_eq!(normalize_bytes_to_lf(b"a\r"), b"a\n");
+    }
+
+    #[test]
+    fn normalize_bytes_to_lf_mixed_terminators() {
+        assert_eq!(normalize_bytes_to_lf(b"a\nb\r\nc\rd"), b"a\nb\nc\nd");
+    }
+
+    // ── normalize_u16_to_lf ───────────────────────────────────────────────────
+
+    const CR_LE: [u8; 2] = [0x0D, 0x00];
+    const LF_LE: [u8; 2] = [0x0A, 0x00];
+
+    #[test]
+    fn normalize_u16_to_lf_empty() {
+        assert_eq!(normalize_u16_to_lf(&[], CR_LE, LF_LE), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn normalize_u16_to_lf_lone_lf_unit_is_unchanged() {
+        // 'a' unit, LF unit, 'b' unit (UTF-16LE).
+        let bytes = [0x61, 0x00, 0x0A, 0x00, 0x62, 0x00];
+        assert_eq!(normalize_u16_to_lf(&bytes, CR_LE, LF_LE), bytes);
+    }
+
+    #[test]
+    fn normalize_u16_to_lf_crlf_pair_becomes_single_lf_unit() {
+        let bytes = [0x61, 0x00, 0x0D, 0x00, 0x0A, 0x00, 0x62, 0x00];
+        let out = normalize_u16_to_lf(&bytes, CR_LE, LF_LE);
+        assert_eq!(out, [0x61, 0x00, 0x0A, 0x00, 0x62, 0x00]);
+    }
+
+    /// A lone CR unit (not immediately followed by an LF unit) must still
+    /// become an LF unit, and the following unit must be processed on its
+    /// own -- pins the CRLF-lookahead comparison against a mutation that
+    /// makes it unconditionally true.
+    #[test]
+    fn normalize_u16_to_lf_lone_cr_unit_not_followed_by_lf_unit() {
+        let bytes = [0x61, 0x00, 0x0D, 0x00, 0x62, 0x00];
+        let out = normalize_u16_to_lf(&bytes, CR_LE, LF_LE);
+        assert_eq!(out, [0x61, 0x00, 0x0A, 0x00, 0x62, 0x00]);
+    }
+
+    #[test]
+    fn normalize_u16_to_lf_trailing_lone_cr_unit() {
+        let bytes = [0x61, 0x00, 0x0D, 0x00];
+        let out = normalize_u16_to_lf(&bytes, CR_LE, LF_LE);
+        assert_eq!(out, [0x61, 0x00, 0x0A, 0x00]);
+    }
+
+    #[test]
+    fn normalize_u16_to_lf_forwards_odd_trailing_byte() {
+        let bytes = [0x61, 0x00, 0x42];
+        let out = normalize_u16_to_lf(&bytes, CR_LE, LF_LE);
+        assert_eq!(out, [0x61, 0x00, 0x42]);
+    }
+
+    #[test]
+    fn normalize_u16_to_lf_mixed_units() {
+        // 'a', LF, CRLF, 'b', lone CR, 'c'.
+        let bytes = [
+            0x61, 0x00, // a
+            0x0A, 0x00, // LF
+            0x0D, 0x00, 0x0A, 0x00, // CRLF
+            0x62, 0x00, // b
+            0x0D, 0x00, // CR
+            0x63, 0x00, // c
+        ];
+        let out = normalize_u16_to_lf(&bytes, CR_LE, LF_LE);
+        assert_eq!(
+            out,
+            [
+                0x61, 0x00, // a
+                0x0A, 0x00, // LF
+                0x0A, 0x00, // LF (from CRLF)
+                0x62, 0x00, // b
+                0x0A, 0x00, // LF (from lone CR)
+                0x63, 0x00, // c
+            ]
+        );
+    }
+
+    // ── apply_line_ending_to_all: single-byte / UTF-8, target = Cr ───────────
+
+    /// Pins `if b == 0x0A { 0x0D } else { b }` against a mutation to `!=`,
+    /// which would invert which bytes get remapped to CR.
+    #[test]
+    fn apply_line_ending_to_all_utf8_target_cr_maps_lf_to_cr_only() {
+        let bytes = b"a\nb".to_vec();
+        let out = apply_line_ending_to_all(bytes, encoding_rs::UTF_8, LineEnding::Cr);
+        assert_eq!(out, b"a\rb");
     }
 }

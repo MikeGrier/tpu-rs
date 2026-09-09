@@ -153,10 +153,9 @@ fn main() {
         };
 
         // Notifications have no id — no response is sent.
-        let id = match msg.id {
-            None => continue,
-            Some(ref v) if v.is_null() => continue,
+        let id = match request_id(msg.id) {
             Some(v) => v,
+            None => continue,
         };
 
         let body = dispatch(
@@ -177,6 +176,29 @@ fn main() {
                 body,
             },
         );
+    }
+}
+
+/// Decide whether an incoming JSON-RPC message's `id` field identifies it
+/// as a request needing a response, and if so extract that id.
+///
+/// Per JSON-RPC 2.0, a message with no `id` member — or with an `id` that is
+/// explicitly `null` — is a *notification*: the server MUST NOT send a
+/// response for it. Returns `None` in both of those cases; returns
+/// `Some(id)` for any other (request) value.
+///
+/// This is split out from the event loop body as a small pure function so
+/// it can be unit-tested directly against in-memory `Option<Value>` inputs
+/// rather than only through a full stdio round trip (where a mutation to
+/// the `is_null()` check previously showed up as a `cargo mutants` TIMEOUT:
+/// misclassifying a notification as a request causes the server to attempt
+/// a response the client never expects and isn't reading for, which can
+/// block the writer once the pipe buffer fills).
+fn request_id(id: Option<Value>) -> Option<Value> {
+    match id {
+        None => None,
+        Some(v) if v.is_null() => None,
+        Some(v) => Some(v),
     }
 }
 
@@ -376,23 +398,20 @@ fn log_warn(out: &mut impl io::Write, message: impl Into<String>) {
 /// stdout writer is available so they appear in the client's MCP output
 /// channel at `warning` level rather than as `[warning]`-tagged stderr.
 fn parse_config() -> (tools::ServerConfig, Vec<String>) {
-    let mut verify_delay_ms: u64 = 100;
-    let mut quiet: bool = std::env::var_os("TPU_MCP_QUIET").is_some_and(|v| !v.is_empty());
+    let verify_delay_ms: u64 = 100;
+    let quiet: bool = std::env::var_os("TPU_MCP_QUIET").is_some_and(|v| !v.is_empty());
     // Out-of-process I/O isolation: default on Windows, off elsewhere.
     // The env var lets users disable it without editing `mcp.json`.
-    let mut io_worker_enabled: bool =
+    let io_worker_enabled: bool =
         cfg!(windows) && std::env::var_os("TPU_MCP_NO_IO_WORKER").is_none_or(|v| v.is_empty());
-    // Write-time line-ending normalisation (default off).  The VS Code
-    // extension forwards its `tpu-mcp.normalizeLineEndings` setting as the env
-    // var; the `--eol-normalize` flag below overrides it on.
-    let mut eol_normalize: bool =
-        std::env::var_os("TPU_EOL_NORMALIZE").is_some_and(|v| !v.is_empty());
+    // Retained for compatibility with older extension/server combinations.
+    let eol_normalize: bool = std::env::var_os("TPU_EOL_NORMALIZE").is_some_and(|v| !v.is_empty());
     let mut warnings: Vec<String> = Vec::new();
     // Default walk-error policy for tools that traverse trees (find, copy).
     // Honour the env var first so the VS Code extension can plumb the user
     // setting in without needing a CLI flag at all; the CLI flag wins if
     // explicitly supplied.
-    let mut default_on_error = match std::env::var("TPU_DEFAULT_ERROR_MODE").ok().as_deref() {
+    let default_on_error = match std::env::var("TPU_DEFAULT_ERROR_MODE").ok().as_deref() {
         Some("strict") | Some("fail") => tpu::cmd::copy::OnError::Fail,
         Some("continue") | Some("warn") => tpu::cmd::copy::OnError::Warn,
         Some(other) if !other.is_empty() => {
@@ -403,7 +422,7 @@ fn parse_config() -> (tools::ServerConfig, Vec<String>) {
         }
         _ => tpu::cmd::copy::OnError::Warn,
     };
-    let mut progress_detail = match std::env::var("TPU_PROGRESS_DETAIL").ok().as_deref() {
+    let progress_detail = match std::env::var("TPU_PROGRESS_DETAIL").ok().as_deref() {
         Some("summary") => tools::ProgressDetail::Summary,
         Some("each-file") | Some("each_file") => tools::ProgressDetail::EachFile,
         Some(other) if !other.is_empty() => {
@@ -414,52 +433,613 @@ fn parse_config() -> (tools::ServerConfig, Vec<String>) {
         }
         _ => tools::ProgressDetail::EachFile,
     };
+    let mut flags = ArgFlags {
+        verify_delay_ms,
+        default_on_error,
+        progress_detail,
+        quiet,
+        eol_normalize,
+        io_worker_enabled,
+        warnings,
+    };
     for arg in std::env::args_os().skip(1) {
-        let s = arg.to_string_lossy();
-        if let Some(rest) = s.strip_prefix("--verify-delay-ms=") {
-            if let Ok(n) = rest.parse::<u64>() {
-                verify_delay_ms = n;
-            } else {
-                warnings.push(format!(
-                    "ignoring invalid --verify-delay-ms value: {rest:?}"
-                ));
-            }
-        } else if let Some(rest) = s.strip_prefix("--default-on-error=") {
-            match rest {
-                "warn" | "continue" => default_on_error = tpu::cmd::copy::OnError::Warn,
-                "fail" | "strict" => default_on_error = tpu::cmd::copy::OnError::Fail,
-                other => warnings.push(format!(
-                    "ignoring invalid --default-on-error value: {other:?}"
-                )),
-            }
-        } else if let Some(rest) = s.strip_prefix("--progress-detail=") {
-            match rest {
-                "each-file" | "each_file" => progress_detail = tools::ProgressDetail::EachFile,
-                "summary" => progress_detail = tools::ProgressDetail::Summary,
-                other => warnings.push(format!(
-                    "ignoring invalid --progress-detail value: {other:?}"
-                )),
-            }
-        } else if s == "--quiet" {
-            quiet = true;
-        } else if s == "--eol-normalize" {
-            eol_normalize = true;
-        } else if s == worker::DISABLE_ARG {
-            io_worker_enabled = false;
-        } else if s == worker::WORKER_ARG {
-            // Handled earlier (process never reaches here in worker mode);
-            // ignore silently if it ever appears here.
-        }
+        apply_arg(&mut flags, &arg.to_string_lossy());
     }
     (
         tools::ServerConfig {
-            verify_delay_ms,
-            trace: !quiet,
-            default_on_error,
-            progress_detail,
-            io_worker_enabled,
-            eol_normalize,
+            verify_delay_ms: flags.verify_delay_ms,
+            trace: !flags.quiet,
+            default_on_error: flags.default_on_error,
+            progress_detail: flags.progress_detail,
+            io_worker_enabled: flags.io_worker_enabled,
+            eol_normalize: flags.eol_normalize,
         },
-        warnings,
+        flags.warnings,
     )
+}
+
+/// The subset of [`parse_config`]'s state that a single CLI argument can
+/// affect, threaded through [`apply_arg`].
+struct ArgFlags {
+    verify_delay_ms: u64,
+    default_on_error: tpu::cmd::copy::OnError,
+    progress_detail: tools::ProgressDetail,
+    quiet: bool,
+    eol_normalize: bool,
+    io_worker_enabled: bool,
+    warnings: Vec<String>,
+}
+
+/// Apply one already-decoded CLI argument to `flags`, exactly as `parse_config`'s
+/// former inline loop body did.
+///
+/// Split out as a pure function over a plain `&str` (rather than reading
+/// `std::env::args_os()` directly) so the argument-matching logic --
+/// including the exact string comparisons for `--quiet`/`--eol-normalize`/
+/// the worker sentinel args -- can be unit-tested with synthetic argument
+/// strings instead of only through a real process invocation.
+fn apply_arg(flags: &mut ArgFlags, s: &str) {
+    if let Some(rest) = s.strip_prefix("--verify-delay-ms=") {
+        if let Ok(n) = rest.parse::<u64>() {
+            flags.verify_delay_ms = n;
+        } else {
+            flags.warnings.push(format!(
+                "ignoring invalid --verify-delay-ms value: {rest:?}"
+            ));
+        }
+    } else if let Some(rest) = s.strip_prefix("--default-on-error=") {
+        match rest {
+            "warn" | "continue" => flags.default_on_error = tpu::cmd::copy::OnError::Warn,
+            "fail" | "strict" => flags.default_on_error = tpu::cmd::copy::OnError::Fail,
+            other => flags.warnings.push(format!(
+                "ignoring invalid --default-on-error value: {other:?}"
+            )),
+        }
+    } else if let Some(rest) = s.strip_prefix("--progress-detail=") {
+        match rest {
+            "each-file" | "each_file" => flags.progress_detail = tools::ProgressDetail::EachFile,
+            "summary" => flags.progress_detail = tools::ProgressDetail::Summary,
+            other => flags.warnings.push(format!(
+                "ignoring invalid --progress-detail value: {other:?}"
+            )),
+        }
+    } else if s == "--quiet" {
+        flags.quiet = true;
+    } else if s == "--eol-normalize" {
+        flags.eol_normalize = true;
+    } else if s == worker::DISABLE_ARG {
+        flags.io_worker_enabled = false;
+    } else if s == worker::WORKER_ARG {
+        // Handled earlier (process never reaches here in worker mode);
+        // ignore silently if it ever appears here.
+        //
+        // (Mutation testing: this arm's body is empty, so mutating the `==`
+        // above to `!=` is behaviourally equivalent for every possible `s`
+        // -- entering an empty branch and falling through past it produce
+        // the exact same observable nothing. Not pursued.)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- request_id --------------------------------------------------------
+
+    #[test]
+    fn request_id_none_is_notification() {
+        assert_eq!(request_id(None), None);
+    }
+
+    #[test]
+    fn request_id_explicit_null_is_notification() {
+        assert_eq!(request_id(Some(Value::Null)), None);
+    }
+
+    #[test]
+    fn request_id_number_is_a_request() {
+        assert_eq!(request_id(Some(Value::from(42))), Some(Value::from(42)));
+    }
+
+    #[test]
+    fn request_id_string_is_a_request() {
+        assert_eq!(
+            request_id(Some(Value::from("abc"))),
+            Some(Value::from("abc"))
+        );
+    }
+
+    #[test]
+    fn request_id_zero_is_a_request_not_a_notification() {
+        // A falsy-but-non-null id (0) must still be treated as a request:
+        // this guards against a `v.is_null()` -> `true`-style mutation that
+        // would happen to also swallow every other "falsy" id.
+        assert_eq!(request_id(Some(Value::from(0))), Some(Value::from(0)));
+    }
+
+    // -- send_response / send_error -----------------------------------------
+    //
+    // Both functions are generic over `impl io::Write`, so -- like
+    // `worker::write_response` -- they can be tested directly against an
+    // in-memory buffer with no stdio round trip. This closes the mutants
+    // that previously only had coverage via a real subprocess exchange
+    // (`tests/mcp_protocol.rs`), where a mutation to either function's body
+    // silences the response entirely and the client's blocking read hangs.
+
+    #[test]
+    fn send_response_ok_emits_expected_json_line() {
+        let mut buf: Vec<u8> = Vec::new();
+        send_response(
+            &mut buf,
+            Response {
+                jsonrpc: "2.0",
+                id: Value::from(5),
+                body: ResponseBody::Ok {
+                    result: serde_json::json!({ "hello": "world" }),
+                },
+            },
+        );
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.ends_with('\n'));
+        let parsed: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 5);
+        assert_eq!(parsed["result"]["hello"], "world");
+        assert!(parsed.get("error").is_none());
+    }
+
+    #[test]
+    fn send_response_err_emits_expected_json_line() {
+        let mut buf: Vec<u8> = Vec::new();
+        send_response(
+            &mut buf,
+            Response {
+                jsonrpc: "2.0",
+                id: Value::from(9),
+                body: ResponseBody::Err {
+                    error: RpcError {
+                        code: code::METHOD_NOT_FOUND,
+                        message: "nope".to_string(),
+                    },
+                },
+            },
+        );
+        let line = String::from_utf8(buf).unwrap();
+        let parsed: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["id"], 9);
+        assert_eq!(parsed["error"]["code"], code::METHOD_NOT_FOUND);
+        assert_eq!(parsed["error"]["message"], "nope");
+        assert!(parsed.get("result").is_none());
+    }
+
+    #[test]
+    fn send_error_emits_expected_json_line() {
+        let mut buf: Vec<u8> = Vec::new();
+        send_error(
+            &mut buf,
+            Value::from(3),
+            code::PARSE_ERROR,
+            "bad json".to_string(),
+        );
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.ends_with('\n'));
+        assert_eq!(buf_lines(&line), 1);
+        let parsed: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["id"], 3);
+        assert_eq!(parsed["error"]["code"], code::PARSE_ERROR);
+        assert_eq!(parsed["error"]["message"], "bad json");
+    }
+
+    fn buf_lines(s: &str) -> usize {
+        s.bytes().filter(|&b| b == b'\n').count()
+    }
+
+    // -- JSON-RPC reserved error codes ---------------------------------------
+    //
+    // These must be negative per the JSON-RPC 2.0 spec; pins each constant's
+    // exact value against a mutation that deletes the leading `-`.
+
+    #[test]
+    fn reserved_error_codes_are_negative_and_exact() {
+        assert_eq!(code::PARSE_ERROR, -32700);
+        assert_eq!(code::METHOD_NOT_FOUND, -32601);
+        assert_eq!(code::INVALID_PARAMS, -32602);
+    }
+
+    // -- dispatch -------------------------------------------------------------
+
+    fn test_config() -> tools::ServerConfig {
+        tools::ServerConfig::default()
+    }
+
+    #[test]
+    fn dispatch_ping_returns_empty_ok_result() {
+        let config = test_config();
+        let worker = IoWorkerHandle::disabled();
+        let mut out: Vec<u8> = Vec::new();
+        let body = dispatch("ping", None, &config, &worker, &mut out);
+        match body {
+            ResponseBody::Ok { result } => assert_eq!(result, serde_json::json!({})),
+            ResponseBody::Err { .. } => panic!("ping must not error"),
+        }
+    }
+
+    #[test]
+    fn dispatch_shutdown_returns_null_ok_result() {
+        let config = test_config();
+        let worker = IoWorkerHandle::disabled();
+        let mut out: Vec<u8> = Vec::new();
+        let body = dispatch("shutdown", None, &config, &worker, &mut out);
+        match body {
+            ResponseBody::Ok { result } => assert_eq!(result, Value::Null),
+            ResponseBody::Err { .. } => panic!("shutdown must not error"),
+        }
+    }
+
+    #[test]
+    fn log_info_emits_expected_notification() {
+        let mut buf: Vec<u8> = Vec::new();
+        log_info(&mut buf, "hello");
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.ends_with('\n'));
+        let parsed: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["jsonrpc"], "2.0");
+        assert_eq!(parsed["method"], "notifications/message");
+        assert_eq!(parsed["params"]["level"], "info");
+        assert_eq!(parsed["params"]["logger"], "tpu-mcp");
+        assert_eq!(parsed["params"]["data"], "hello");
+    }
+
+    #[test]
+    fn log_warn_emits_expected_notification() {
+        let mut buf: Vec<u8> = Vec::new();
+        log_warn(&mut buf, "uh oh");
+        let line = String::from_utf8(buf).unwrap();
+        let parsed: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["params"]["level"], "warning");
+        assert_eq!(parsed["params"]["logger"], "tpu-mcp");
+        assert_eq!(parsed["params"]["data"], "uh oh");
+    }
+
+    #[test]
+    fn dispatch_unknown_method_is_method_not_found() {
+        let config = test_config();
+        let worker = IoWorkerHandle::disabled();
+        let mut out: Vec<u8> = Vec::new();
+        let body = dispatch("nonexistent/method", None, &config, &worker, &mut out);
+        match body {
+            ResponseBody::Err { error } => assert_eq!(error.code, code::METHOD_NOT_FOUND),
+            ResponseBody::Ok { .. } => panic!("unknown method must error"),
+        }
+    }
+
+    // -- apply_arg ------------------------------------------------------------
+
+    fn default_flags() -> ArgFlags {
+        ArgFlags {
+            verify_delay_ms: 100,
+            default_on_error: tpu::cmd::copy::OnError::Warn,
+            progress_detail: tools::ProgressDetail::EachFile,
+            quiet: false,
+            eol_normalize: false,
+            io_worker_enabled: true,
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn apply_arg_verify_delay_ms_valid() {
+        let mut flags = default_flags();
+        apply_arg(&mut flags, "--verify-delay-ms=250");
+        assert_eq!(flags.verify_delay_ms, 250);
+        assert!(flags.warnings.is_empty());
+    }
+
+    #[test]
+    fn apply_arg_verify_delay_ms_invalid_warns_and_keeps_default() {
+        let mut flags = default_flags();
+        apply_arg(&mut flags, "--verify-delay-ms=notanumber");
+        assert_eq!(flags.verify_delay_ms, 100);
+        assert_eq!(flags.warnings.len(), 1);
+    }
+
+    #[test]
+    fn apply_arg_default_on_error_each_recognised_value() {
+        for (arg, expected) in [
+            ("warn", tpu::cmd::copy::OnError::Warn),
+            ("continue", tpu::cmd::copy::OnError::Warn),
+            ("fail", tpu::cmd::copy::OnError::Fail),
+            ("strict", tpu::cmd::copy::OnError::Fail),
+        ] {
+            let mut flags = default_flags();
+            apply_arg(&mut flags, &format!("--default-on-error={arg}"));
+            assert_eq!(flags.default_on_error, expected, "arg={arg}");
+            assert!(flags.warnings.is_empty(), "arg={arg}");
+        }
+    }
+
+    #[test]
+    fn apply_arg_default_on_error_invalid_warns() {
+        let mut flags = default_flags();
+        apply_arg(&mut flags, "--default-on-error=bogus");
+        assert_eq!(flags.warnings.len(), 1);
+    }
+
+    #[test]
+    fn apply_arg_progress_detail_each_recognised_value() {
+        for (arg, expected) in [
+            ("each-file", tools::ProgressDetail::EachFile),
+            ("each_file", tools::ProgressDetail::EachFile),
+            ("summary", tools::ProgressDetail::Summary),
+        ] {
+            let mut flags = default_flags();
+            apply_arg(&mut flags, &format!("--progress-detail={arg}"));
+            assert_eq!(flags.progress_detail, expected, "arg={arg}");
+            assert!(flags.warnings.is_empty(), "arg={arg}");
+        }
+    }
+
+    #[test]
+    fn apply_arg_progress_detail_invalid_warns() {
+        let mut flags = default_flags();
+        apply_arg(&mut flags, "--progress-detail=bogus");
+        assert_eq!(flags.warnings.len(), 1);
+    }
+
+    #[test]
+    fn apply_arg_quiet_sets_flag() {
+        let mut flags = default_flags();
+        apply_arg(&mut flags, "--quiet");
+        assert!(flags.quiet);
+    }
+
+    #[test]
+    fn apply_arg_eol_normalize_sets_flag() {
+        let mut flags = default_flags();
+        apply_arg(&mut flags, "--eol-normalize");
+        assert!(flags.eol_normalize);
+    }
+
+    #[test]
+    fn apply_arg_disable_worker_arg_clears_flag() {
+        let mut flags = default_flags();
+        apply_arg(&mut flags, worker::DISABLE_ARG);
+        assert!(!flags.io_worker_enabled);
+    }
+
+    #[test]
+    fn apply_arg_worker_sentinel_arg_is_a_no_op() {
+        let mut flags = default_flags();
+        apply_arg(&mut flags, worker::WORKER_ARG);
+        assert!(flags.io_worker_enabled);
+        assert!(flags.warnings.is_empty());
+    }
+
+    #[test]
+    fn apply_arg_unrecognised_arg_is_silently_ignored() {
+        let mut flags = default_flags();
+        apply_arg(&mut flags, "--totally-unknown-flag");
+        assert!(flags.warnings.is_empty());
+        assert_eq!(flags.verify_delay_ms, 100);
+    }
+
+    // -- parse_config env-var-driven defaults --------------------------------
+    //
+    // `parse_config` reads real process env vars, which are global mutable
+    // state shared by every thread in the process. nextest runs each test in
+    // its own OS process, so that alone would make this safe -- but plain
+    // `cargo test` runs tests from one binary multithreaded in a *single*
+    // shared process by default, where two of these tests setting the same
+    // env var concurrently would race. `ENV_VAR_TEST_LOCK` serialises just
+    // this group of tests against each other so they are correct under
+    // either test runner, not only under nextest.
+    static ENV_VAR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn parse_config_default_on_error_env_var_recognised_values() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        for (val, expected) in [
+            ("strict", tpu::cmd::copy::OnError::Fail),
+            ("fail", tpu::cmd::copy::OnError::Fail),
+            ("continue", tpu::cmd::copy::OnError::Warn),
+            ("warn", tpu::cmd::copy::OnError::Warn),
+        ] {
+            unsafe {
+                std::env::set_var("TPU_DEFAULT_ERROR_MODE", val);
+            }
+            let (config, warnings) = parse_config();
+            assert_eq!(config.default_on_error, expected, "val={val}");
+            assert!(warnings.is_empty(), "val={val}");
+        }
+        unsafe {
+            std::env::remove_var("TPU_DEFAULT_ERROR_MODE");
+        }
+    }
+
+    #[test]
+    fn parse_config_default_on_error_env_var_unrecognised_nonempty_warns() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TPU_DEFAULT_ERROR_MODE", "bogus");
+        }
+        let (config, warnings) = parse_config();
+        assert_eq!(config.default_on_error, tpu::cmd::copy::OnError::Warn);
+        assert_eq!(warnings.len(), 1);
+        unsafe {
+            std::env::remove_var("TPU_DEFAULT_ERROR_MODE");
+        }
+    }
+
+    /// An empty (but present) env var value must fall back to the default
+    /// silently -- no warning -- pinning the `!other.is_empty()` guard
+    /// against a mutation that would make an empty value warn too.
+    #[test]
+    fn parse_config_default_on_error_env_var_empty_is_silent_default() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TPU_DEFAULT_ERROR_MODE", "");
+        }
+        let (config, warnings) = parse_config();
+        assert_eq!(config.default_on_error, tpu::cmd::copy::OnError::Warn);
+        assert!(warnings.is_empty(), "empty value must not warn");
+        unsafe {
+            std::env::remove_var("TPU_DEFAULT_ERROR_MODE");
+        }
+    }
+
+    #[test]
+    fn parse_config_progress_detail_env_var_recognised_values() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        for (val, expected) in [
+            ("summary", tools::ProgressDetail::Summary),
+            ("each-file", tools::ProgressDetail::EachFile),
+            ("each_file", tools::ProgressDetail::EachFile),
+        ] {
+            unsafe {
+                std::env::set_var("TPU_PROGRESS_DETAIL", val);
+            }
+            let (config, warnings) = parse_config();
+            assert_eq!(config.progress_detail, expected, "val={val}");
+            assert!(warnings.is_empty(), "val={val}");
+        }
+        unsafe {
+            std::env::remove_var("TPU_PROGRESS_DETAIL");
+        }
+    }
+
+    #[test]
+    fn parse_config_progress_detail_env_var_unrecognised_nonempty_warns() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TPU_PROGRESS_DETAIL", "bogus");
+        }
+        let (config, warnings) = parse_config();
+        assert_eq!(config.progress_detail, tools::ProgressDetail::EachFile);
+        assert_eq!(warnings.len(), 1);
+        unsafe {
+            std::env::remove_var("TPU_PROGRESS_DETAIL");
+        }
+    }
+
+    #[test]
+    fn parse_config_progress_detail_env_var_empty_is_silent_default() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TPU_PROGRESS_DETAIL", "");
+        }
+        let (config, warnings) = parse_config();
+        assert_eq!(config.progress_detail, tools::ProgressDetail::EachFile);
+        assert!(warnings.is_empty(), "empty value must not warn");
+        unsafe {
+            std::env::remove_var("TPU_PROGRESS_DETAIL");
+        }
+    }
+
+    /// `TPU_MCP_QUIET` set to a non-empty value must enable quiet mode (and
+    /// therefore disable `trace`); unset or empty must leave tracing on --
+    /// pins both the `!v.is_empty()` guard and the `trace: !flags.quiet`
+    /// inversion in one round trip.
+    #[test]
+    fn parse_config_quiet_env_var_non_empty_disables_trace() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TPU_MCP_QUIET", "1");
+        }
+        let (config, _) = parse_config();
+        assert!(!config.trace, "non-empty TPU_MCP_QUIET must disable trace");
+        unsafe {
+            std::env::remove_var("TPU_MCP_QUIET");
+        }
+    }
+
+    #[test]
+    fn parse_config_quiet_env_var_empty_or_unset_keeps_trace_on() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("TPU_MCP_QUIET");
+        }
+        let (config, _) = parse_config();
+        assert!(config.trace, "unset TPU_MCP_QUIET must leave trace on");
+
+        unsafe {
+            std::env::set_var("TPU_MCP_QUIET", "");
+        }
+        let (config, _) = parse_config();
+        assert!(config.trace, "empty TPU_MCP_QUIET must leave trace on");
+        unsafe {
+            std::env::remove_var("TPU_MCP_QUIET");
+        }
+    }
+
+    /// `TPU_MCP_NO_IO_WORKER` set to a non-empty value must disable the
+    /// worker subsystem on Windows -- pins the `&&` in
+    /// `cfg!(windows) && ...is_none_or(...)` against an `||` mutation, which
+    /// would make `io_worker_enabled` always `true` regardless of this env
+    /// var (since `cfg!(windows)` is `true` on this build).
+    #[test]
+    #[cfg(windows)]
+    fn parse_config_no_io_worker_env_var_non_empty_disables_worker() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TPU_MCP_NO_IO_WORKER", "1");
+        }
+        let (config, _) = parse_config();
+        assert!(
+            !config.io_worker_enabled,
+            "non-empty TPU_MCP_NO_IO_WORKER must disable the io worker on Windows"
+        );
+        unsafe {
+            std::env::remove_var("TPU_MCP_NO_IO_WORKER");
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn parse_config_no_io_worker_env_var_empty_or_unset_keeps_worker_enabled() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("TPU_MCP_NO_IO_WORKER");
+        }
+        let (config, _) = parse_config();
+        assert!(config.io_worker_enabled);
+        unsafe {
+            std::env::remove_var("TPU_MCP_NO_IO_WORKER");
+        }
+    }
+
+    /// `TPU_EOL_NORMALIZE` set to a non-empty value must enable
+    /// `eol_normalize`; unset or empty must leave it off -- pins the
+    /// `!v.is_empty()` guard.
+    #[test]
+    fn parse_config_eol_normalize_env_var_non_empty_enables_flag() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("TPU_EOL_NORMALIZE", "1");
+        }
+        let (config, _) = parse_config();
+        assert!(config.eol_normalize);
+        unsafe {
+            std::env::remove_var("TPU_EOL_NORMALIZE");
+        }
+    }
+
+    #[test]
+    fn parse_config_eol_normalize_env_var_empty_or_unset_leaves_flag_off() {
+        let _guard = ENV_VAR_TEST_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("TPU_EOL_NORMALIZE");
+        }
+        let (config, _) = parse_config();
+        assert!(!config.eol_normalize);
+
+        unsafe {
+            std::env::set_var("TPU_EOL_NORMALIZE", "");
+        }
+        let (config, _) = parse_config();
+        assert!(!config.eol_normalize);
+        unsafe {
+            std::env::remove_var("TPU_EOL_NORMALIZE");
+        }
+    }
 }

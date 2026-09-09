@@ -622,6 +622,40 @@ mod create_cli {
             .arg("a\nb\n"));
         assert_eq!(fs::read(&dst).unwrap(), b"a\r\nb\r\n");
     }
+
+    /// `create --utf8 --bom=force` on a brand-new file must prepend a BOM.
+    /// Pins `bom_policy == BomPolicy::Force` (in
+    /// `encode_new_file_content`) against a `!=` mutation.
+    #[test]
+    fn utf8_bom_force_new_file_has_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("bom.txt");
+        ok(tpu()
+            .arg("create")
+            .arg("--utf8")
+            .arg("--bom=force")
+            .arg(&dst)
+            .arg("content\n"));
+        let bytes = fs::read(&dst).unwrap();
+        assert!(
+            bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "create --utf8 --bom=force must produce a BOM-prefixed file"
+        );
+    }
+
+    /// `create --utf8` without `--bom=force` (default policy) on a brand-new
+    /// file must not add a BOM.
+    #[test]
+    fn utf8_default_bom_new_file_has_no_bom() {
+        let dir = tempfile::tempdir().unwrap();
+        let dst = dir.path().join("nobom.txt");
+        ok(tpu().arg("create").arg("--utf8").arg(&dst).arg("content\n"));
+        let bytes = fs::read(&dst).unwrap();
+        assert!(
+            !bytes.starts_with(&[0xEF, 0xBB, 0xBF]),
+            "create --utf8 without --bom=force must not produce a BOM"
+        );
+    }
 }
 
 /// 6 `tpu replace` tests for one non-empty text asset file.
@@ -1936,6 +1970,27 @@ fn write_diff_on_change_exits_ok() {
     );
 }
 
+/// `--diff` on a brand-new (nonexistent) target file must succeed cleanly
+/// with no diff emitted -- there is no prior content to read. Pins
+/// `need_old_bytes && file.exists()` against an `||` mutation, which would
+/// wrongly attempt `fs::read` on the not-yet-created file and fail.
+#[test]
+fn write_diff_on_nonexistent_target_exits_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("brand_new.txt");
+    assert!(!dst.exists());
+    let o = ok_stdin(
+        tpu().arg("write").arg("--diff").arg(&dst),
+        b"fresh content\n",
+    );
+    assert!(
+        o.stdout.is_empty(),
+        "expected no diff output for a brand-new file; got: {:?}",
+        String::from_utf8_lossy(&o.stdout)
+    );
+    assert_eq!(fs::read(&dst).unwrap(), b"fresh content\n");
+}
+
 #[test]
 fn write_diff_shows_minus_and_plus_lines() {
     let dir = tempfile::tempdir().unwrap();
@@ -2242,10 +2297,10 @@ fn replace_multiline_caret_matches_line_starts() {
         .arg("^line")
         .arg("LINE"));
     let s = String::from_utf8(o.stderr).unwrap();
-    // The BOM-prefixed first line escapes ^-anchor match; 2 of the 3 lines are replaced.
+    // The BOM is encoding metadata, not text, so all 3 lines are replaced.
     assert!(
-        s.contains("2 replacements"),
-        "expected 2 multiline replacements; got: {s}"
+        s.contains("3 replacements"),
+        "expected 3 multiline replacements; got: {s}"
     );
     let content = fs::read_to_string(&f).unwrap();
     assert!(
@@ -2666,6 +2721,25 @@ fn write_binary_data_format_hex_with_diff_exits_ok() {
     let dst = dir.path().join("out.bin");
     // Create a prior version so a diff can be emitted.
     fs::write(&dst, b"\x00\x00").unwrap();
+    ok(tpu()
+        .arg("write")
+        .arg("--binary")
+        .arg("--diff")
+        .arg("--data-format=hex")
+        .arg(&dst)
+        .arg("4D5A"));
+    assert_eq!(fs::read(&dst).unwrap(), &[0x4D, 0x5A]);
+}
+
+/// `write --binary --diff` on a brand-new (nonexistent) target must succeed
+/// cleanly with no attempt to read a prior version. Pins `diff_out.is_some()
+/// && file.exists()` (in `run_binary`) against an `||` mutation, which would
+/// wrongly attempt `fs::read` on the not-yet-created file and fail.
+#[test]
+fn write_binary_diff_on_nonexistent_target_exits_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    let dst = dir.path().join("new.bin");
+    assert!(!dst.exists());
     ok(tpu()
         .arg("write")
         .arg("--binary")
@@ -7534,6 +7608,270 @@ fn mx_replace_diff_no_match_emits_empty_diff() {
     );
 }
 
+// The three tests below pin `if diff && !diff_buf.is_empty()` (write,
+// replace, edit each have their own copy of this guard) against a `||`
+// mutation. In human-output mode an empty diff renders as an empty string
+// either way (`HumanOutput::emit_json` only writes the `rendered` field, and
+// an empty diff's `rendered` field is itself empty), so the human-mode tests
+// above (MX-IT-1, MX-IT-6) cannot distinguish "guard correctly skipped
+// emit_json" from "guard incorrectly called emit_json with empty content".
+// `--message-format=json` makes this observable, because `JsonOutput::
+// emit_json` always writes the full `{"reason":"diff",...}` envelope
+// (non-empty) regardless of how empty the `content`/`rendered` fields are.
+
+/// `tpu write --diff --message-format=json` with identical content must not
+/// emit a `"reason":"diff"` message.
+#[test]
+fn mj_write_diff_identical_content_emits_no_diff_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("same.txt");
+    let content = b"line one\nline two\n";
+    fs::write(&path, content).unwrap();
+
+    let o = ok_stdin(
+        tpu()
+            .arg("--message-format=json")
+            .arg("write")
+            .arg("--diff")
+            .arg(&path),
+        content,
+    );
+    let msgs = parse_ndjson(&o.stdout);
+    assert!(
+        !msgs.iter().any(|m| reason(m) == "diff"),
+        "expected no 'diff' message for identical content; got: {msgs:#?}",
+    );
+}
+
+/// `tpu replace --diff --message-format=json` on a pattern with no match
+/// must not emit a `"reason":"diff"` message.
+#[test]
+fn mj_replace_diff_no_match_emits_no_diff_reason() {
+    let (_dir, path) = cp("ascii_10lines.txt");
+
+    let o = ok(tpu()
+        .arg("--message-format=json")
+        .arg("replace")
+        .arg("--diff")
+        .arg(&path)
+        .arg("ABSOLUTELY_NO_MATCH_XYZZY")
+        .arg("replacement"));
+    let msgs = parse_ndjson(&o.stdout);
+    assert!(
+        !msgs.iter().any(|m| reason(m) == "diff"),
+        "expected no 'diff' message when pattern has no match; got: {msgs:#?}",
+    );
+}
+
+/// `tpu edit --diff --message-format=json` with a splice that replaces a
+/// line with itself (no actual byte change) must not emit a
+/// `"reason":"diff"` message.
+#[test]
+fn mj_edit_diff_no_op_splice_emits_no_diff_reason() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("noop.txt");
+    fs::write(&path, b"line one\nline two\nline three\n").unwrap();
+
+    let o = ok(tpu()
+        .arg("--message-format=json")
+        .arg("edit")
+        .arg("--diff")
+        .arg(&path)
+        .arg("--splice")
+        .arg("2")
+        .arg("line two\n"));
+    let msgs = parse_ndjson(&o.stdout);
+    assert!(
+        !msgs.iter().any(|m| reason(m) == "diff"),
+        "expected no 'diff' message for a no-op splice; got: {msgs:#?}",
+    );
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        b"line one\nline two\nline three\n",
+        "no-op splice must leave the file byte-for-byte unchanged",
+    );
+}
+
+// ─── doctor CLI option wiring (main.rs's `run()` dispatch, not cmd::doctor's
+// own already-thoroughly-unit-tested internals) ───────────────────────────────
+
+/// `--format json` (doctor's own format option, independent of the global
+/// `--message-format`) must produce a single parseable JSON document.
+#[test]
+fn doctor_format_json_emits_json_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clean.txt");
+    fs::write(&path, b"hello world\n").unwrap();
+    let o = ok(tpu().arg("doctor").arg("--format").arg("json").arg(&path));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("expected a single valid JSON document, got {e}: {stdout}"));
+    assert!(parsed.is_object());
+    assert_eq!(parsed["total_issues"], 0);
+}
+
+/// The default (`human`) format must not itself be a JSON document.
+#[test]
+fn doctor_format_human_is_not_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clean.txt");
+    fs::write(&path, b"hello world\n").unwrap();
+    let o = ok(tpu().arg("doctor").arg(&path));
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).is_err(),
+        "human format should not parse as a single JSON document; got: {stdout}",
+    );
+    assert!(stdout.contains("scanned"));
+}
+
+/// A clean scan (0 issues) must exit 0; pins the boundary against a `>=`/
+/// `==` mutation on `report.total_issues() > 0`.
+#[test]
+fn doctor_clean_file_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("clean.txt");
+    fs::write(&path, b"hello world\n").unwrap();
+    let o = ok(tpu().arg("doctor").arg(&path));
+    assert!(o.status.success());
+}
+
+/// A scan with exactly one issue must exit 1; pins the boundary against a
+/// `<` mutation on `report.total_issues() > 0` (which would wrongly exit 0
+/// for a nonzero issue count -- impossible to distinguish from `>` using
+/// only the "clean" case above).
+#[test]
+fn doctor_one_issue_exits_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dirty.txt");
+    // Base-64 of the canonical Latin-1 "cafe" mojibake fingerprint (see
+    // crates/tpu/src/test_fixtures.rs for the documented byte sequence).
+    fs::write(&path, decode_b64("Y2Fmw4PCqQo=")).unwrap();
+    let mut cmd = tpu();
+    cmd.arg("doctor").arg(&path);
+    let o = cmd.output().expect("failed to spawn tpu");
+    assert_eq!(o.status.code(), Some(1));
+}
+
+/// `--fix peel` must actually repair a flagged file in place; without it,
+/// the file is left untouched -- pins the `Some("peel") | Some("all")`
+/// match arm against deletion (which would fall through to `DoctorFix::None`
+/// and silently do nothing even when `--fix peel` was requested).
+#[test]
+fn doctor_fix_peel_repairs_file_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("dirty.txt");
+    let mojibake_bytes = decode_b64("Y2Fmw4PCqQo=");
+    fs::write(&path, &mojibake_bytes).unwrap();
+
+    // Without --fix: file must be unchanged.
+    let _ = tpu().arg("doctor").arg(&path).output().unwrap();
+    assert_eq!(fs::read(&path).unwrap(), mojibake_bytes);
+
+    // With --fix peel: file must be repaired to plain UTF-8.
+    let _ = tpu()
+        .arg("doctor")
+        .arg("--fix")
+        .arg("peel")
+        .arg(&path)
+        .output()
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), decode_b64("Y2Fmw6kK"));
+}
+
+/// `--quiet` suppresses walk-warning lines on stderr; without it, a
+/// warning about an inaccessible path is printed -- pins `if !opts.quiet`
+/// against a `delete !` mutation (which would invert the guard and print
+/// warnings only when `--quiet` *was* passed).
+#[test]
+fn doctor_quiet_suppresses_walk_warnings() {
+    // Must be an absolute nonexistent path: a relative one that doesn't
+    // match anything expands to zero files silently (no walk warning at
+    // all), which wouldn't exercise this guard either way.
+    let missing = std::env::temp_dir()
+        .join("definitely_missing_dir_xyz_123")
+        .join("*.txt");
+
+    let loud = tpu().arg("doctor").arg(&missing).output().unwrap();
+    let loud_stderr = String::from_utf8_lossy(&loud.stderr);
+    assert!(
+        loud_stderr.contains("warning"),
+        "expected a walk warning without --quiet; got: {loud_stderr}",
+    );
+
+    let quiet = tpu()
+        .arg("doctor")
+        .arg("--quiet")
+        .arg(&missing)
+        .output()
+        .unwrap();
+    let quiet_stderr = String::from_utf8_lossy(&quiet.stderr);
+    assert!(
+        !quiet_stderr.contains("warning"),
+        "expected no walk warning with --quiet; got: {quiet_stderr}",
+    );
+}
+
+/// `tpu setup --inject PATH` on a brand-new file reports "block appended".
+#[test]
+fn setup_inject_fresh_file_reports_block_appended() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copilot-instructions.md");
+    assert!(!path.exists());
+
+    let o = ok(tpu().arg("setup").arg("--inject").arg(&path));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("block appended"),
+        "expected 'block appended' for a fresh file; got: {stderr}"
+    );
+    assert!(path.exists(), "inject must create the target file");
+}
+
+/// A second `--inject` on a file that already has the current block must
+/// report "already up to date", not "block replaced"/"block appended".
+/// Pins `if !updated` (in `main.rs`'s `Commands::Setup` dispatch) against a
+/// `delete !` mutation, which would report the wrong verb whenever the
+/// block did not change (`updated == false`).
+#[test]
+fn setup_inject_unchanged_file_reports_already_up_to_date() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copilot-instructions.md");
+
+    ok(tpu().arg("setup").arg("--inject").arg(&path));
+    let first_write = fs::read(&path).unwrap();
+
+    let o = ok(tpu().arg("setup").arg("--inject").arg(&path));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("already up to date"),
+        "expected 'already up to date' on an unchanged re-inject; got: {stderr}"
+    );
+    // The file must not have been rewritten.
+    assert_eq!(fs::read(&path).unwrap(), first_write);
+}
+
+/// Injecting into a file that already carries an *outdated* copy of the
+/// block (different body between the markers) must report "block
+/// replaced".
+#[test]
+fn setup_inject_stale_block_reports_block_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("copilot-instructions.md");
+    fs::write(
+        &path,
+        "# Notes\n\n<!-- tpu-mcp:setup:begin -->\nstale content\n<!-- tpu-mcp:setup:end -->\n",
+    )
+    .unwrap();
+
+    let o = ok(tpu().arg("setup").arg("--inject").arg(&path));
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("block replaced"),
+        "expected 'block replaced' for a stale block; got: {stderr}"
+    );
+}
+
 /// MX-IT-7: `tpu read --binary --hash crc32:0-$` emits a line containing the hash
 /// algorithm name and a hex value.
 #[test]
@@ -9312,9 +9650,9 @@ fn rc_replace_count_crlf_file_correct_count() {
 }
 
 /// RC-IT-9: `replace --count` on a UTF-16LE file does not corrupt the file.
-/// `tpu replace` operates on raw bytes; the ASCII pattern "fox" does not appear
-/// as a raw byte sequence in the UTF-16LE encoding (each char is 2 bytes), so
-/// the count is 0.  The key invariant is that the file bytes are unchanged.
+/// `tpu replace` decodes UTF-16LE before matching, so the count reflects
+/// logical text matches. The key invariant is that count mode leaves the file
+/// bytes unchanged.
 #[test]
 fn rc_replace_count_utf16le_does_not_corrupt() {
     let dir = tempfile::tempdir().unwrap();
@@ -9328,8 +9666,7 @@ fn rc_replace_count_utf16le_does_not_corrupt() {
     fs::write(&path, &bytes).unwrap();
     let original = fs::read(&path).unwrap();
 
-    // The ASCII bytes for "fox" do not appear in the UTF-16LE encoding.
-    // --count must return 0 and must not modify the file.
+    // --count sees decoded text but must not modify the file.
     let o = ok(tpu()
         .arg("replace")
         .arg("--count")
@@ -9340,8 +9677,8 @@ fn rc_replace_count_utf16le_does_not_corrupt() {
     let stdout = String::from_utf8(o.stdout).unwrap();
     assert_eq!(
         stdout.trim(),
-        "0",
-        "expected 0 raw-byte matches in UTF-16LE file; got {stdout:?}"
+        "3",
+        "expected 3 text matches in UTF-16LE file; got {stdout:?}"
     );
 
     // File must be unchanged — the key invariant.
@@ -9354,12 +9691,10 @@ fn rc_replace_count_utf16le_does_not_corrupt() {
     assert_eq!(&original[..2], &[0xFF, 0xFE], "BOM must be intact");
 }
 
-/// RC-IT-10: `replace --dry-run` on a UTF-16LE file with no raw-byte match
-/// exits 0, emits no diff, and does not modify the file.
-/// `tpu replace` works on raw bytes; "fox" in ASCII (0x66 0x6F 0x78) does not
-/// appear in the UTF-16LE encoding where each char occupies two bytes.
+/// RC-IT-10: `replace --dry-run` matches decoded UTF-16LE text, emits a diff,
+/// exits 1 to report pending changes, and does not modify the file.
 #[test]
-fn rc_replace_dry_run_utf16le_no_match_exits_zero() {
+fn rc_replace_dry_run_utf16le_matches_without_writing() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("rc10.txt");
 
@@ -9371,17 +9706,19 @@ fn rc_replace_dry_run_utf16le_no_match_exits_zero() {
     fs::write(&path, &bytes).unwrap();
     let original = fs::read(&path).unwrap();
 
-    // No raw-byte match → exits 0, no diff emitted.
-    let o = ok(tpu()
+    let o = tpu()
         .arg("replace")
         .arg("--dry-run")
         .arg(&path)
         .arg("fox")
-        .arg("cat"));
+        .arg("cat")
+        .output()
+        .expect("failed to spawn tpu");
 
+    assert_eq!(o.status.code(), Some(1));
     assert!(
-        o.stdout.is_empty(),
-        "expected empty stdout for --dry-run with no match; got: {}",
+        String::from_utf8_lossy(&o.stdout).contains("+hello cat"),
+        "expected decoded UTF-16 dry-run diff; got: {}",
         String::from_utf8_lossy(&o.stdout)
     );
 

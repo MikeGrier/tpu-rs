@@ -857,6 +857,200 @@ mod tests {
         assert_eq!(looks_like_one_layer_peel(double), None);
     }
 
+    // ── is_clean ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_clean_reports_false_when_matches_present() {
+        // Companion to the existing `is_clean() == true` assertions on clean
+        // input: without this, a report with real matches was never checked
+        // to actually report `false`.
+        let r = scan("cafÃ©");
+        assert!(!r.matches.is_empty());
+        assert!(!r.is_clean());
+    }
+
+    // ── char_to_cp1252 (exercised via try_peel_once / looks_like_one_layer_peel) ──
+
+    #[test]
+    fn char_to_cp1252_ascii_and_gap_boundary() {
+        // The ASCII fast path covers 0x00..=0x7F; 0x80 falls in the gap
+        // between the ASCII branch and the C1 special-case table (the
+        // table's first defined codepoint is 0x0081), so it must be `None`.
+        // These two values pin both edges of the `cp < 0x80` comparison.
+        assert_eq!(char_to_cp1252('\u{007F}'), Some(0x7F));
+        assert_eq!(char_to_cp1252('\u{0080}'), None);
+    }
+
+    #[test]
+    fn char_to_cp1252_identity_range_boundary() {
+        // 0x00A0..=0x00FF round-trips as its own low byte; 0x009F (just
+        // below it) is not defined in the C1 table below and must be None.
+        assert_eq!(char_to_cp1252('\u{009F}'), None);
+        assert_eq!(char_to_cp1252('\u{00A0}'), Some(0xA0));
+        assert_eq!(char_to_cp1252('\u{00FF}'), Some(0xFF));
+    }
+
+    /// Every documented Windows-1252 C1-range special mapping. `char_to_cp1252`
+    /// is private but reachable directly from `mod tests`.
+    #[test]
+    fn char_to_cp1252_covers_full_c1_special_table() {
+        // (codepoint, expected cp1252 byte)
+        const TABLE: &[(char, u8)] = &[
+            ('\u{20AC}', 0x80),
+            ('\u{0081}', 0x81),
+            ('\u{201A}', 0x82),
+            ('\u{0192}', 0x83),
+            ('\u{201E}', 0x84),
+            ('\u{2026}', 0x85),
+            ('\u{2020}', 0x86),
+            ('\u{2021}', 0x87),
+            ('\u{02C6}', 0x88),
+            ('\u{2030}', 0x89),
+            ('\u{0160}', 0x8A),
+            ('\u{2039}', 0x8B),
+            ('\u{0152}', 0x8C),
+            ('\u{008D}', 0x8D),
+            ('\u{017D}', 0x8E),
+            ('\u{008F}', 0x8F),
+            ('\u{0090}', 0x90),
+            ('\u{2018}', 0x91),
+            ('\u{2019}', 0x92),
+            ('\u{201C}', 0x93),
+            ('\u{201D}', 0x94),
+            ('\u{2022}', 0x95),
+            ('\u{2013}', 0x96),
+            ('\u{2014}', 0x97),
+            ('\u{02DC}', 0x98),
+            ('\u{2122}', 0x99),
+            ('\u{0161}', 0x9A),
+            ('\u{203A}', 0x9B),
+            ('\u{0153}', 0x9C),
+            ('\u{009D}', 0x9D),
+            ('\u{017E}', 0x9E),
+            ('\u{0178}', 0x9F),
+        ];
+        for &(codepoint, expected_byte) in TABLE {
+            assert_eq!(
+                char_to_cp1252(codepoint),
+                Some(expected_byte),
+                "codepoint U+{:04X} should map to cp1252 byte 0x{:02X}",
+                codepoint as u32,
+                expected_byte
+            );
+        }
+    }
+
+    #[test]
+    fn char_to_cp1252_undefined_c1_codepoint_returns_none() {
+        // A C1 codepoint with no cp1252 assignment at all (outside the
+        // table above and outside the identity/ASCII ranges).
+        assert_eq!(char_to_cp1252('\u{0082}'), None);
+    }
+
+    // ── scan_replacement_chars ──────────────────────────────────────────────
+
+    #[test]
+    fn scan_replacement_chars_reports_precise_byte_offsets() {
+        // Multi-byte chars before each U+FFFD make the byte offset diverge
+        // from the char index, pinning the cumulative `pos += c.len_utf8()`
+        // arithmetic (a `pos *= ...` mutant would collapse every offset to
+        // 0; a `pos -= ...` would underflow/panic).
+        // Chars:  a(1) é(2) FFFD(3) b(1) FFFD(3) c(1)
+        // Offset: 0    1    3       6    7       10
+        let text = "aé\u{FFFD}b\u{FFFD}c";
+        let matches = scan_replacement_chars(text, false);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].byte_offset, 3);
+        assert_eq!(matches[1].byte_offset, 7);
+    }
+
+    #[test]
+    fn scan_replacement_chars_returns_empty_for_clean_text() {
+        assert_eq!(scan_replacement_chars("hello world", false), vec![]);
+    }
+
+    #[test]
+    fn scan_replacement_chars_context_window_is_byte_and_char_exact() {
+        // 20 'a's + FFFD + 20 'b's: long enough on both sides that the
+        // `(i + 1 + WINDOW).min(len)` / `i.saturating_sub(WINDOW)` bounds
+        // are determined by the arithmetic, not the clamp, so a `+` -> `-`
+        // or `+` -> `*` mutant produces an observably different (or
+        // panicking, for `-`) context window.
+        let text = format!("{}{}{}", "a".repeat(20), '\u{FFFD}', "b".repeat(20));
+        let matches = scan_replacement_chars(&text, false);
+        assert_eq!(matches.len(), 1);
+        let expected_context = format!("{}{}{}", "a".repeat(20), '\u{FFFD}', "b".repeat(20));
+        assert_eq!(matches[0].context, expected_context);
+        assert_eq!(matches[0].context.chars().count(), 41);
+    }
+
+    #[test]
+    fn scan_replacement_chars_context_window_clamps_at_start_and_end() {
+        // FFFD at the very start and very end: the window must clamp to
+        // the string bounds rather than underflow or run past the end.
+        let text = "\u{FFFD}hello\u{FFFD}";
+        let matches = scan_replacement_chars(text, false);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].context, "\u{FFFD}hello\u{FFFD}");
+        assert_eq!(matches[1].context, "\u{FFFD}hello\u{FFFD}");
+    }
+
+    #[test]
+    fn scan_replacement_chars_without_guess_never_suggests() {
+        let matches = scan_replacement_chars("a \u{FFFD} b", false);
+        assert_eq!(matches[0].suggested, None);
+    }
+
+    // ── guess_replacement_char ───────────────────────────────────────────────
+
+    #[test]
+    fn guess_replacement_char_em_dash_requires_both_flanking_spaces() {
+        let both = scan_replacement_chars("a \u{FFFD} b", true);
+        assert_eq!(both[0].suggested, Some('\u{2014}'));
+
+        // Only the left side is a space: the `&&` must not degrade to `||`.
+        let left_only = scan_replacement_chars("a \u{FFFD}b", true);
+        assert_eq!(left_only[0].suggested, None);
+
+        // Only the right side is a space.
+        let right_only = scan_replacement_chars("a\u{FFFD} b", true);
+        assert_eq!(right_only[0].suggested, None);
+    }
+
+    #[test]
+    fn guess_replacement_char_en_dash_requires_both_flanking_digits() {
+        let both = scan_replacement_chars("1\u{FFFD}9", true);
+        assert_eq!(both[0].suggested, Some('\u{2013}'));
+
+        // Only the left side is a digit.
+        let left_only = scan_replacement_chars("1\u{FFFD}x", true);
+        assert_eq!(left_only[0].suggested, None);
+
+        // Only the right side is a digit.
+        let right_only = scan_replacement_chars("x\u{FFFD}9", true);
+        assert_eq!(right_only[0].suggested, None);
+    }
+
+    #[test]
+    fn guess_replacement_char_none_at_string_boundaries() {
+        // No previous char (start of string) and no next char (end of
+        // string): `idx.checked_sub(1)` / `chars.get(idx + 1)` both `None`,
+        // so neither heuristic can fire.
+        let start = scan_replacement_chars("\u{FFFD} b", true);
+        assert_eq!(start[0].suggested, None);
+        let end = scan_replacement_chars("a \u{FFFD}", true);
+        assert_eq!(end[0].suggested, None);
+    }
+
+    // ── first_match ──────────────────────────────────────────────────────────
+    //
+    // NOTE: `first_match`'s tie-break (`candidate.byte_offset < b.byte_offset`)
+    // is very likely an *equivalent mutant* under `<=`: every pattern in
+    // `patterns()` requires a distinct leading character (Ã / â.../ Â), so
+    // two different patterns can never produce a match starting at the same
+    // byte offset, and the tie-break branch is therefore unreachable by any
+    // real input. Not pursued further.
+
     // ── WritePolicy ─────────────────────────────────────────────────────────
 
     #[test]

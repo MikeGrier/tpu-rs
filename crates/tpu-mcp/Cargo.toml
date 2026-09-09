@@ -20,6 +20,12 @@ path = "src/main.rs"
 tpu         = { path = "../tpu" }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
+# Attribute-only decorator for `cargo mutants`; a real (non-dev) dependency
+# because `#[cfg_attr(test, mutants::skip)]` is applied to non-test code.
+# Compiles to nothing (the attribute is a documented no-op) -- see the
+# doc comments on `IoWorker::call` in worker.rs for why specific mutants
+# there are excluded from mutation testing.
+mutants     = "0.0.4"
 
 [dev-dependencies]
 tempfile = "3"

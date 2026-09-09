@@ -3,9 +3,8 @@
 //! `tpu read` — emit a file as UTF-8/LF to a writer, with optional line
 //! range selection and line-number prefixes.
 
-use std::{fs, io::Write, path::Path, sync::Arc};
+use std::{fs, io::Write, path::Path};
 
-use harrier::{encoding::SourceConfig, source::Source};
 use md5::{Digest, Md5};
 
 use crate::{
@@ -45,22 +44,9 @@ pub fn run(
     io_mode: IoMode,
     notes: Option<&mut dyn Write>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let branch = crate::open_as_branch(file, io_mode)?;
-    let file_len = branch.byte_len();
-
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-    let bom_len = source.bom_len();
-    let source_had_bom = bom_len > 0;
-    let encoding = source.encoding();
-    let lines = source.as_lines()?;
-    // Start the view range at bom_len so the BOM bytes themselves are not
-    // included in the decoded content (they are file-encoding metadata, not
-    // document text).
-    let view = lines.view_range(bom_len as u64..file_len)?;
-
-    // Decode from the original encoding (LF-normalised bytes) to a UTF-8
-    // Cow<str>.  The view range already starts past the BOM bytes.
-    let (text, _) = encoding.decode_without_bom_handling(&view.bytes);
+    let decoded = crate::read_text_file(file, io_mode)?;
+    let source_had_bom = decoded.bom_len > 0;
+    let text = decoded.text;
 
     // Read-time advisory (Milestone 4): emit a one-line note to the
     // diagnostics writer if the decoded text appears to contain
@@ -521,6 +507,14 @@ mod tests {
     #[test]
     fn parse_bytes_range() {
         assert_eq!(parse_bytes_arg("3-7").unwrap(), (3, 7));
+    }
+
+    // An explicit pair with equal start/end (e.g. "5-5") is a valid
+    // single-byte range, not a "start after end" error. Pins `lo > hi`
+    // against a `>=` mutation.
+    #[test]
+    fn parse_bytes_pair_equal_is_ok() {
+        assert_eq!(parse_bytes_arg("5-5").unwrap(), (5, 5));
     }
 
     #[test]

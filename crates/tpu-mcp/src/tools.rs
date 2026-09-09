@@ -175,8 +175,9 @@ pub fn list() -> Value {
                  Latin-1, punctuation, box-drawing, NBSP, or double-encoded fingerprints), \
                  the read still succeeds; run `tpu doctor` (or call this tool from a \
                  CLI shell) to diagnose and optionally repair the file. \
-                 Line-ending awareness: pass `git_root` to additionally detect when the \
-                 file's on-disk line endings differ from what git would materialise for \
+                 Git awareness: the nearest repository is discovered automatically. The \
+                 file is decoded using `working-tree-encoding`, and TPU detects line-ending mismatches \
+                 against what git would materialise for \
                  that path (per .gitattributes / core.autocrlf / core.eol); when they do, \
                  the response is prefixed with a single `note:` line and the unchanged \
                  content follows. Run `tpu_doctor` with `fix: \"eol\"` to normalise.",
@@ -204,11 +205,12 @@ pub fn list() -> Value {
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root (no upward \
-                             discovery). When set, the response is prefixed with a `note:` \
+                            "Optional absolute path to a git repository root. Repository \
+                             discovery is automatic when omitted. When set, the response is \
+                             prefixed with a `note:` \
                              line if the file's on-disk line endings differ from git's \
                              expected convention for that path (per .gitattributes / \
-                             core.autocrlf / core.eol). Opt-in; omit to skip all git checks."
+                             core.autocrlf / core.eol)."
                     }
                 },
                 "required": ["file"]
@@ -220,7 +222,8 @@ pub fn list() -> Value {
             "description":
                 "Write UTF-8/LF text to a file, preserving the target file's existing \
                  encoding (UTF-8, UTF-16LE/BE, Windows-1252, …) and line endings \
-                 (LF or CRLF). For new files, UTF-8/LF is used. The original file is \
+                 (LF or CRLF). Git `working-tree-encoding` and definite EOL policy \
+                 apply automatically; otherwise new files use UTF-8/LF. The original file is \
                  atomically backed up to <file>.bak before writing. Prefer this over \
                  PowerShell Set-Content or Out-File to avoid encoding corruption.\n\n\
                  ESCAPING: 'content' is the LITERAL text to write. The JSON-RPC \
@@ -277,20 +280,15 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["lf", "crlf", "cr"],
                         "description":
-                            "Override the output line ending. Omit to preserve the file's \
-                             existing convention. Cannot be used with binary content."
+                            "Override the output line ending. Omit to use definite Git policy \
+                             or preserve the file's existing convention. Cannot be used with \
+                             binary content."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             write denormalises to git's expected convention for this path \
-                             (per .gitattributes / core.autocrlf / core.eol). Off by \
-                             default — without the server setting this argument has no \
-                             effect on writes."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "diff": {
                         "type": "boolean",
@@ -356,11 +354,9 @@ pub fn list() -> Value {
                  name matches the intent and the call FAILS if the path already exists, \
                  so an existing file is never silently overwritten. To overwrite or \
                  modify a file that already exists, use tpu_write_file instead.\n\n\
-                 New files are UTF-8 with LF line endings by default. Set line_ending to \
-                 force CRLF/CR, or pass git_root to follow the repository's configured \
-                 convention (per .gitattributes / core.autocrlf / core.eol) when the \
-                 server has line-ending normalisation enabled. Parent directories are \
-                 created as needed.\n\n\
+                 New files use repository working-tree-encoding and EOL policy when Git \
+                 supplies them; otherwise they default to UTF-8/LF. Set line_ending to \
+                 force LF/CRLF/CR. Parent directories are created as needed.\n\n\
                  ESCAPING: 'content' is the LITERAL text to write. The JSON-RPC transport \
                  already handles JSON string escaping; do not add a second layer. To \
                  insert a newline put a real newline in the JSON string.\n\n\
@@ -385,7 +381,7 @@ pub fn list() -> Value {
                         "description":
                             "Full UTF-8 text content for the new file. Any CRLF or bare CR \
                              line endings are normalized to LF before processing, then \
-                             written as LF unless line_ending (or git_root normalisation) \
+                             written as LF unless line_ending or Git policy \
                              specifies otherwise. When content_format is set, this is the \
                              encoded payload instead of literal text — see content_format."
                     },
@@ -405,20 +401,14 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["lf", "crlf", "cr"],
                         "description":
-                            "Line ending for the new file. Omit for LF (the default for \
-                             new files) or to defer to git_root normalisation."
+                            "Line ending for the new file. Omit to use Git policy, or LF \
+                             when no definite repository policy applies."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             new file is written with git's expected convention for this \
-                             path (per .gitattributes / core.autocrlf / core.eol). Off by \
-                             default — without the server setting this argument has no \
-                             effect."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "allow_mojibake": {
                         "type": "boolean",
@@ -604,17 +594,14 @@ pub fn list() -> Value {
                         "enum": ["lf", "crlf", "cr"],
                         "description":
                             "Override the output line ending for the replacement output. \
-                             Omit to preserve the file's existing convention."
+                             Omit to use definite Git policy or preserve the file's existing \
+                             convention."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             write denormalises to git's expected convention for this path. \
-                             Off by default."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "diff": {
                         "type": "boolean",
@@ -822,18 +809,15 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["lf", "crlf", "cr"],
                         "description":
-                            "Override the output line ending in text mode. Omit to preserve \
-                             the file's existing convention. Conflicts with binary: true."
+                            "Override the output line ending in text mode. Omit to use definite \
+                             Git policy or preserve the file's existing convention. Conflicts \
+                             with binary: true."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             write denormalises to git's expected convention for this path. \
-                             Off by default."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "if_match": {
                         "type": "string",
@@ -1035,11 +1019,12 @@ pub fn list() -> Value {
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When set (and \
-                             not in byte mode), the response is prefixed with a `note:` line \
+                            "Optional absolute path to pin Git repository context. Repository \
+                             discovery is automatic when omitted. In line mode, the response \
+                             is prefixed with a `note:` line \
                              if the file's on-disk line endings differ from git's expected \
                              convention for that path (per .gitattributes / core.autocrlf / \
-                             core.eol). Opt-in."
+                             core.eol)."
                     }
                 },
                 "required": ["file"]
@@ -1094,11 +1079,12 @@ pub fn list() -> Value {
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When set (and \
-                             not in byte mode), the response is prefixed with a `note:` line \
+                            "Optional absolute path to pin Git repository context. Repository \
+                             discovery is automatic when omitted. In line mode, the response \
+                             is prefixed with a `note:` line \
                              if the file's on-disk line endings differ from git's expected \
                              convention for that path (per .gitattributes / core.autocrlf / \
-                             core.eol). Opt-in."
+                             core.eol)."
                     }
                 },
                 "required": ["file"]
@@ -1245,18 +1231,14 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["lf", "crlf", "cr"],
                         "description":
-                            "Override the output line ending for the combined file. Omit to \
-                             preserve the file's existing convention."
+                            "Override the output line ending for the combined file. Omit to use \
+                             definite Git policy or preserve the file's existing convention."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             write denormalises to git's expected convention for this path. \
-                             Off by default."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "diff": {
                         "type": "boolean",
@@ -1656,12 +1638,12 @@ pub fn list() -> Value {
                  Files containing the literal sentinel `encoding-check: allow-mojibake` \
                  are treated as legitimate (test fixtures, regex sources, docs about \
                  mojibake) and reported as clean. \n\n\
-                 LINE ENDINGS: pass `git_root` to additionally detect files whose on-disk \
-                 line endings differ from git's expected convention for their path (per \
+                 LINE ENDINGS: repository discovery is automatic. Files whose on-disk line \
+                 endings differ from git's expected convention for their path (per \
                  .gitattributes / core.autocrlf / core.eol); such files are flagged with \
                  an `eol_mismatch` object in the report. Call with `fix: \"eol\"` (line \
-                 endings only) or `fix: \"all\"` (peel + line endings) together with \
-                 `git_root` to normalise them atomically with a `.bak` backup. \n\n\
+                 endings only) or `fix: \"all\"` (peel + line endings) to normalise them \
+                 atomically with a `.bak` backup, including UTF-16 files. \n\n\
                  When a teammate or another tool (e.g. PowerShell `Get-Content` / \
                  `Set-Content`, a misconfigured generator) appears to have introduced \
                  corruption, `git log -p -- <file>` will identify the introducing commit \
@@ -1691,16 +1673,16 @@ pub fn list() -> Value {
                              strictly fewer matches than the original, rewriting it \
                              atomically with a `.bak` backup. `eol` normalises only line \
                              endings to git's expected convention; `all` does both peel \
-                             and eol. `eol` and `all` require the `git_root` argument."
+                             and eol."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root (no upward \
-                             discovery). When set, doctor additionally reports files whose \
+                            "Optional absolute path to pin Git repository context. Repository \
+                             discovery is automatic when omitted. Doctor reports files whose \
                              on-disk line endings differ from git's expected convention \
                              (per .gitattributes / core.autocrlf / core.eol) via an \
-                             `eol_mismatch` field. Required when `fix` is `eol` or `all`."
+                             `eol_mismatch` field."
                     },
                     "on_error": {
                         "type": "string",
@@ -1739,6 +1721,8 @@ pub fn call(
     args: &Value,
     config: &ServerConfig,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    tpu::git::begin_operation();
+    EOL_REPO_CACHE.with(|cache| cache.borrow_mut().clear());
     match name {
         "tpu_read_file" => Ok(call_read_file(args)),
         "tpu_write_file" => Ok(call_write_file(args, config)),
@@ -1781,16 +1765,14 @@ fn git_root_arg(args: &Value) -> Option<std::path::PathBuf> {
 }
 
 thread_local! {
-    /// Per-worker cache of opened [`tpu::git::GitEol`] handles, keyed by the
-    /// canonicalised `git_root`.  An agent session issues many reads against
-    /// the same repository; opening the repo (and loading its index) on every
-    /// call is wasteful, so we open once and reuse.
+    /// Per-request cache of opened [`tpu::git::GitEol`] handles, keyed by the
+    /// canonicalised `git_root`. A glob may inspect many files in the same
+    /// repository, so opening it for every path is wasteful.
     ///
     /// The worker loop is single-threaded, so a `thread_local` `RefCell` needs
-    /// no locking and `GitEol` need not be `Sync`.  Entries live for the
-    /// process lifetime; a `.gitattributes`/config change mid-session is not
-    /// observed — acceptable for a best-effort advisory and for opt-in
-    /// normalisation within a single session.
+    /// no locking and `GitEol` need not be `Sync`. The dispatcher clears this
+    /// cache before each tool call so repository changes between calls are
+    /// observed while reuse within one operation remains cheap.
     static EOL_REPO_CACHE: std::cell::RefCell<
         std::collections::HashMap<std::path::PathBuf, Option<std::rc::Rc<tpu::git::GitEol>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -1813,19 +1795,17 @@ fn cached_git_eol(root: &std::path::Path) -> Option<std::rc::Rc<tpu::git::GitEol
     })
 }
 
-/// When a `git_root` is supplied and the file's on-disk line endings differ
-/// from git's expected convention, prepend a single `note:` line (identical to
-/// the one `tpu read --git-root` emits) ahead of the returned content.  The
-/// note line is part of the response *preamble*, like the invocation header,
-/// and is omitted entirely when there is no mismatch.
+/// When the file's on-disk line endings differ from Git's expected convention,
+/// prepend a single `note:` line. Repository discovery is automatic unless an
+/// explicit `git_root` pins the context.
 fn prepend_eol_note(args: &Value, file: &str, content: String) -> String {
-    let Some(root) = git_root_arg(args) else {
-        return content;
+    let path = std::path::Path::new(file);
+    let note = if let Some(root) = git_root_arg(args) {
+        cached_git_eol(&root).and_then(|git| git.advisory_note(path))
+    } else {
+        tpu::git::advisory_note_for_path(path)
     };
-    let Some(git) = cached_git_eol(&root) else {
-        return content;
-    };
-    match git.advisory_note(std::path::Path::new(file)) {
+    match note {
         Some(note) => format!("{note}\n{content}"),
         None => content,
     }
@@ -1834,11 +1814,8 @@ fn prepend_eol_note(args: &Value, file: &str, content: String) -> String {
 /// Resolve the write-time line-ending override for a mutating MCP tool.
 ///
 /// Thin wrapper over the shared [`tpu::git::resolve_write_override`] (also used
-/// by the `tpu` CLI): an explicit `line_ending` argument always wins;
-/// otherwise, when the server has line-ending normalisation enabled
-/// (`config.eol_normalize`) and the call supplies a `git_root`, the override is
-/// git's expected convention for the file.  Returns `Ok(None)` when neither
-/// applies.
+/// by the `tpu` CLI): this parses an explicit `line_ending`; otherwise each
+/// command discovers and applies the complete Git policy itself.
 fn eol_write_override(
     args: &Value,
     file: &str,
@@ -1846,12 +1823,12 @@ fn eol_write_override(
 ) -> Result<Option<tpu::encoding::LineEnding>, Box<dyn std::error::Error>> {
     let explicit = args.get("line_ending").and_then(|v| v.as_str());
     let git_root = git_root_arg(args);
-    let git_root = if config.eol_normalize {
-        git_root.as_deref()
-    } else {
-        None
-    };
-    tpu::git::resolve_write_override(explicit, std::path::Path::new(file), git_root, true)
+    tpu::git::resolve_write_override(
+        explicit,
+        std::path::Path::new(file),
+        git_root.as_deref(),
+        config.eol_normalize,
+    )
 }
 
 fn call_read_file(args: &Value) -> ToolResult {
@@ -3249,12 +3226,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
                 }
             },
         };
-        // `eol`/`all` require a repository root to resolve git's expected line
-        // endings; reject early with a clear message rather than silently no-op.
         let git_root = git_root_arg(args);
-        if fix_eol && git_root.is_none() {
-            return Err("doctor: `fix: \"eol\"`/`\"all\"` requires a `git_root` argument".into());
-        }
 
         let on_error = match args.get("on_error") {
             None => config.default_on_error,
@@ -3471,14 +3443,8 @@ pub struct ServerConfig {
     /// `--no-io-worker` (or `TPU_MCP_NO_IO_WORKER=1`).
     pub io_worker_enabled: bool,
 
-    /// When true, mutating tools (`tpu_write_file`, `tpu_replace_in_file`,
-    /// `tpu_edit_file`, `tpu_append_file`) normalise the target file's line
-    /// endings to git's expected convention — but only when the call also
-    /// supplies a `git_root` and does not pass an explicit `line_ending`.
-    ///
-    /// Off by default (writes never silently change line endings).  Enabled
-    /// by the `--eol-normalize` flag or `TPU_EOL_NORMALIZE=1`, which the VS
-    /// Code extension forwards from its `tpu-mcp.normalizeLineEndings` setting.
+    /// Legacy compatibility setting. Definite Git line-ending policy is now
+    /// discovered and applied automatically.
     pub eol_normalize: bool,
 }
 
@@ -4316,6 +4282,189 @@ mod tests {
         assert_eq!(from_const, from_list, "TOOL_NAMES out of sync with list()");
     }
 
+    #[test]
+    fn tool_names_is_non_empty_and_contains_known_tools() {
+        let names = tool_names();
+        assert!(!names.is_empty());
+        assert!(names.contains(&"tpu_read_file"));
+        assert!(names.contains(&"tpu_write_file"));
+    }
+
+    // ── diff_separator ───────────────────────────────────────────────────────
+
+    #[test]
+    fn diff_separator_adds_newline_only_when_missing() {
+        assert_eq!(diff_separator("no trailing newline"), "\n");
+        assert_eq!(diff_separator("has one\n"), "");
+        assert_eq!(diff_separator(""), "\n");
+    }
+
+    // ── is_binary_selector ───────────────────────────────────────────────────
+
+    #[test]
+    fn is_binary_selector_recognizes_each_prefix_independently() {
+        assert!(is_binary_selector("bytes:0-10"));
+        assert!(is_binary_selector("md5:0-10"));
+        assert!(is_binary_selector("crc32:0-10"));
+        assert!(!is_binary_selector("line:5"));
+        assert!(!is_binary_selector("line-contains:5"));
+        assert!(!is_binary_selector(""));
+    }
+
+    // ── hex_nibble ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_nibble_covers_all_digit_ranges_and_rejects_non_hex() {
+        assert_eq!(hex_nibble(b'0'), Some(0));
+        assert_eq!(hex_nibble(b'9'), Some(9));
+        assert_eq!(hex_nibble(b'a'), Some(10));
+        assert_eq!(hex_nibble(b'f'), Some(15));
+        assert_eq!(hex_nibble(b'A'), Some(10));
+        assert_eq!(hex_nibble(b'F'), Some(15));
+        assert_eq!(hex_nibble(b'g'), None);
+        assert_eq!(hex_nibble(b'G'), None);
+        assert_eq!(hex_nibble(b' '), None);
+    }
+
+    // ── is_windows_drive_path ────────────────────────────────────────────────
+
+    #[test]
+    fn is_windows_drive_path_length_boundary() {
+        // Fewer than 3 bytes can never be a drive path.
+        assert!(!is_windows_drive_path("C:"));
+        assert!(!is_windows_drive_path("C"));
+        // Exactly 3 bytes is the minimal valid form.
+        assert!(is_windows_drive_path("C:/"));
+    }
+
+    #[test]
+    fn is_windows_drive_path_requires_alphabetic_drive_letter() {
+        assert!(!is_windows_drive_path("1:/foo"));
+    }
+
+    #[test]
+    fn is_windows_drive_path_accepts_forward_and_back_slash() {
+        assert!(is_windows_drive_path("C:/foo"));
+        assert!(is_windows_drive_path(r"C:\foo"));
+        assert!(!is_windows_drive_path("C:foo"));
+    }
+
+    #[test]
+    fn is_windows_drive_path_percent_encoded_requires_all_components() {
+        // Each component of "C%3A/" must independently be required: flip
+        // one at a time away from valid and the whole match must fail.
+        assert!(is_windows_drive_path("C%3A/foo"));
+        assert!(is_windows_drive_path("c%3a/foo"), "case-insensitive hex");
+        assert!(!is_windows_drive_path("C%3A"), "too short (< 6 bytes)");
+        assert!(!is_windows_drive_path("C%4Afoo/"), "wrong first hex digit");
+        assert!(!is_windows_drive_path("C%3Zfoo/"), "wrong second hex digit");
+        assert!(!is_windows_drive_path("C%3A#foo"), "wrong separator byte");
+    }
+
+    // ── flatten_validate_pairs ───────────────────────────────────────────────
+
+    #[test]
+    fn flatten_validate_pairs_flattens_selector_value_in_order() {
+        let validates = vec![
+            serde_json::json!({"selector": "line:1", "value": "a"}),
+            serde_json::json!({"selector": "line:2", "value": "b"}),
+        ];
+        let pairs = flatten_validate_pairs(&validates).unwrap();
+        assert_eq!(pairs, vec!["line:1", "a", "line:2", "b"]);
+    }
+
+    #[test]
+    fn flatten_validate_pairs_errors_on_missing_selector_or_value() {
+        let missing_selector = vec![serde_json::json!({"value": "a"})];
+        assert!(flatten_validate_pairs(&missing_selector).is_err());
+
+        let missing_value = vec![serde_json::json!({"selector": "line:1"})];
+        assert!(flatten_validate_pairs(&missing_value).is_err());
+    }
+
+    // ── mojibake_policy_from_args ────────────────────────────────────────────
+
+    #[test]
+    fn mojibake_policy_from_args_respects_allow_mojibake_flag() {
+        let allowed = mojibake_policy_from_args(&serde_json::json!({"allow_mojibake": true}));
+        assert!(!allowed.reject_introduced_mojibake);
+
+        let default_off = mojibake_policy_from_args(&serde_json::json!({}));
+        assert!(default_off.reject_introduced_mojibake);
+
+        let explicit_false =
+            mojibake_policy_from_args(&serde_json::json!({"allow_mojibake": false}));
+        assert!(explicit_false.reject_introduced_mojibake);
+    }
+
+    // ── ServerConfig::to_wire / from_wire ────────────────────────────────────
+
+    #[test]
+    fn server_config_wire_round_trip_default() {
+        let cfg = ServerConfig::default();
+        let wire = cfg.to_wire();
+        let restored = ServerConfig::from_wire(&wire).unwrap();
+        assert_eq!(restored.verify_delay_ms, cfg.verify_delay_ms);
+        assert_eq!(restored.trace, cfg.trace);
+        assert_eq!(restored.default_on_error, cfg.default_on_error);
+        assert_eq!(restored.progress_detail, cfg.progress_detail);
+        assert_eq!(restored.eol_normalize, cfg.eol_normalize);
+    }
+
+    #[test]
+    fn server_config_wire_round_trip_non_default_variants() {
+        let cfg = ServerConfig {
+            verify_delay_ms: 250,
+            trace: false,
+            default_on_error: tpu::cmd::copy::OnError::Fail,
+            progress_detail: ProgressDetail::Summary,
+            ..ServerConfig::default()
+        };
+        let wire = cfg.to_wire();
+        assert_eq!(wire["default_on_error"], "fail");
+        assert_eq!(wire["progress_detail"], "summary");
+        let restored = ServerConfig::from_wire(&wire).unwrap();
+        assert_eq!(restored.default_on_error, tpu::cmd::copy::OnError::Fail);
+        assert_eq!(restored.progress_detail, ProgressDetail::Summary);
+        assert_eq!(restored.verify_delay_ms, 250);
+        assert!(!restored.trace);
+    }
+
+    #[test]
+    fn server_config_from_wire_rejects_unknown_enum_values() {
+        assert!(
+            ServerConfig::from_wire(&serde_json::json!({"default_on_error": "bogus"})).is_err()
+        );
+        assert!(ServerConfig::from_wire(&serde_json::json!({"progress_detail": "bogus"})).is_err());
+    }
+
+    // ── current_version ──────────────────────────────────────────────────────
+
+    #[test]
+    fn current_version_missing_file_is_none_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("does_not_exist.txt");
+        assert_eq!(current_version(f.to_str().unwrap()).unwrap(), None);
+    }
+
+    #[test]
+    fn current_version_existing_file_is_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, b"hello").unwrap();
+        assert!(current_version(f.to_str().unwrap()).unwrap().is_some());
+    }
+
+    #[test]
+    fn current_version_propagates_non_not_found_errors() {
+        // Passing a directory path (instead of a file) triggers a different
+        // I/O error kind than NotFound, which must propagate as `Err` rather
+        // than being silently mapped to `Ok(None)`.
+        let dir = tempfile::tempdir().unwrap();
+        let result = current_version(dir.path().to_str().unwrap());
+        assert!(result.is_err(), "a directory is not NotFound; must error");
+    }
+
     /// Regression (read-side TOCTOU): `stable_content_version` attaches the
     /// token only when the pre-read snapshot still matches the current digest,
     /// so a file swapped during the read yields no token instead of one that
@@ -5014,6 +5163,32 @@ mod integration_tests {
             "alpha\nbeta\ngamma\n",
             "zero-match must leave file bytes untouched"
         );
+    }
+
+    #[test]
+    fn replace_zero_match_does_not_apply_automatic_git_eol_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        fs::write(dir.path().join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        let f = dir.path().join("zero_match_git.txt");
+        fs::write(&f, "alpha\nbeta\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+
+        let out = call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "NOT_PRESENT",
+                "replacement": "unused",
+                "allow_no_match": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(last_json_line(&out)["count"].as_u64(), Some(0), "{out}");
+        assert_eq!(fs::read(&f).unwrap(), b"alpha\nbeta\n");
+        assert_eq!(fs::metadata(&f).unwrap().modified().unwrap(), before);
+        assert!(!f.with_extension("txt.bak").exists());
     }
 
     /// `count:true` and `dry_run:true` are introspection modes: a zero result
