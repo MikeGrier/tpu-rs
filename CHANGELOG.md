@@ -1,5 +1,21 @@
 # Changelog
 
+## [4.1.0](https://github.com/MikeGrier/tpu-rs/compare/v4.0.2...v4.1.0) (2026-09-10)
+
+
+### Features
+
+* git-attributes worktree policy, mutation-testing hardening (Milestones 11-12), scope M13 carry-over ([6869a3d](https://github.com/MikeGrier/tpu-rs/commit/6869a3de9450d511701cace53403ddd4fd941e21))
+* implement Milestone 13 - tools.rs mutation-testing carry-over ([2e73f58](https://github.com/MikeGrier/tpu-rs/commit/2e73f5861455760e1b9336dd753d6d4b410595d3))
+
+
+### Bug Fixes
+
+* address additional PR [#72](https://github.com/MikeGrier/tpu-rs/issues/72) review comments (find.rs alloc, replace.rs docs) ([9aebced](https://github.com/MikeGrier/tpu-rs/commit/9aebced73d383dea830dff2f9ae0e3a0a49a6e5a))
+* address PR [#72](https://github.com/MikeGrier/tpu-rs/issues/72) review comments (BOM stripping bug, mutants dep) ([eb77075](https://github.com/MikeGrier/tpu-rs/commit/eb770751a6e95fc2cb4b9cb902229bd9ab86c91b))
+* pin write_legacy_git_encoding_is_strict to LF to fix CI flakiness ([489f597](https://github.com/MikeGrier/tpu-rs/commit/489f59727045f01d531faf4ef0c904042fa9d63c))
+* tpu doctor makes marker suppression and declined peel repairs visible ([63aecd6](https://github.com/MikeGrier/tpu-rs/commit/63aecd609c5fbe295b97c07b79053cb2f0820d39))
+
 ## [4.0.2](https://github.com/MikeGrier/tpu-rs/compare/v4.0.1...v4.0.2) (2026-08-29)
 
 
