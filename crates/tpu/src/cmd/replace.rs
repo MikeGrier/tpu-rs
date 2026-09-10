@@ -32,10 +32,22 @@
 //!
 //! ## Replacement-string escapes
 //!
-//! This module operates on raw `&[u8]` replacement bytes.  Backslash-escape
-//! decoding (`\n` → LF, `\t` → TAB, `\\` → `\`, `\xHH`, `\uXXXX`, …) is the
-//! responsibility of the *caller* — the CLI front-end in `main.rs` performs
-//! that decoding via [`crate::escape::decode_bytes`] unless the user passes
+//! [`run`] takes the replacement as raw `&[u8]` for signature convenience
+//! (matching [`decode_replacement`]'s `Vec<u8>` output), but the bytes
+//! **must be valid UTF-8** once escape decoding is complete: `replace`
+//! operates on the file's decoded UTF-8 text throughout (matching/expanding
+//! against `old_norm`, which is `old_text.as_bytes()` of an already-decoded
+//! `&str`) and re-encodes strictly to the file's target encoding afterward,
+//! so a non-UTF-8 replacement has nothing valid to expand into. [`run`]
+//! checks this explicitly up front and returns a `"replacement is not valid
+//! UTF-8"` error rather than silently corrupting the match expansion.  In
+//! practice this only bites a `\xHH` escape (or a raw byte from
+//! `--literal-replacement`) that doesn't form a valid UTF-8 sequence on its
+//! own — e.g. `\xFF` alone; multi-byte sequences like `\xC3\xA9` (é) are
+//! fine.  Backslash-escape decoding (`\n` → LF, `\t` → TAB, `\\` → `\`,
+//! `\xHH`, `\uXXXX`, …) is the responsibility of the *caller* — the CLI
+//! front-end in `main.rs` performs that decoding via
+//! [`crate::escape::decode_bytes`] unless the user passes
 //! `--literal-replacement`.  By the time bytes reach [`run`] they should
 //! already contain real LF/TAB/etc. bytes for any escapes the user wrote.
 //!
@@ -289,17 +301,22 @@ pub fn run(
     for caps in re.captures_iter(old_norm) {
         let m = caps.get(0).unwrap();
 
-        // Expand capture-group back-references in normalised space.  When
-        // the pattern has no explicit groups the replacement is taken
-        // verbatim, so `$` survives instead of being read as a reference.
-        let mut norm_repl: Vec<u8> = Vec::new();
-        if has_capture_groups {
-            caps.expand(replacement, &mut norm_repl);
-        } else {
-            norm_repl.extend_from_slice(replacement);
-        }
-
         if let Some(req) = regions.as_mut() {
+            // Expand capture-group back-references in normalised space, but
+            // only when a `ChangedRegion` echo was actually requested: the
+            // real rewrite below (`re.replace_all`) redoes this expansion
+            // independently, so doing it here unconditionally for every
+            // match would be wasted work whenever `regions` is `None`
+            // (e.g. `count`/`dry_run` without a preview).  When the pattern
+            // has no explicit groups the replacement is taken verbatim, so
+            // `$` survives instead of being read as a reference.
+            let mut norm_repl: Vec<u8> = Vec::new();
+            if has_capture_groups {
+                caps.expand(replacement, &mut norm_repl);
+            } else {
+                norm_repl.extend_from_slice(replacement);
+            }
+
             line_no += old_norm[scanned_to..m.start()]
                 .iter()
                 .filter(|&&b| b == b'\n')
@@ -586,6 +603,41 @@ mod tests {
                 policy: crate::mojibake::WritePolicy::permissive(),
             },
         )
+    }
+
+    /// `run` takes `replacement` as `&[u8]` for signature convenience, but
+    /// the bytes must form valid UTF-8: `replace` operates on decoded UTF-8
+    /// text throughout and re-encodes strictly afterward, so a replacement
+    /// that isn't valid UTF-8 on its own has nothing valid to expand into.
+    /// A single `\xFF` byte (as `--literal-replacement` or an unpaired
+    /// `\xHH` escape would produce) is invalid UTF-8 in isolation, so `run`
+    /// must reject it explicitly rather than let it corrupt the match
+    /// expansion or panic downstream. The file must be left untouched.
+    #[test]
+    fn run_rejects_non_utf8_replacement_bytes() {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"hello\n").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+        drop(f);
+        fs::write(&path, b"hello\n").unwrap();
+
+        let err = run_test(
+            &path, "hello", b"\xFF", false, false, None, None, false, false,
+        )
+        .expect_err("a lone 0xFF byte is not valid UTF-8 and must be rejected");
+        assert!(
+            err.to_string().contains("replacement is not valid UTF-8"),
+            "got: {err}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"hello\n",
+            "file must be untouched when the replacement is rejected"
+        );
+
+        let _ = fs::remove_file(format!("{}.bak", path.display()));
+        let _ = fs::remove_file(&path);
     }
 
     /// Write `content` to a temp file, run `replace::run`, and return the

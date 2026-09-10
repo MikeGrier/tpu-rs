@@ -337,10 +337,12 @@ fn run_single_file(
     drop(f);
 
     let decoded = crate::read_text_file(file, io_mode)?;
-    let mut file_lines: Vec<&str> = decoded.text.split('\n').collect();
-    if file_lines.last() == Some(&"") {
-        file_lines.pop();
-    }
+    // `split_terminator` (not `split`) so a trailing newline doesn't produce
+    // a spurious final empty "line" -- equivalent to the previous
+    // split-then-pop-trailing-empty logic, but as a lazy iterator over `&str`
+    // slices rather than collecting into an intermediate `Vec` up front,
+    // avoiding an allocation proportional to the file's line count.
+    let file_lines = decoded.text.split_terminator('\n');
 
     // Ring buffer for before-context: at most `lines_before` entries.
     // Even lines emitted as matches or after-context are pushed so the
