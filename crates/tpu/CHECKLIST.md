@@ -1508,44 +1508,222 @@ test — the same reason `tpu-mcp/src/main.rs` and `worker.rs`'s protocol
 layer in Milestone 11 needed a different testing style than the `tpu` CLI's
 Tier 2/3 files.
 
+Unlike Tier 2/3's `tpu` CLI files, `tools.rs`'s own `integration_tests`
+module calls `super::call(name, args, &ServerConfig)` **directly in-process**
+(no subprocess spawning), making its scoped `cargo mutants` runs far cheaper
+(~13 minutes for 261 mutants, vs. multi-hour runs for the CLI's own
+integration-test files) — so no MCP-worker-level tests were actually needed;
+plain in-process `call()` tests sufficed throughout.
+
 **Baseline:** 67 missed mutants (2026-09-08 `cargo mutants` run, Tier 1,
-already deduplicated), all in `crates/tpu-mcp/src/tools.rs`, clustered in:
+already deduplicated), all in `crates/tpu-mcp/src/tools.rs`.
 
-- [ ] M13-1: `call_write_file` — `&&`/`||`/`!` argument-combination mutants
-      in its option handling.
-- [ ] M13-2: `call_replace_in_file` (6 missed) — boolean-logic mutants
-      across its `count`/`dry_run`/`diff` and related flag combinations.
-- [ ] M13-3: `call_edit_file` (4 missed) — boolean-logic mutants in its op
-      dispatch / diff / validate handling.
-- [ ] M13-4: `call_find` (5 missed) — boolean-logic mutants in its
-      context/count/invert flag combinations.
-- [ ] M13-5: `call_render_file` (4 missed) — boolean-logic mutants in its
-      template/token-handling options.
-- [ ] M13-6: `call_count_file` (3 missed) — boolean-logic mutants in its
-      counting-mode options.
-- [ ] M13-7: `call_copy_file`'s `Write` impl — boolean-logic mutant(s) in
-      its output-formatting logic.
-- [ ] M13-8: `render_changed_regions` — `-=`/`+=` manual-index mutants
-      around lines ~3991/3994 (candidate for an M11-4-style iterator
-      refactor rather than a direct test, if the loop turns out to have the
-      same timeout-proneness as the Tier 2 manual-loop cases).
-- [ ] M13-9: `stamp_and_verify` — one boundary-condition mutant.
-- [ ] M13-10: Final verification — a scoped `cargo mutants -f
-      crates/tpu-mcp/src/tools.rs` run (nextest tool) confirming the
-      before/after missed-mutant count, matching the before/after table
-      style used in Milestones 11 and 12; document any mutants accepted as
-      equivalent with the same rigor.
+**Result:** 261 mutants in a final scoped verification run (some baseline
+line numbers had drifted / some mutants were reclassified as unviable by a
+newer compiler): **2 missed (both confirmed equivalent), 219 caught, 36
+unviable, 2 genuine timeouts (documented, same category as M11/M12
+precedent), and 2 additional timeouts that were confirmed flaky re-runs at a
+tighter-than-usual auto-computed timeout** (re-verified caught with a manual
+`--timeout 60`; not a real gap — see M13-Misc below).
 
-**Approach (carried over from M11/M12 methodology):** get a fresh deduped
-missed-mutant list for this file specifically (line numbers in the
-2026-09-08 baseline may have drifted since), read each site, prefer
-MCP-request-level integration tests (this file's own test suite already has
-the scaffolding for constructing and sending requests to a running worker),
-watch for the same recurring patterns already seen twice now — an operand
-that's only ever tested in combination with another truthy operand,
-disjoint-bitmask `|`-vs-`^` equivalence, and boundary conditions masked by
-an unrelated early guard — and verify empirically with a real scoped
-`cargo mutants` run rather than assuming a fix works from inspection alone.
+- [x] M13-1: `call_write_file` (2 missed). **Complete.** Added
+      `write_file_diff_true_shows_diff_on_real_change` (pins `if diff &&
+      !diff_buf.is_empty()` against a `delete !` mutation) and
+      `write_file_diff_true_on_no_op_write_has_no_spurious_blank_line` (pins
+      the same guard against `&&`-to-`||`: writing byte-identical content
+      with `diff:true` leaves `diff_buf` completely empty — proven directly
+      against `tpu::cmd::write::run`'s `emit_text_diff` by the pre-existing
+      `write_text_diff_no_change_is_empty` test in
+      `crates/tpu/src/cmd/write.rs` — so only a genuinely no-op write, not
+      simply omitting `diff:true`, can distinguish `&&` from `||` here).
+- [x] M13-2: `call_replace_in_file` (8 missed). **Complete.** Added 5 tests:
+      `replace_diff_true_shows_removed_lines_not_just_changed_region_echo`
+      (kills two mutants at once — the `diff_out` capture guard's `diff ||
+      dry_run` against `&&`, and the echo-source guard's `delete !` — by
+      checking for a removed `-` line, which only the real unified diff
+      shows, never the changed-region echo); `replace_count_only_skips_
+      write_lock_wait` and `replace_dry_run_only_skips_write_lock_wait`
+      (each needed separately, since neither alone catches both `delete!`
+      variants on `!count && !dry_run`); `replace_real_write_cleans_up_
+      stray_bak_file` (kills both `wrote` calculation mutants at once); and
+      `replace_diff_true_on_textually_noop_match_still_shows_changed_region_
+      echo` (pins the echo-source guard's `&&`-to-`||` from the opposite
+      direction of the first test: a pattern/replacement pair that are
+      textually identical, e.g. `pattern:"foo", replacement:"foo"`, still
+      matches — so `regions` is non-empty and the changed-region echo has
+      content to show — but the whole-file unified diff comparing old/new
+      *bytes* is empty since nothing actually changed, distinguishing
+      `diff && !diff_buf.is_empty()` from `diff || !diff_buf.is_empty()`).
+- [x] M13-3: `call_edit_file` (4 missed / 1 confirmed equivalent).
+      **Complete.** Added
+      `edit_file_diff_true_shows_diff_on_real_change` and
+      `edit_file_diff_true_on_textually_noop_splice_has_no_spurious_blank_
+      line` (same pairing pattern as M13-1/M13-2: edit ops are
+      unconditional — no match/no-match semantics — so a `splice` whose
+      `data` is byte-identical to the line(s) it replaces still "succeeds"
+      but leaves `diff_buf` empty despite `diff:true`, distinguishing the
+      outer echo-source guard's `&&` from `||`). One mutant accepted as
+      equivalent: the `diff_out` capture guard `diff && !binary` mutated to
+      `diff || !binary` — confirmed by hand-mutating the guard in isolation
+      and running the full `call_edit_file` test group, which all still
+      passed. In binary mode, `cmd::edit::run` unconditionally discards
+      `diff_out` (`let _ = diff_out;`), so an over-eager capture has no
+      effect there; in text mode, the *same* outer `diff &&
+      !diff_buf.is_empty()` guard a few lines later re-gates on the
+      original `diff` flag directly, so a needlessly-populated `diff_buf`
+      (when `diff:false`) is simply never read regardless.
+- [x] M13-4: `call_find` (7 missed). **Complete.** Added 5 tests:
+      `find_no_match_produces_no_spurious_blank_line`, `find_with_match_
+      produces_no_extra_blank_line` (separator content-empty guard, both
+      `delete!` and `||` variants), `find_walk_warning_appears_in_each_
+      file_progress_detail` and `find_walk_warning_summarized_under_
+      summary_progress_detail` (the separator `.find()` comparison mutants;
+      the Summary-progress-detail case needed a hand-built `ServerConfig`
+      since the shared `call()` test helper hardcodes `EachFile`), and
+      `find_no_warnings_under_summary_progress_detail_omits_message`
+      (`warnings`-non-empty `delete!`). Triggering a genuine walk warning
+      (not a hard error) required a multi-path array with one real matching
+      file and one nonexistent *literal* file, since a single nonexistent
+      glob spec is a fatal error under `expand_paths_with_policy`'s
+      zero-matches rule, not a soft per-file warning.
+- [x] M13-5: `call_render_file` (4 missed). **Complete.** Added
+      `render_file_invalid_vars_key_character_is_rejected` and
+      `render_file_vars_key_with_underscore_and_dash_accepted`. The first
+      test needed a redesign after an initial version (`template:
+      "{{BAD KEY}}"`) was found to be masked by `render_str`'s own,
+      independent token-name validation (which rejects any `{{...}}`
+      placeholder containing a space) — since that error also contains the
+      substring "may only contain", both the correct and the `k.is_empty()
+      && ...` mutated code paths produced an error that satisfied a
+      loose `contains()` assertion, hiding the mutation entirely. Fixed by
+      using a template with **no placeholders at all**: the bad key
+      (`"BAD KEY"`) is present in `vars` but never referenced, so the
+      *only* possible source of an error is the vars-key guard itself,
+      correctly distinguishing `||` from a `&&` mutation.
+- [x] M13-6: `call_count_file` (3 missed). **Complete.** `emit_*`/
+      `standard_metric_names` only control output *routing* — `tpu::cmd::
+      count::run` receives the raw `lines`/`words`/`chars`/`bytes` flags
+      directly, not the derived `emit_*` values — so a bug in `any_standard
+      = lines || words || chars || bytes` is only observable via a pattern
+      label that collides with an unrequested standard-metric name. Because
+      `&&` binds tighter than `||` in Rust, cargo-mutants' single-operator
+      substitution does **not** regroup the whole chain left-to-right as
+      naive reasoning would suggest (confirmed by reading the actual
+      generated `.diff`, not the textual mutant description): mutating the
+      *first* `||` gives `(lines && words) || chars || bytes`; the *second*
+      gives `lines || (words && chars) || bytes`; the *third* gives `lines
+      || words || (chars && bytes)`. Each needs `lines`/`words`/`chars`
+      (respectively) to be the *only* true flag for the surrounding chain's
+      truth value to actually depend on the mutated sub-term — added three
+      tests, one per operator: `count_file_only_lines_requested_excludes_
+      other_standard_names_from_routing` (a "chars"-labeled colliding
+      pattern), `count_file_only_words_requested_excludes_other_standard_
+      names_from_routing` ("bytes"-labeled), and `count_file_only_chars_
+      requested_excludes_other_standard_names_from_routing`
+      ("lines"-labeled).
+- [x] M13-7: `call_copy_file` (3 missed). **Complete.** Added
+      `copy_file_warning_log_is_not_corrupted_by_writer_byte_count`, pinning
+      `SharedWriter::write`'s return-value mutants (`Ok(0)`/`Ok(1)` instead
+      of `Ok(b.len())`). `extend_from_slice` always appends the full slice
+      regardless of the reported count, so the mutation is only observable
+      via `write_all`'s retry semantics: `Ok(1)` causes `write_all` to
+      retry with the (already-fully-appended, unshrunk) remaining slice,
+      duplicating overlapping bytes — a genuinely corrupted/duplicated log
+      buffer. Triggering a `shell.warn()` call portably (no symlinks,
+      which require Developer Mode / admin rights on Windows) used a
+      pre-created plain **file** at a path where the walk needs to create a
+      **subdirectory**, so `fs::create_dir_all` deterministically fails
+      with `AlreadyExists` and the `Entry::Dir` arm's warning fires.
+- [x] M13-8: `render_changed_regions` (3 missed / 2 timeout). **Complete.**
+      Added `render_changed_regions_exact_max_line_bytes_not_truncated`
+      (the `line.len() > MAX_ECHO_LINE_BYTES` boundary) and `render_
+      changed_regions_truncates_at_char_boundary_not_mid_multibyte_char`
+      (constructs a line whose exact byte-500 cut point falls inside a
+      multi-byte UTF-8 character, forcing the `boundary -= 1` backward scan
+      to actually execute and proving it doesn't panic on a mid-character
+      split). The `boundary -= 1` loop counter's `-=`-to-`/=` mutation
+      remains a documented TIMEOUT: the test constructs the exact scenario
+      that would hang under this mutation (and would be caught by
+      cargo-nextest's own 60s kill), but `cargo-mutants`' auto-computed
+      timeout for this fast-testing file (~24s) is short enough that the
+      external budget expires before nextest's kill would — same category
+      as M11/M12's TIMEOUT precedent, confirmed by a manual `--timeout 60`
+      re-run which reproduced the identical timeout (a real hang, not
+      flakiness).
+- [x] M13-9: `stamp_and_verify` (3 missed). **Complete.** Extracted the
+      inline `actual_ms.abs_diff(now_ms) > 10` tolerance check into a
+      standalone, directly-testable `mtime_drift_exceeds_tolerance(actual_ms,
+      expected_ms) -> bool` (M11-4-style extraction — forcing an exact 10ms
+      real-filesystem mtime drift is impractical). Added
+      `stamp_and_verify_zero_delay_never_opens_file_for_writing` (pins
+      `delay_ms == 0` against a `!=` mutation, via a read-only file that
+      would error if ever opened for writing) and `mtime_drift_exceeds_
+      tolerance_boundary` (exact `> 10` boundary on the extracted function).
+- [x] M13-Misc: Newly-discovered scope beyond the original 9-item
+      breakdown, found only via the real scoped baseline run (not visible
+      from a static read of the missed-mutant list alone): dispatcher
+      match-arm deletes for `"tpu_read_file_binary"`/`"tpu_validate_file"`
+      in `call()`; `eol_write_override`'s whole-function-replace-with-
+      `Ok(None)`; `call_read_file_binary`'s hash-branch `delete!`;
+      `call_append_file`'s `changed` calc `delete!`. Added
+      `dispatcher_routes_tpu_read_file_binary`, `dispatcher_routes_tpu_
+      validate_file`, `read_file_binary_with_hash_returns_hashes_json`,
+      `write_file_explicit_line_ending_override_is_honoured`, and `append_
+      file_diff_true_reports_changed_on_real_append`.
 
-**Status:** Not started.
+      **Timeout sources eliminated by refactor:** `normalize_bytes_to_lf`
+      and `percent_decode_path` both had manual-index loop-counter mutants
+      (`i += N` → `*=`/`/=`) capable of genuine infinite loops. Refactored
+      both to eliminate manual indices entirely — `normalize_bytes_to_lf`
+      now uses a `Peekable` iterator; `percent_decode_path` now uses
+      slice-shrinking via `split_first()` — guaranteeing per-iteration
+      progress regardless of any mutation to the (now-removed) advancement
+      arithmetic. This also incidentally eliminated `hex_nibble`'s
+      whole-function-replace timeout mutants, since the fallback path is
+      now unconditionally progress-guaranteed. Added `decode_pattern_arg_
+      returns_the_given_pattern_verbatim` for that function's separate
+      whole-function-replace mutant (its own residual TIMEOUT — see below
+      — traces to `tpu::cmd::replace::run`'s pre-existing empty-pattern
+      handling, outside `tools.rs`'s control).
+
+      One mutant accepted as equivalent post-refactor: `percent_decode_
+      path`'s `hi << 4 | lo` bit-packing, mutated to `^` (XOR). `hi` and
+      `lo` are both 4-bit nibbles (0–15) occupying disjoint bit positions
+      once `hi` is shifted left by 4, so OR and XOR are mathematically
+      identical for every possible input — confirmed no reachable input
+      diverges. (A second mutation at the same site, `|` → `&`, which
+      would zero every decoded byte, is already caught by existing tests.)
+- [x] M13-10: Final verification — a scoped `cargo mutants -f
+      crates/tpu-mcp/src/tools.rs` run confirmed 261 mutants: 2 missed
+      (both confirmed equivalent, see M13-3 and M13-Misc above), 219
+      caught, 36 unviable, and 2 genuine TIMEOUTs (`decode_pattern_arg`,
+      `render_changed_regions`'s `boundary -= 1`, both re-confirmed as real
+      hangs — not flakiness — via a manual `--timeout 60` re-run). Two
+      *additional* TIMEOUTs seen in the first pass of this same run
+      (`ServerConfig::to_wire`/`from_wire`, mutated to `Default::default()`)
+      were confirmed **flaky, not real gaps**: re-run individually with
+      `--timeout 60`, both were caught in well under that budget by the
+      pre-existing `server_config_wire_round_trip_*` tests. The file's
+      fast own-test baseline (~4s) makes cargo-mutants' auto-computed
+      per-mutant timeout (~24s) tight enough that transient system load
+      (e.g. several `cargo mutants` runs executed back-to-back in the same
+      session) can occasionally starve an otherwise-fast, already-covered
+      mutant past that budget — a timing artifact of the verification
+      environment, not a test-coverage gap.
+
+**Approach (carried over from M11/M12 methodology, refined this milestone):**
+get a fresh deduped missed-mutant list, read each site, prefer direct
+in-process `call()` tests (cheap for this file specifically), extract inline
+logic into pure functions when direct testing is impractical, refactor away
+manual-loop-counter patterns entirely when the file's own tests are fast
+enough that cargo-mutants' auto-timeout is tight (nextest's kill may not
+have time to "win" the race), and — the key lesson from this milestone —
+**never assume how cargo-mutants regroups a boolean chain from the textual
+mutant description alone; read the actual generated `.diff` file** under
+`mutants.out/diff/*.diff` before writing a test or declaring a mutant
+equivalent, since `&&` binds tighter than `||` in Rust and a single-operator
+substitution can produce a materially different grouping than naive
+left-to-right reasoning suggests.
+
+**Status:** ✅ Complete.
 
