@@ -8062,9 +8062,16 @@ fn write_line_ending_crlf_on_lf_file_produces_crlf() {
             }
         })
         .collect();
+    // `multiline_lf.txt` intentionally starts with a UTF-8 BOM (see the
+    // BOM-transparency tests around `replace_multiline_caret_matches_line_starts`),
+    // and a preserving write must not silently strip an existing BOM
+    // (regression covered directly in `cmd::write::tests`), so the expected
+    // bytes include it too.
+    let mut expected_with_bom = vec![0xEF, 0xBB, 0xBF];
+    expected_with_bom.extend_from_slice(&expected);
     assert_eq!(
-        result, expected,
-        "result must be byte-identical to CRLF-expanded input"
+        result, expected_with_bom,
+        "result must be byte-identical to the BOM-prefixed, CRLF-expanded input"
     );
     let _ = dir; // keep TempDir alive
 }
