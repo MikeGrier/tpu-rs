@@ -19,13 +19,8 @@
 //! [`WritePolicy::permissive`] / `--allow-mojibake` /
 //! `"allow_mojibake": true` to override.
 
-use harrier::{
-    denormalise::DenormaliseWriter,
-    encoding::{LineEnding, SourceConfig},
-    source::Source,
-    view::View,
-};
-use std::{fs, io::Write, path::Path, sync::Arc};
+use harrier::{encoding::LineEnding, view::View};
+use std::{fs, io::Write, path::Path};
 
 use crate::{
     IoMode,
@@ -235,18 +230,14 @@ fn run_line(
         return Ok(0);
     }
 
-    let branch = crate::open_as_branch(file, io_mode)?;
-    let file_len = branch.byte_len();
+    let decoded = crate::read_text_file(file, io_mode)?;
+    let detected_ending = decoded.line_ending;
+    let file_encoding = decoded.encoding;
+    let had_bom = decoded.bom_len > 0;
+    let old_norm = decoded.text.into_bytes();
+    let git_policy = crate::git::policy_for_path(file)?;
 
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-    let detected_ending = source.line_ending();
-    let file_encoding = source.encoding();
-    let line_ending = line_ending_override.unwrap_or(detected_ending);
-    let bom_len = source.bom_len();
-    let lines = source.as_lines()?; // consumes source
-    let view = lines.view_range(bom_len as u64..file_len)?;
-
-    // Normalise all ops to (source_start, source_end, denormalised_data).
+    // Normalise all ops to UTF-8/LF byte ranges.
     // Op start/end are 1-based line numbers at this stage.
     struct Patch {
         start: usize,
@@ -257,7 +248,7 @@ fn run_line(
     // Count lines from the normalised view so the Insert arm can allow
     // offset == total_lines + 1 as a valid append position.
     let total_lines = {
-        let b = &view.bytes;
+        let b = &old_norm;
         if b.is_empty() {
             0
         } else if b.last() == Some(&b'\n') {
@@ -271,7 +262,7 @@ fn run_line(
     for op in ops {
         match op {
             EditOp::Delete { start, end } => {
-                let (sb, eb) = line_range_to_source_bytes(&view, start, end)
+                let (sb, eb) = line_range_to_normalized_bytes(&old_norm, start, end)
                     .map_err(|e| format!("--delete: {e}"))?;
                 patches.push(Patch {
                     start: sb,
@@ -285,27 +276,31 @@ fn run_line(
                 // Offset == total_lines + 1 is also a valid append ("insert before a
                 // hypothetical line just past the last one"), so treat it the same way.
                 let sb = if offset == EOF_SENTINEL || offset == total_lines + 1 {
-                    file_len as usize
+                    old_norm.len()
                 } else {
-                    let (start, _) = line_range_to_source_bytes(&view, offset, offset)
+                    let (start, _) = line_range_to_normalized_bytes(&old_norm, offset, offset)
                         .map_err(|e| format!("--insert: {e}"))?;
                     start
                 };
-                let dn = denorm_bytes(&data, line_ending);
+                std::str::from_utf8(&data).map_err(|error| {
+                    format!("edit: {}: edit data is not UTF-8: {error}", file.display())
+                })?;
                 patches.push(Patch {
                     start: sb,
                     end: sb,
-                    data: dn,
+                    data,
                 });
             }
             EditOp::Splice { start, end, data } => {
-                let (sb, eb) = line_range_to_source_bytes(&view, start, end)
+                let (sb, eb) = line_range_to_normalized_bytes(&old_norm, start, end)
                     .map_err(|e| format!("--splice: {e}"))?;
-                let dn = denorm_bytes(&data, line_ending);
+                std::str::from_utf8(&data).map_err(|error| {
+                    format!("edit: {}: edit data is not UTF-8: {error}", file.display())
+                })?;
                 patches.push(Patch {
                     start: sb,
                     end: eb,
-                    data: dn,
+                    data,
                 });
             }
         }
@@ -326,56 +321,45 @@ fn run_line(
 
     let op_count = patches.len();
 
-    // Snapshot the normalised old content for diff computation (cheap clone,
-    // paid only when --diff is requested).
-    let old_norm: Option<Vec<u8>> = if diff_out.is_some() {
-        Some(view.bytes.to_vec())
-    } else {
-        None
-    };
-
-    // Snapshot the raw old bytes for the mojibake write-time guard.  Only
-    // taken when the guard is active.  Decoded against `file_encoding`
-    // after the splice result is known.
-    let guard_old_bytes: Option<Vec<u8>> = if policy.reject_introduced_mojibake {
-        Some(view.bytes.to_vec())
-    } else {
-        None
-    };
-
-    // Apply in reverse source order so earlier coord patches see original
+    let mut new_norm = old_norm.clone();
+    // Apply in reverse order so earlier coordinates retain their original
     // positions undisturbed.
-    let b2 = branch.fork();
     for p in patches.iter().rev() {
-        let len = (p.end - p.start) as u64;
-        b2.splice(p.start as u64, len, &p.data)?;
+        new_norm.splice(p.start..p.end, p.data.iter().copied());
+    }
+    let new_text = std::str::from_utf8(&new_norm)
+        .map_err(|error| format!("edit: generated invalid UTF-8: {error}"))?;
+    let line_ending = line_ending_override
+        .or_else(|| git_policy.line_ending_for_text(new_text))
+        .unwrap_or(detected_ending);
+    if policy.reject_introduced_mojibake {
+        let old_text = std::str::from_utf8(&old_norm)?;
+        check_write_does_not_introduce_mojibake(old_text, new_text)
+            .map_err(|e| format!("edit: {}: {e}", file.display()))?;
     }
 
-    let out_bytes = redwing::materialize(&*b2)?;
-
-    // Release all mmap-backed handles before file-system work (Windows requirement).
-    drop(b2);
-    drop(view);
-    drop(lines);
-    drop(branch);
-
-    // Mojibake write-time guard.  Decode old + new bytes via the file's
-    // encoding and compare in UTF-8 char space.
-    if let Some(old_raw) = guard_old_bytes.as_deref() {
-        let (old_text, _, _) = file_encoding.decode(old_raw);
-        let (new_text, _, _) = file_encoding.decode(&out_bytes);
-        check_write_does_not_introduce_mojibake(&old_text, &new_text)
-            .map_err(|e| format!("edit: {}: {e}", file.display()))?;
+    let encoded = crate::encoding::encode_text_strict(new_text, file_encoding)
+        .map_err(|error| format!("edit: {}: {error}", file.display()))?;
+    let encoded = match line_ending {
+        LineEnding::Lf => encoded,
+        LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, file_encoding),
+        LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, file_encoding),
+    };
+    let mut out_bytes = encoded;
+    if git_policy.write_bom(had_bom) {
+        let bom = crate::encoding::bom_bytes_for(file_encoding);
+        let mut with_bom = Vec::with_capacity(bom.len() + out_bytes.len());
+        with_bom.extend_from_slice(bom);
+        with_bom.extend_from_slice(&out_bytes);
+        out_bytes = with_bom;
     }
 
     // Atomic write via the shared temp→.bak→persist→restore helper.
     crate::atomic_write(file, &out_bytes)?;
 
     // Emit the unified text diff after a successful write.
-    if let (Some(out), Some(old)) = (diff_out, old_norm) {
-        let new_str_raw = String::from_utf8_lossy(&out_bytes[bom_len..]);
-        let new_norm = new_str_raw.replace("\r\n", "\n").replace('\r', "\n");
-        emit_unified_diff(file, &old, new_norm.as_bytes(), out)?;
+    if let Some(out) = diff_out {
+        emit_unified_diff(file, &old_norm, &new_norm, out)?;
     }
 
     Ok(op_count)
@@ -401,15 +385,68 @@ fn emit_unified_diff(
     Ok(())
 }
 
-/// Expand normalised (LF-only) bytes to use line ending `le`.
-fn denorm_bytes(norm: &[u8], le: LineEnding) -> Vec<u8> {
-    let mut dw = DenormaliseWriter::new(Vec::with_capacity(norm.len()), std::iter::repeat(le));
-    // Vec<u8> never returns I/O errors; unwrap is safe.
-    std::io::Write::write_all(&mut dw, norm).unwrap();
-    dw.into_inner()
-}
-
 // ── Line-coordinate helper ──────────────────────────────────────────────────────
+
+fn line_range_to_normalized_bytes(
+    bytes: &[u8],
+    start_line: usize,
+    end_line: usize,
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    if start_line == 0 {
+        return Err("edit: line numbers are 1-based (minimum 1)".into());
+    }
+    if start_line > end_line {
+        return Err(format!("edit: start line {start_line} is after end line {end_line}").into());
+    }
+
+    let mut line_starts = vec![0];
+    for (i, &byte) in bytes.iter().enumerate() {
+        if byte == b'\n' {
+            line_starts.push(i + 1);
+        }
+    }
+    let total_lines = if bytes.is_empty() {
+        0
+    } else if bytes.last() == Some(&b'\n') {
+        line_starts.len() - 1
+    } else {
+        line_starts.len()
+    };
+    let start_line = if start_line == EOF_SENTINEL {
+        total_lines
+    } else {
+        start_line
+    };
+    let end_line = if end_line == EOF_SENTINEL {
+        total_lines
+    } else {
+        end_line
+    };
+    if start_line == 0 || end_line == 0 {
+        return Err(format!("edit: line 1 is out of range (file has {total_lines} lines)").into());
+    }
+    if start_line > total_lines {
+        return Err(format!(
+            "edit: line {start_line} is out of range (file has {total_lines} line{})",
+            if total_lines == 1 { "" } else { "s" }
+        )
+        .into());
+    }
+    if end_line > total_lines {
+        return Err(format!(
+            "edit: line {end_line} is out of range (file has {total_lines} line{})",
+            if total_lines == 1 { "" } else { "s" }
+        )
+        .into());
+    }
+    let start = line_starts[start_line - 1];
+    let end = if end_line < line_starts.len() {
+        line_starts[end_line]
+    } else {
+        bytes.len()
+    };
+    Ok((start, end))
+}
 
 /// Map a 1-based inclusive line range to source byte offsets `(start, end)`
 /// where `end` is exclusive.
@@ -441,6 +478,15 @@ pub fn line_range_to_source_bytes(
     start_line: usize,
     end_line: usize,
 ) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    line_range_to_source_bytes_with_encoding(view, encoding_rs::UTF_8, start_line, end_line)
+}
+
+fn line_range_to_source_bytes_with_encoding(
+    view: &View,
+    encoding: &'static encoding_rs::Encoding,
+    start_line: usize,
+    end_line: usize,
+) -> Result<(usize, usize), Box<dyn std::error::Error>> {
     if start_line == 0 {
         return Err("edit: line numbers are 1-based (minimum 1)".into());
     }
@@ -451,16 +497,30 @@ pub fn line_range_to_source_bytes(
     // Build the normalised start-of-line position table.
     // line_starts[i] is the normalised byte offset of the start of line i+1.
     let mut line_starts: Vec<usize> = vec![0];
-    for (i, &b) in view.bytes.iter().enumerate() {
-        if b == b'\n' {
-            line_starts.push(i + 1);
+    let newline_width = if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE {
+        2
+    } else {
+        1
+    };
+    let newline = if encoding == encoding_rs::UTF_16LE {
+        &[0x0A, 0x00][..]
+    } else if encoding == encoding_rs::UTF_16BE {
+        &[0x00, 0x0A][..]
+    } else {
+        &[0x0A][..]
+    };
+    let mut i = 0;
+    while i + newline_width <= view.bytes.len() {
+        if &view.bytes[i..i + newline_width] == newline {
+            line_starts.push(i + newline_width);
         }
+        i += newline_width;
     }
 
     // Total number of content lines.
     let total_lines = if view.bytes.is_empty() {
         0
-    } else if view.bytes.last() == Some(&b'\n') {
+    } else if view.bytes.ends_with(newline) {
         // The final push added a past-EOF position; discount it.
         line_starts.len() - 1
     } else {
@@ -1677,6 +1737,14 @@ mod tests {
         assert!(parse_line_range("0").is_err());
     }
 
+    // parse_line_range: an explicit pair with equal start/end (e.g. "5-5")
+    // is a valid single-line range, not a "start after end" error. Pins
+    // `lo > hi` against a `>=` mutation.
+    #[test]
+    fn plr_pair_equal_is_ok() {
+        assert_eq!(parse_line_range("5-5").unwrap(), (5, 5));
+    }
+
     // 64. parse_line_range: start > end → error.
     #[test]
     fn plr_start_after_end() {
@@ -1964,6 +2032,142 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_file_bytes(&p), b"HELLO WORLD");
+    }
+
+    // ── run_line: had_bom, total_lines, and overlap boundary mutants ─────────
+
+    /// A UTF-8 BOM present on the source file must survive a line-mode edit
+    /// (outside a git-attributes context, the default policy preserves
+    /// whatever BOM state the source had). Pins `decoded.bom_len > 0` against
+    /// a `<` mutation: `bom_len` is a `usize`, so `< 0` is always false and
+    /// would silently strip the BOM on every edit.
+    #[test]
+    fn ed_line_had_bom_is_preserved_after_edit() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"\xEF\xBB\xBFaaa\nbbb\nccc\n");
+        run_test(
+            &p,
+            vec![EditOp::Delete { start: 2, end: 2 }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let out = read_file_bytes(&p);
+        assert!(
+            out.starts_with(b"\xEF\xBB\xBF"),
+            "BOM must be preserved after edit; got {out:?}"
+        );
+        assert_eq!(&out[3..], b"aaa\nccc\n");
+    }
+
+    /// `total_lines` for a file whose final line has no trailing newline must
+    /// count that final line (newline_count + 1), not just the newline
+    /// count. Only reachable through the `else` arm of the `total_lines`
+    /// block (a file *without* a trailing `\n`), which no pre-existing test
+    /// exercised. Pins both the `+ 1` (against `- 1` / `* 1`) and the `==
+    /// b'\n'` (against `!=`) mutations on that line: appending at exactly
+    /// `total_lines + 1` must be accepted as a valid append position.
+    #[test]
+    fn ed_line_total_lines_counts_final_line_without_trailing_newline() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"aaa\nbbb\nccc");
+        run_test(
+            &p,
+            vec![EditOp::Insert {
+                offset: 4, // total_lines(3) + 1: valid append position
+                data: b"ddd\n".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"aaa\nbbb\ncccddd\n");
+    }
+
+    /// Two line-mode ops whose byte ranges are exactly adjacent (one op's
+    /// end equals the next op's start) must be accepted, not rejected as
+    /// overlapping. Pins `w[0].end > w[1].start` against a `>=` mutation.
+    #[test]
+    fn ed_line_adjacent_deletes_are_not_overlapping() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"aaa\nbbb\nccc\n");
+        run_test(
+            &p,
+            vec![
+                EditOp::Delete { start: 1, end: 1 },
+                EditOp::Delete { start: 2, end: 2 },
+            ],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"ccc\n");
+    }
+
+    /// `line_range_to_normalized_bytes`: a numeric start beyond a
+    /// `EOF_SENTINEL` end that resolves to 0 lines (empty file) must report
+    /// "line 1 is out of range", not "line {start_line} is out of range".
+    /// Pins `start_line == 0 || end_line == 0` against a `&&` mutation: only
+    /// `end_line` is 0 here, so `&&` would wrongly skip this guard and let
+    /// the *next* check report the wrong line number.
+    #[test]
+    fn ed_line_delete_numeric_start_past_eof_end_on_empty_file() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"");
+        let err = run_test(
+            &p,
+            vec![EditOp::Delete {
+                start: 5,
+                end: EOF_SENTINEL,
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "--delete: edit: line 1 is out of range (file has 0 lines)"
+        );
+    }
+
+    // ── line_range_to_source_bytes_with_encoding: encoding-specific mutants ──
+
+    /// The UTF-16LE newline-scanning width (2 bytes) is only selected when
+    /// `encoding == UTF_16LE || encoding == UTF_16BE`. Pins that `||` against
+    /// a `&&` mutation, which is never true for a single concrete encoding
+    /// and would silently fall back to scanning 1 byte at a time against a
+    /// 2-byte newline pattern -- finding no newlines at all.
+    #[test]
+    fn lrtsb_with_encoding_utf16le_newline_width() {
+        // Two UTF-16LE "lines": "AB\n" then "CD\n" (LE code units, LF-only).
+        let content: &[u8] = &[
+            0x41, 0x00, 0x42, 0x00, 0x0A, 0x00, // "AB\n"
+            0x43, 0x00, 0x44, 0x00, 0x0A, 0x00, // "CD\n"
+        ];
+        let (view, _dir) = make_view(content);
+        let (start, end) =
+            line_range_to_source_bytes_with_encoding(&view, encoding_rs::UTF_16LE, 1, 1).unwrap();
+        assert_eq!(&content[start..end], &content[0..6]);
+        let (start, end) =
+            line_range_to_source_bytes_with_encoding(&view, encoding_rs::UTF_16LE, 2, 2).unwrap();
+        assert_eq!(&content[start..end], &content[6..12]);
+    }
+
+    /// Same "numeric start past a zero-lines EOF end" scenario as
+    /// `ed_line_delete_numeric_start_past_eof_end_on_empty_file`, but for
+    /// `line_range_to_source_bytes_with_encoding`'s own copy of the guard.
+    #[test]
+    fn lrtsb_numeric_start_past_eof_end_on_empty_view() {
+        let (view, _dir) = make_empty_view();
+        let err = line_range_to_source_bytes(&view, 5, EOF_SENTINEL).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "edit: line 1 is out of range (file has 0 lines)"
+        );
     }
 
     // ── validate integration (ED-4) ───────────────────────────────────────────

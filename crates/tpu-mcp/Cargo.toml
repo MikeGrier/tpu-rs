@@ -25,3 +25,11 @@ serde_json  = { workspace = true }
 tempfile = "3"
 sysinfo  = { version = "0.32", default-features = false, features = ["system"] }
 gix      = { version = "0.85", default-features = false, features = ["attributes", "sha1"] }
+# Attribute-only decorator for `cargo mutants`, applied via
+# `#[cfg_attr(test, mutants::skip)]` in worker.rs. Because the attribute is
+# wrapped in `cfg_attr(test, ...)`, it is elided entirely (and `mutants::skip`
+# is never resolved) whenever `cfg(test)` is false, so the crate is only ever
+# needed for test builds -- a dev-dependency, not a normal one. See the doc
+# comments on `IoWorker::call` in worker.rs for why specific mutants there are
+# excluded from mutation testing.
+mutants  = "0.0.4"

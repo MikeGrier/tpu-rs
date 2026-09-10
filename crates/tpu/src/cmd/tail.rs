@@ -2,12 +2,9 @@
 
 //! `tpu tail` — emit the last N lines or N bytes of a file to stdout.
 
-use std::{io::Write, path::Path, sync::Arc};
+use std::{io::Write, path::Path};
 
-use harrier::{
-    encoding::{LineEnding, SourceConfig},
-    source::Source,
-};
+use harrier::encoding::LineEnding;
 
 use crate::IoMode;
 
@@ -75,16 +72,9 @@ fn run_lines(
     }
     drop(f);
 
-    let branch = crate::open_as_branch(file, io_mode)?;
-    let file_len = branch.byte_len();
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-    let bom_len = source.bom_len();
-    let encoding = source.encoding();
-    let line_ending = source.line_ending();
-    let lines_iter = source.as_lines()?;
-    // Skip BOM bytes so decoded text starts at the first content character.
-    let view = lines_iter.view_range(bom_len as u64..file_len)?;
-    let (text, _) = encoding.decode_without_bom_handling(&view.bytes);
+    let decoded = crate::read_text_file(file, io_mode)?;
+    let line_ending = decoded.line_ending;
+    let text = decoded.text;
 
     // Read-time advisory (Milestone 4).
     if let Some(notes) = notes {
@@ -152,4 +142,54 @@ fn run_bytes(
     let bytes = redwing::materialize_range(&*branch, start, read_len)?;
     out.write_all(&bytes)?;
     Ok(())
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_tmp(dir: &tempfile::TempDir, name: &str, content: &[u8]) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// A file with *no* trailing newline, requesting fewer lines than exist:
+    /// the last selected line is always the file's true last line (`tail`
+    /// selects a suffix), so it must not get a terminator, while the
+    /// non-last selected line(s) must. Pins `i + 1 == take` (against `!=`
+    /// and against `*`, which would make `is_last_selected` unreachable) and
+    /// `delete !` (which would invert which lines get a terminator).
+    #[test]
+    fn run_lines_no_trailing_newline_omits_final_terminator_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"aaa\nbbb\nccc");
+        let mut out: Vec<u8> = Vec::new();
+        run_lines(&p, 2, false, &mut out, crate::IoMode::Mmap, None).unwrap();
+        assert_eq!(out, b"bbb\nccc");
+    }
+
+    /// `file_len == 0 || n == 0` must short-circuit before attempting to
+    /// read the file (mirrors the identical guard in `cmd::head::run_bytes`
+    /// -- memory-mapping a genuinely empty file is platform-dependent).
+    /// Pins that `||` against a `&&` mutation.
+    #[test]
+    fn run_bytes_zero_requested_on_nonempty_file_emits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_tmp(&dir, "f.bin", b"hello");
+        let mut out: Vec<u8> = Vec::new();
+        run_bytes(&p, 0, &mut out, crate::IoMode::Mmap).unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn run_bytes_nonzero_requested_on_empty_file_emits_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_tmp(&dir, "f.bin", b"");
+        let mut out: Vec<u8> = Vec::new();
+        run_bytes(&p, 5, &mut out, crate::IoMode::Mmap).unwrap();
+        assert!(out.is_empty());
+    }
 }

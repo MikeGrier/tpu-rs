@@ -504,6 +504,48 @@ mod tests {
         assert_eq!(decode("").unwrap(), "");
     }
 
+    // ── DecodeError: Display ──────────────────────────────────────────────────
+    //
+    // Each variant's exact message text is asserted (not just "non-empty" or
+    // "contains X") so a whole-function-replace mutation (`Ok(Default::default())`,
+    // which writes nothing and would still satisfy a looser check) is caught.
+
+    #[test]
+    fn decode_error_display_unexpected_end() {
+        assert_eq!(
+            DecodeError::UnexpectedEnd { at: 3 }.to_string(),
+            "escape sequence truncated at offset 3"
+        );
+    }
+
+    #[test]
+    fn decode_error_display_unknown_escape() {
+        assert_eq!(
+            DecodeError::UnknownEscape { at: 2, ch: 'q' }.to_string(),
+            "unknown escape '\\q' at offset 2"
+        );
+    }
+
+    #[test]
+    fn decode_error_display_invalid_hex() {
+        assert_eq!(
+            DecodeError::InvalidHex { at: 1, ch: 'z' }.to_string(),
+            "non-hex digit 'z' in escape sequence at offset 1"
+        );
+    }
+
+    #[test]
+    fn decode_error_display_invalid_scalar() {
+        assert_eq!(
+            DecodeError::InvalidScalar {
+                at: 0,
+                value: 0xD800
+            }
+            .to_string(),
+            "U+0000D800 is not a valid Unicode scalar value (offset 0)"
+        );
+    }
+
     #[test]
     fn decode_plain_ascii_passthrough() {
         assert_eq!(decode("hello world").unwrap(), "hello world");

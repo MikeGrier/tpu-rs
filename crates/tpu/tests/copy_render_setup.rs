@@ -302,6 +302,97 @@ fn setup_inject_appends_when_no_markers_present() {
     assert!(after.contains("<!-- tpu-mcp:setup:begin -->"));
 }
 
+/// Appending to an empty existing file must not insert any leading blank
+/// line before the block. Pins the `!out.is_empty()` guard against a
+/// `delete !` mutation (which would wrongly treat "empty" as "needs a
+/// separator") and, together with the next two tests, the `&&` joining it
+/// to the "already ends with a blank line" check against an `||` mutation.
+#[test]
+fn setup_inject_into_empty_existing_file_has_no_leading_blank_line() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("empty.md");
+    write_file(&target, b"");
+    ok(tpu().arg("setup").arg("--inject").arg(&target));
+    let after = fs::read_to_string(&target).unwrap();
+    assert!(
+        after.starts_with("<!-- tpu-mcp:setup:begin -->"),
+        "block must start at offset 0 with no leading blank line; got: {:?}",
+        &after[..after.len().min(60)]
+    );
+}
+
+/// Appending after content with no trailing newline at all must insert
+/// exactly one blank line (two newlines) of separation -- one to terminate
+/// the existing last line, one to create the blank line. Pins the inner
+/// `!out.ends_with('\n')` guard against a `delete !` mutation (which would
+/// wrongly skip the first newline and leave the block directly glued to the
+/// existing content).
+#[test]
+fn setup_inject_after_content_with_no_trailing_newline_adds_blank_line_separator() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("notes.md");
+    write_file(&target, b"no newline at end");
+    ok(tpu().arg("setup").arg("--inject").arg(&target));
+    let after = fs::read_to_string(&target).unwrap();
+    assert!(
+        after.starts_with("no newline at end\n\n<!-- tpu-mcp:setup:begin -->"),
+        "expected exactly one blank line before the block; got: {:?}",
+        &after[..after.len().min(60)]
+    );
+}
+
+/// Appending after content that already ends with a single `\n` (but not a
+/// blank line) must still add a blank line of separation. Pins the
+/// `!out.ends_with("\n\n")` guard against a `delete !` mutation (which would
+/// wrongly treat a single trailing newline as "already separated" and glue
+/// the block directly to the last line).
+#[test]
+fn setup_inject_after_single_trailing_newline_adds_blank_line_separator() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("notes.md");
+    write_file(&target, b"single newline at end\n");
+    ok(tpu().arg("setup").arg("--inject").arg(&target));
+    let after = fs::read_to_string(&target).unwrap();
+    assert!(
+        after.starts_with("single newline at end\n\n<!-- tpu-mcp:setup:begin -->"),
+        "expected exactly one blank line before the block; got: {:?}",
+        &after[..after.len().min(70)]
+    );
+}
+
+/// An `END_MARKER` occurring before any `BEGIN_MARKER` is an unbalanced
+/// (corrupt) block and must be rejected, not silently treated as a
+/// well-formed block to replace. Pins the `e > b` match guard against a
+/// `replace guard with true` mutation (which would wrongly take the
+/// "replace" arm for this out-of-order marker pair).
+#[test]
+fn setup_inject_end_marker_before_begin_marker_errors() {
+    let dir = TempDir::new().unwrap();
+    let target = dir.path().join("corrupt.md");
+    write_file(
+        &target,
+        b"<!-- tpu-mcp:setup:end -->\nstray content\n<!-- tpu-mcp:setup:begin -->\n",
+    );
+    let before = fs::read(&target).unwrap();
+    let result = tpu()
+        .arg("setup")
+        .arg("--inject")
+        .arg(&target)
+        .output()
+        .unwrap();
+    assert!(!result.status.success(), "expected error exit");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        stderr.contains("before"),
+        "expected an 'appears before' unbalanced-marker error; got: {stderr}"
+    );
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        before,
+        "file must be left unchanged when injection is rejected"
+    );
+}
+
 /// M8-5: the injected guidance block records the version of `tpu` that
 /// wrote it as an HTML comment on its first line, so callers can compare
 /// it against the `tpu_version` field emitted in every `tpu_*` response's

@@ -7,13 +7,7 @@
 //!
 //! See [`run`] for the full contract and output guarantees.
 
-use std::{fs, path::Path, sync::Arc};
-
-use harrier::{
-    encoding::{LineEnding, SourceConfig},
-    lines::LineTerminator,
-    source::Source,
-};
+use std::{fs, path::Path};
 
 use crate::IoMode;
 
@@ -50,14 +44,6 @@ struct LineEndingSeen {
 }
 
 impl LineEndingSeen {
-    fn record(&mut self, le: LineEnding) {
-        match le {
-            LineEnding::Lf => self.lf = true,
-            LineEnding::CrLf => self.crlf = true,
-            LineEnding::Cr => self.cr = true,
-        }
-    }
-
     /// Derive the `line_ending` string from the set of terminators seen.
     ///
     /// - `"None"` when no terminated lines were encountered (empty file or
@@ -102,38 +88,16 @@ pub fn run(file: &Path, io_mode: IoMode) -> Result<DescribeResult, Box<dyn std::
     let metadata = fs::metadata(file).map_err(|e| format!("describe: {}: {e}", file.display()))?;
     let byte_count = metadata.len();
 
-    // ── open as harrier Source ───────────────────────────────────────────────
-    let branch = crate::open_as_branch(file, io_mode)
-        .map_err(|e| format!("describe: open {}: {e}", file.display()))?;
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())
-        .map_err(|e| format!("describe: source {}: {e}", file.display()))?;
-
-    let bom = source.bom_len() > 0;
-    let encoding_label = source.encoding().name();
-
-    let mut lines = source
-        .as_lines()
-        .map_err(|e| format!("describe: lines {}: {e}", file.display()))?;
-
-    // ── iterate to count lines and track terminators ────────────────────────
-    let mut line_count: u64 = 0;
-    let mut seen = LineEndingSeen::default();
-
-    loop {
-        match lines.next() {
-            None => break,
-            Some((_bytes, terminator)) => {
-                line_count += 1;
-                match terminator {
-                    LineTerminator::Ending(le) => seen.record(le),
-                    LineTerminator::End => {
-                        // Final unterminated line — counts toward line_count
-                        // but contributes no terminator kind.
-                    }
-                }
-            }
-        }
-    }
+    let decoded = crate::read_text_file(file, io_mode)
+        .map_err(|e| format!("describe: read {}: {e}", file.display()))?;
+    let bom = decoded.bom_len > 0;
+    let encoding_label = decoded.encoding.name();
+    let line_count = decoded.layout.line_count;
+    let seen = LineEndingSeen {
+        lf: decoded.layout.has_lf,
+        crlf: decoded.layout.has_crlf,
+        cr: decoded.layout.has_cr,
+    };
 
     let line_ending = seen.as_str();
 
@@ -145,4 +109,99 @@ pub fn run(file: &Path, io_mode: IoMode) -> Result<DescribeResult, Box<dyn std::
         line_ending,
         bom,
     })
+}
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_tmp(dir: &TempDir, name: &str, content: &[u8]) -> std::path::PathBuf {
+        let p = dir.path().join(name);
+        fs::write(&p, content).unwrap();
+        p
+    }
+
+    // ── LineEndingSeen::as_str ────────────────────────────────────────────────
+    //
+    // Each combination is asserted individually (not just checked against
+    // "not None"/"not Mixed") so that a whole-function-replace mutation
+    // (returning "" or "xyzzy" unconditionally) and a single match-arm
+    // deletion (falling through to the `_ => "Mixed"` catch-all) are both
+    // caught: a deleted-arm mutant would still return a *plausible*-looking
+    // string ("Mixed") for that one combination, so each expected value must
+    // be checked exactly.
+
+    #[test]
+    fn line_ending_seen_none_when_nothing_seen() {
+        let seen = LineEndingSeen {
+            lf: false,
+            crlf: false,
+            cr: false,
+        };
+        assert_eq!(seen.as_str(), "None");
+    }
+
+    #[test]
+    fn line_ending_seen_lf_only() {
+        let seen = LineEndingSeen {
+            lf: true,
+            crlf: false,
+            cr: false,
+        };
+        assert_eq!(seen.as_str(), "LF");
+    }
+
+    #[test]
+    fn line_ending_seen_crlf_only() {
+        let seen = LineEndingSeen {
+            lf: false,
+            crlf: true,
+            cr: false,
+        };
+        assert_eq!(seen.as_str(), "CRLF");
+    }
+
+    #[test]
+    fn line_ending_seen_cr_only() {
+        let seen = LineEndingSeen {
+            lf: false,
+            crlf: false,
+            cr: true,
+        };
+        assert_eq!(seen.as_str(), "CR");
+    }
+
+    #[test]
+    fn line_ending_seen_mixed_when_more_than_one_kind() {
+        let seen = LineEndingSeen {
+            lf: true,
+            crlf: true,
+            cr: false,
+        };
+        assert_eq!(seen.as_str(), "Mixed");
+    }
+
+    // ── run(): bom detection ──────────────────────────────────────────────────
+
+    /// `bom_len` is a `usize`; pins `> 0` against a `<` mutation (always
+    /// false for an unsigned type) and against `==`/`>=` by covering both a
+    /// BOM'd and a BOM-less file.
+    #[test]
+    fn run_reports_bom_true_when_file_has_utf8_bom() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"\xEF\xBB\xBFhello\n");
+        let result = run(&p, IoMode::Mmap).unwrap();
+        assert!(result.bom, "expected bom == true for a BOM'd file");
+    }
+
+    #[test]
+    fn run_reports_bom_false_when_file_has_no_bom() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"hello\n");
+        let result = run(&p, IoMode::Mmap).unwrap();
+        assert!(!result.bom, "expected bom == false for a plain file");
+    }
 }

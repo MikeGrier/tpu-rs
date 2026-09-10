@@ -277,4 +277,51 @@ mod selftests {
             double_cafe(),
         );
     }
+
+    // The tests above only check that each constant *decodes* correctly and
+    // that each accessor *returns valid UTF-8* -- neither asserts an
+    // accessor's actual returned content, so a whole-function-replaced
+    // accessor (e.g. always returning an empty string) would pass both.
+    // These pin the exact returned value directly.
+
+    #[test]
+    fn latin1_fragment_returns_the_expected_string() {
+        assert_eq!(latin1_fragment(), s(LATIN1_FRAGMENT_B64));
+        assert_eq!(latin1_fragment().as_bytes(), [0xC3, 0x83, 0xC2, 0xA9]);
+    }
+
+    #[test]
+    fn double_cafe_returns_the_expected_string() {
+        assert_eq!(double_cafe(), s(DOUBLE_CAFE_B64));
+        assert_eq!(
+            double_cafe().as_bytes(),
+            [
+                0x63, 0x61, 0x66, 0xC3, 0x83, 0xC6, 0x92, 0xC3, 0x82, 0xC2, 0xA9
+            ]
+        );
+    }
+
+    // ── b64: short-chunk (unpadded) boundary conditions ──────────────────────
+    //
+    // Every real fixture constant is a 4-aligned, `=`-padded base64 string,
+    // so `chunk.len()` is always exactly 4 for them -- these two synthetic
+    // inputs are the only way to exercise (and pin) the `chunk.len() > 2` /
+    // `> 3` short-chunk boundaries, which real fixtures never reach.
+
+    #[test]
+    fn b64_handles_a_two_char_final_chunk() {
+        // "QQ": only b[0]/b[1] are meaningful; b[2]/b[3] must stay 0 and no
+        // second/third byte must be pushed (each accesses chunk[2]/chunk[3],
+        // which don't exist here -- a `>=` mutation on either length check
+        // would index out of bounds and panic).
+        assert_eq!(b64("QQ"), vec![0x41]);
+    }
+
+    #[test]
+    fn b64_handles_a_three_char_final_chunk() {
+        // "QQQ": b[2] is meaningful (chunk.len() > 2 is true) but b[3] must
+        // stay 0 and no third byte pushed (chunk.len() > 3 is false; a `>=`
+        // mutation there would index chunk[3] out of bounds and panic).
+        assert_eq!(b64("QQQ"), vec![0x41, 0x04]);
+    }
 }

@@ -80,8 +80,8 @@ function buildArgs(): string[] {
  * Forwards `tpu-mcp.errorMode` and `tpu-mcp.progressDetail` so the server's
  * tools default to the user's preferred walk-error policy and progress
  * verbosity without the agent needing to thread those arguments through every
- * call. Also forwards `tpu-mcp.normalizeLineEndings` (default off) which gates
- * write-time line-ending normalisation.
+ * call. Also forwards the legacy `tpu-mcp.normalizeLineEndings` setting for
+ * compatibility; Git policy is now discovered automatically by TPU.
  */
 function buildEnv(): Record<string, string> {
     const config = vscode.workspace.getConfiguration("tpu-mcp");

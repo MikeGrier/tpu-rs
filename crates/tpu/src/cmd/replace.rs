@@ -5,8 +5,8 @@
 //!
 //! The pattern is applied to a LF-only normalised view so callers never need
 //! to account for CRLF in their patterns.  `\n` in patterns always matches
-//! the LF byte used inside the normalised view.  Replacements are denormalised
-//! back to the file's dominant line-ending before writing.  The result is
+//! the LF byte used inside the normalised view. Replacements are denormalised
+//! to explicit or Git policy, or the file's dominant line ending. The result is
 //! written atomically via a temp file; the original is renamed to `<file>.bak`.
 //!
 //! `--multiline` prepends `(?m)` to the pattern, making `^` / `$` match at
@@ -32,10 +32,22 @@
 //!
 //! ## Replacement-string escapes
 //!
-//! This module operates on raw `&[u8]` replacement bytes.  Backslash-escape
-//! decoding (`\n` → LF, `\t` → TAB, `\\` → `\`, `\xHH`, `\uXXXX`, …) is the
-//! responsibility of the *caller* — the CLI front-end in `main.rs` performs
-//! that decoding via [`crate::escape::decode_bytes`] unless the user passes
+//! [`run`] takes the replacement as raw `&[u8]` for signature convenience
+//! (matching [`decode_replacement`]'s `Vec<u8>` output), but the bytes
+//! **must be valid UTF-8** once escape decoding is complete: `replace`
+//! operates on the file's decoded UTF-8 text throughout (matching/expanding
+//! against `old_norm`, which is `old_text.as_bytes()` of an already-decoded
+//! `&str`) and re-encodes strictly to the file's target encoding afterward,
+//! so a non-UTF-8 replacement has nothing valid to expand into. [`run`]
+//! checks this explicitly up front and returns a `"replacement is not valid
+//! UTF-8"` error rather than silently corrupting the match expansion.  In
+//! practice this only bites a `\xHH` escape (or a raw byte from
+//! `--literal-replacement`) that doesn't form a valid UTF-8 sequence on its
+//! own — e.g. `\xFF` alone; multi-byte sequences like `\xC3\xA9` (é) are
+//! fine.  Backslash-escape decoding (`\n` → LF, `\t` → TAB, `\\` → `\`,
+//! `\xHH`, `\uXXXX`, …) is the responsibility of the *caller* — the CLI
+//! front-end in `main.rs` performs that decoding via
+//! [`crate::escape::decode_bytes`] unless the user passes
 //! `--literal-replacement`.  By the time bytes reach [`run`] they should
 //! already contain real LF/TAB/etc. bytes for any escapes the user wrote.
 //!
@@ -81,13 +93,9 @@
 //! cause.  Pass [`WritePolicy::permissive`] / `--allow-mojibake` /
 //! `"allow_mojibake": true` to override.
 
-use std::{io::Write, path::Path, sync::Arc};
+use std::{io::Write, path::Path};
 
-use harrier::{
-    denormalise::DenormaliseWriter,
-    encoding::{LineEnding, SourceConfig},
-    source::Source,
-};
+use harrier::encoding::LineEnding;
 use regex::bytes::Regex;
 
 use crate::{
@@ -129,9 +137,8 @@ pub fn decode_replacement(s: &str, literal: bool) -> Result<Vec<u8>, String> {
 /// transparent.
 ///
 /// When `line_ending_override` is `Some`, the specified ending is used for
-/// denormalisation of replacement bytes instead of the file's detected
-/// dominant ending.  The file's content encoding is still detected and
-/// preserved.
+/// denormalisation instead of Git policy or the file's detected dominant
+/// ending. The file's content encoding follows Git policy or is preserved.
 ///
 /// When `diff_out` is `Some`, a unified text diff of the changes (computed in
 /// LF-normalised space) is written to the provided writer after the file has
@@ -161,7 +168,7 @@ pub struct ReplaceOptions {
     /// default), `pattern` is treated as a fixed literal string (every regex
     /// metacharacter is escaped) — regex is opt-in, never implicit.
     pub regex: bool,
-    /// Override the output line ending; `None` preserves the file's.
+    /// Override the output line ending; `None` uses Git policy or preserves the file's.
     pub line_ending_override: Option<LineEnding>,
     /// Count matches without modifying the file.
     pub count_only: bool,
@@ -255,16 +262,12 @@ pub fn run(
         escaped
     };
 
-    let branch = crate::open_as_branch(file, io_mode)?;
-    let file_len = branch.byte_len();
-
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-    // Capture the file's encoding now (static ref; independent of source
-    // lifetime) for use in the output line-ending post-processing step.
-    let file_encoding = source.encoding();
-    let line_ending = line_ending_override.unwrap_or_else(|| source.line_ending());
-    let lines = source.as_lines()?;
-    let view = lines.view_range(0..file_len)?;
+    let decoded = crate::read_text_file(file, io_mode)?;
+    let file_encoding = decoded.encoding;
+    let detected_line_ending = decoded.line_ending;
+    let had_bom = decoded.bom_len > 0;
+    let old_text = decoded.text;
+    let old_norm = old_text.as_bytes();
 
     let re = Regex::new(&effective_pattern)?;
 
@@ -278,36 +281,14 @@ pub fn run(
     // whole-match group 0, so `> 1` means at least one explicit group exists.
     let has_capture_groups = re.captures_len() > 1;
 
-    // Snapshot the normalised old bytes now for diff computation later.
-    // Only paid when --diff or --dry-run is requested: this is a full-file
-    // clone, so it must stay opt-in (see ChangedRegion for the cheap,
-    // always-available alternative used for the default changed-region echo).
-    let old_norm: Option<Vec<u8>> = if diff_out.is_some() {
-        Some(view.bytes.to_vec())
-    } else {
-        None
-    };
+    std::str::from_utf8(replacement).map_err(|error| {
+        format!(
+            "replace: {}: replacement is not valid UTF-8: {error}",
+            file.display()
+        )
+    })?;
 
-    // Snapshot the raw old bytes for the mojibake write-time guard.  Only
-    // taken when the guard is active and we will actually write (i.e. not
-    // count-only).  Decoded against `file_encoding` later, after the
-    // substitution result is known.
-    let guard_old_bytes: Option<Vec<u8>> = if policy.reject_introduced_mojibake && !count_only {
-        Some(view.bytes.to_vec())
-    } else {
-        None
-    };
-
-    // A splice descriptor: source-coordinate range and its denormalised
-    // replacement bytes.
-    struct Splice {
-        source_start: u64,
-        source_len: u64,
-        content: Vec<u8>,
-    }
-
-    // Collect all matches as source-coordinate splices.  Matches are visited
-    // in left-to-right order (regex::bytes::Captures::iter guarantees this),
+    // Collect match metadata. Matches are visited in left-to-right order,
     // so `line_no`/`scanned_to` track cumulative line position incrementally:
     // each match only counts newlines in the *unscanned* gap since the last
     // match, never rescanning from the start of the file. Total newline-
@@ -316,25 +297,27 @@ pub fn run(
     let mut line_no: usize = 1;
     let mut scanned_to: usize = 0;
     let mut text_materialized: usize = 0;
-    let mut splices: Vec<Splice> = Vec::new();
-    for caps in re.captures_iter(&view.bytes) {
+    let mut replacement_count = 0;
+    for caps in re.captures_iter(old_norm) {
         let m = caps.get(0).unwrap();
-        let source_start = view.byte_range_start() + view.offset_map.to_source(m.start() as u64);
-        let source_end = view.byte_range_start() + view.offset_map.to_source(m.end() as u64);
-        let source_len = source_end - source_start;
-
-        // Expand capture-group back-references in normalised space.  When
-        // the pattern has no explicit groups the replacement is taken
-        // verbatim, so `$` survives instead of being read as a reference.
-        let mut norm_repl: Vec<u8> = Vec::new();
-        if has_capture_groups {
-            caps.expand(replacement, &mut norm_repl);
-        } else {
-            norm_repl.extend_from_slice(replacement);
-        }
 
         if let Some(req) = regions.as_mut() {
-            line_no += view.bytes[scanned_to..m.start()]
+            // Expand capture-group back-references in normalised space, but
+            // only when a `ChangedRegion` echo was actually requested: the
+            // real rewrite below (`re.replace_all`) redoes this expansion
+            // independently, so doing it here unconditionally for every
+            // match would be wasted work whenever `regions` is `None`
+            // (e.g. `count`/`dry_run` without a preview).  When the pattern
+            // has no explicit groups the replacement is taken verbatim, so
+            // `$` survives instead of being read as a reference.
+            let mut norm_repl: Vec<u8> = Vec::new();
+            if has_capture_groups {
+                caps.expand(replacement, &mut norm_repl);
+            } else {
+                norm_repl.extend_from_slice(replacement);
+            }
+
+            line_no += old_norm[scanned_to..m.start()]
                 .iter()
                 .filter(|&&b| b == b'\n')
                 .count();
@@ -342,7 +325,7 @@ pub fn run(
             // A newline that is the LAST byte of the match only terminates
             // the match's own last line -- it doesn't pull in any content
             // from the following line, so it must not extend end_line.
-            let match_span = &view.bytes[m.start()..m.end()];
+            let match_span = &old_norm[m.start()..m.end()];
             let counted_span = match match_span.last() {
                 Some(b'\n') => &match_span[..match_span.len() - 1],
                 _ => match_span,
@@ -401,24 +384,17 @@ pub fn run(
             scanned_to = m.end();
         }
 
-        // Denormalise: restore the file's dominant line terminator.
-        let content = denormalize_bytes(&norm_repl, line_ending);
-
-        splices.push(Splice {
-            source_start,
-            source_len,
-            content,
-        });
+        replacement_count += 1;
     }
-
-    let replacement_count = splices.len();
 
     // --count: return match count without applying any edits.
     if count_only {
         return Ok(replacement_count);
     }
 
-    // Zero-match short-circuit: no splices means the atomic rewrite would
+    let git_policy = crate::git::policy_for_path(file)?;
+
+    // Zero-match short-circuit: no replacements means the atomic rewrite would
     // produce byte-identical content, so skip it entirely -- no mojibake
     // guard work, no materialize, no atomic_write, no .bak, no mtime bump.
     // Callers can then distinguish "matched nothing" from "replaced N" at
@@ -432,58 +408,51 @@ pub fn run(
         return Ok(0);
     }
 
-    // Apply splices in reverse source order so earlier-offset splices can
-    // reuse the original b1 source coordinates without adjustment.
-    let b2 = branch.fork();
-    splices.sort_unstable_by_key(|s| std::cmp::Reverse(s.source_start));
-    for s in &splices {
-        b2.splice(s.source_start, s.source_len, &s.content)?;
-    }
-
-    let out_bytes = redwing::materialize(&*b2)?;
-
-    // Release all branch and view handles before any file-system work.
-    // On Windows a memory-mapped file cannot be renamed while a mapping is open.
-    drop(splices);
-    drop(view);
-    drop(lines);
-    drop(b2);
-    drop(branch);
-
-    // When `--line-ending` is set, the splice step above already used the
-    // override for replacement bytes, but the un-replaced regions still carry
-    // the original file's line terminators.  Normalise the entire output now
-    // so every line ending matches the requested convention.
-    let out_bytes = match line_ending_override {
-        None => out_bytes,
-        Some(target) => crate::encoding::apply_line_ending_to_all(out_bytes, file_encoding, target),
+    let new_norm = if has_capture_groups {
+        re.replace_all(old_norm, replacement).into_owned()
+    } else {
+        re.replace_all(old_norm, regex::bytes::NoExpand(replacement))
+            .into_owned()
+    };
+    let new_text = std::str::from_utf8(&new_norm)
+        .map_err(|error| format!("replace: generated invalid UTF-8: {error}"))?;
+    let encoded = crate::encoding::encode_text_strict(new_text, file_encoding)
+        .map_err(|error| format!("replace: {}: {error}", file.display()))?;
+    let target_line_ending = line_ending_override
+        .or_else(|| git_policy.line_ending_for_text(new_text))
+        .unwrap_or(detected_line_ending);
+    let encoded = match target_line_ending {
+        LineEnding::Lf => encoded,
+        LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, file_encoding),
+        LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, file_encoding),
+    };
+    let out_bytes = if git_policy.write_bom(had_bom) {
+        let bom = crate::encoding::bom_bytes_for(file_encoding);
+        let mut bytes = Vec::with_capacity(bom.len() + encoded.len());
+        bytes.extend_from_slice(bom);
+        bytes.extend_from_slice(&encoded);
+        bytes
+    } else {
+        encoded
     };
 
     // Write atomically: temp file in same dir → rename original to .bak →
     // persist temp to original path.  Skipped for --dry-run.
     if !dry_run {
-        // Mojibake write-time guard.  Decode old + new bytes via the
-        // file's encoding so the comparison is in UTF-8 char space.
-        if let Some(old_raw) = guard_old_bytes.as_deref() {
-            let (old_text, _, _) = file_encoding.decode(old_raw);
-            let (new_text, _, _) = file_encoding.decode(&out_bytes);
-            check_write_does_not_introduce_mojibake(&old_text, &new_text)
+        if policy.reject_introduced_mojibake {
+            check_write_does_not_introduce_mojibake(&old_text, new_text)
                 .map_err(|e| format!("replace: {}: {e}", file.display()))?;
         }
 
-        // Atomic write via the shared temp→.bak→persist→restore helper.
-        crate::atomic_write(file, &out_bytes)?;
+        let old_bytes = crate::retry_io(|| std::fs::read(file))?;
+        if old_bytes != out_bytes {
+            crate::atomic_write(file, &out_bytes)?;
+        }
     }
 
     // Emit the diff (for both --diff after a successful write and --dry-run).
-    if let (Some(out), Some(old)) = (diff_out, old_norm) {
-        let new_norm = if has_capture_groups {
-            re.replace_all(&old, replacement).into_owned()
-        } else {
-            re.replace_all(&old, regex::bytes::NoExpand(replacement))
-                .into_owned()
-        };
-        emit_unified_diff(file, &old, &new_norm, out)?;
+    if let Some(out) = diff_out {
+        emit_unified_diff(file, old_norm, &new_norm, out)?;
     }
 
     Ok(replacement_count)
@@ -508,20 +477,6 @@ fn emit_unified_diff(
         .to_string();
     out.write_all(text.as_bytes())?;
     Ok(())
-}
-
-/// Expand a normalised (LF-only) byte slice to use the file's dominant line
-/// terminator.
-///
-/// Each `\n` byte is passed through [`DenormaliseWriter`] backed by an
-/// infinite repeat of `le`.  Non-newline bytes pass through unchanged.
-fn denormalize_bytes(norm: &[u8], le: LineEnding) -> Vec<u8> {
-    let mut dw = DenormaliseWriter::new(Vec::with_capacity(norm.len()), std::iter::repeat(le));
-    // Vec<u8> never returns I/O errors; unwrap is safe.
-    std::io::Write::write_all(&mut dw, norm).unwrap();
-    // into_inner rather than finish: the infinite repeat iterator has no
-    // surplus terminators to flush.
-    dw.into_inner()
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -648,6 +603,41 @@ mod tests {
                 policy: crate::mojibake::WritePolicy::permissive(),
             },
         )
+    }
+
+    /// `run` takes `replacement` as `&[u8]` for signature convenience, but
+    /// the bytes must form valid UTF-8: `replace` operates on decoded UTF-8
+    /// text throughout and re-encodes strictly afterward, so a replacement
+    /// that isn't valid UTF-8 on its own has nothing valid to expand into.
+    /// A single `\xFF` byte (as `--literal-replacement` or an unpaired
+    /// `\xHH` escape would produce) is invalid UTF-8 in isolation, so `run`
+    /// must reject it explicitly rather than let it corrupt the match
+    /// expansion or panic downstream. The file must be left untouched.
+    #[test]
+    fn run_rejects_non_utf8_replacement_bytes() {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(b"hello\n").unwrap();
+        f.flush().unwrap();
+        let path = f.path().to_path_buf();
+        drop(f);
+        fs::write(&path, b"hello\n").unwrap();
+
+        let err = run_test(
+            &path, "hello", b"\xFF", false, false, None, None, false, false,
+        )
+        .expect_err("a lone 0xFF byte is not valid UTF-8 and must be rejected");
+        assert!(
+            err.to_string().contains("replacement is not valid UTF-8"),
+            "got: {err}"
+        );
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"hello\n",
+            "file must be untouched when the replacement is rejected"
+        );
+
+        let _ = fs::remove_file(format!("{}.bak", path.display()));
+        let _ = fs::remove_file(&path);
     }
 
     /// Write `content` to a temp file, run `replace::run`, and return the
@@ -1199,6 +1189,49 @@ mod tests {
         );
 
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn zero_match_does_not_apply_automatic_git_eol_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        fs::write(dir.path().join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        let path = dir.path().join("note.txt");
+        fs::write(&path, b"hello\n").unwrap();
+
+        let count = run_test(
+            &path,
+            "not present",
+            b"replacement",
+            false,
+            false,
+            None,
+            None,
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(count, 0);
+        assert_eq!(fs::read(&path).unwrap(), b"hello\n");
+        assert!(!Path::new(&format!("{}.bak", path.display())).exists());
+    }
+
+    #[test]
+    fn text_auto_does_not_normalize_binary_content() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "*.dat text=auto eol=crlf\n",
+        )
+        .unwrap();
+        let path = dir.path().join("binary.dat");
+        fs::write(&path, b"old\n\0tail\n").unwrap();
+
+        run_test(&path, "old", b"new", false, false, None, None, false, false).unwrap();
+
+        assert_eq!(fs::read(&path).unwrap(), b"new\n\0tail\n");
     }
 
     // ── Diff output ───────────────────────────────────────────────────────────

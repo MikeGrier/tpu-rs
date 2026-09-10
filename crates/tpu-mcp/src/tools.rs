@@ -175,8 +175,9 @@ pub fn list() -> Value {
                  Latin-1, punctuation, box-drawing, NBSP, or double-encoded fingerprints), \
                  the read still succeeds; run `tpu doctor` (or call this tool from a \
                  CLI shell) to diagnose and optionally repair the file. \
-                 Line-ending awareness: pass `git_root` to additionally detect when the \
-                 file's on-disk line endings differ from what git would materialise for \
+                 Git awareness: the nearest repository is discovered automatically. The \
+                 file is decoded using `working-tree-encoding`, and TPU detects line-ending mismatches \
+                 against what git would materialise for \
                  that path (per .gitattributes / core.autocrlf / core.eol); when they do, \
                  the response is prefixed with a single `note:` line and the unchanged \
                  content follows. Run `tpu_doctor` with `fix: \"eol\"` to normalise.",
@@ -204,11 +205,12 @@ pub fn list() -> Value {
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root (no upward \
-                             discovery). When set, the response is prefixed with a `note:` \
+                            "Optional absolute path to a git repository root. Repository \
+                             discovery is automatic when omitted. When set, the response is \
+                             prefixed with a `note:` \
                              line if the file's on-disk line endings differ from git's \
                              expected convention for that path (per .gitattributes / \
-                             core.autocrlf / core.eol). Opt-in; omit to skip all git checks."
+                             core.autocrlf / core.eol)."
                     }
                 },
                 "required": ["file"]
@@ -220,7 +222,8 @@ pub fn list() -> Value {
             "description":
                 "Write UTF-8/LF text to a file, preserving the target file's existing \
                  encoding (UTF-8, UTF-16LE/BE, Windows-1252, …) and line endings \
-                 (LF or CRLF). For new files, UTF-8/LF is used. The original file is \
+                 (LF or CRLF). Git `working-tree-encoding` and definite EOL policy \
+                 apply automatically; otherwise new files use UTF-8/LF. The original file is \
                  atomically backed up to <file>.bak before writing. Prefer this over \
                  PowerShell Set-Content or Out-File to avoid encoding corruption.\n\n\
                  ESCAPING: 'content' is the LITERAL text to write. The JSON-RPC \
@@ -277,20 +280,15 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["lf", "crlf", "cr"],
                         "description":
-                            "Override the output line ending. Omit to preserve the file's \
-                             existing convention. Cannot be used with binary content."
+                            "Override the output line ending. Omit to use definite Git policy \
+                             or preserve the file's existing convention. Cannot be used with \
+                             binary content."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             write denormalises to git's expected convention for this path \
-                             (per .gitattributes / core.autocrlf / core.eol). Off by \
-                             default — without the server setting this argument has no \
-                             effect on writes."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "diff": {
                         "type": "boolean",
@@ -356,11 +354,9 @@ pub fn list() -> Value {
                  name matches the intent and the call FAILS if the path already exists, \
                  so an existing file is never silently overwritten. To overwrite or \
                  modify a file that already exists, use tpu_write_file instead.\n\n\
-                 New files are UTF-8 with LF line endings by default. Set line_ending to \
-                 force CRLF/CR, or pass git_root to follow the repository's configured \
-                 convention (per .gitattributes / core.autocrlf / core.eol) when the \
-                 server has line-ending normalisation enabled. Parent directories are \
-                 created as needed.\n\n\
+                 New files use repository working-tree-encoding and EOL policy when Git \
+                 supplies them; otherwise they default to UTF-8/LF. Set line_ending to \
+                 force LF/CRLF/CR. Parent directories are created as needed.\n\n\
                  ESCAPING: 'content' is the LITERAL text to write. The JSON-RPC transport \
                  already handles JSON string escaping; do not add a second layer. To \
                  insert a newline put a real newline in the JSON string.\n\n\
@@ -385,7 +381,7 @@ pub fn list() -> Value {
                         "description":
                             "Full UTF-8 text content for the new file. Any CRLF or bare CR \
                              line endings are normalized to LF before processing, then \
-                             written as LF unless line_ending (or git_root normalisation) \
+                             written as LF unless line_ending or Git policy \
                              specifies otherwise. When content_format is set, this is the \
                              encoded payload instead of literal text — see content_format."
                     },
@@ -405,20 +401,14 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["lf", "crlf", "cr"],
                         "description":
-                            "Line ending for the new file. Omit for LF (the default for \
-                             new files) or to defer to git_root normalisation."
+                            "Line ending for the new file. Omit to use Git policy, or LF \
+                             when no definite repository policy applies."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             new file is written with git's expected convention for this \
-                             path (per .gitattributes / core.autocrlf / core.eol). Off by \
-                             default — without the server setting this argument has no \
-                             effect."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "allow_mojibake": {
                         "type": "boolean",
@@ -604,17 +594,14 @@ pub fn list() -> Value {
                         "enum": ["lf", "crlf", "cr"],
                         "description":
                             "Override the output line ending for the replacement output. \
-                             Omit to preserve the file's existing convention."
+                             Omit to use definite Git policy or preserve the file's existing \
+                             convention."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             write denormalises to git's expected convention for this path. \
-                             Off by default."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "diff": {
                         "type": "boolean",
@@ -822,18 +809,15 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["lf", "crlf", "cr"],
                         "description":
-                            "Override the output line ending in text mode. Omit to preserve \
-                             the file's existing convention. Conflicts with binary: true."
+                            "Override the output line ending in text mode. Omit to use definite \
+                             Git policy or preserve the file's existing convention. Conflicts \
+                             with binary: true."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             write denormalises to git's expected convention for this path. \
-                             Off by default."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "if_match": {
                         "type": "string",
@@ -1035,11 +1019,12 @@ pub fn list() -> Value {
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When set (and \
-                             not in byte mode), the response is prefixed with a `note:` line \
+                            "Optional absolute path to pin Git repository context. Repository \
+                             discovery is automatic when omitted. In line mode, the response \
+                             is prefixed with a `note:` line \
                              if the file's on-disk line endings differ from git's expected \
                              convention for that path (per .gitattributes / core.autocrlf / \
-                             core.eol). Opt-in."
+                             core.eol)."
                     }
                 },
                 "required": ["file"]
@@ -1094,11 +1079,12 @@ pub fn list() -> Value {
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When set (and \
-                             not in byte mode), the response is prefixed with a `note:` line \
+                            "Optional absolute path to pin Git repository context. Repository \
+                             discovery is automatic when omitted. In line mode, the response \
+                             is prefixed with a `note:` line \
                              if the file's on-disk line endings differ from git's expected \
                              convention for that path (per .gitattributes / core.autocrlf / \
-                             core.eol). Opt-in."
+                             core.eol)."
                     }
                 },
                 "required": ["file"]
@@ -1245,18 +1231,14 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["lf", "crlf", "cr"],
                         "description":
-                            "Override the output line ending for the combined file. Omit to \
-                             preserve the file's existing convention."
+                            "Override the output line ending for the combined file. Omit to use \
+                             definite Git policy or preserve the file's existing convention."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root. When the \
-                             server has line-ending normalisation enabled \
-                             (tpu-mcp.normalizeLineEndings setting / --eol-normalize / \
-                             TPU_EOL_NORMALIZE) and no explicit line_ending is given, the \
-                             write denormalises to git's expected convention for this path. \
-                             Off by default."
+                            "Optional legacy repository hint retained for compatibility. Write \
+                             policy is discovered automatically from the target path."
                     },
                     "diff": {
                         "type": "boolean",
@@ -1652,16 +1634,28 @@ pub fn list() -> Value {
                  the file is rewritten only if the peel produces strictly fewer mojibake \
                  matches than the original. The original content is preserved at \
                  `<file>.bak` (the standard atomic-write backup). To preview without \
-                 writing, leave `fix` unset and inspect `peel_suggested` in the report. \n\n\
+                 writing, leave `fix` unset and inspect `peel_suggested` in the report. \
+                 When a flagged file's peel is declined (`peel_suggested: false` despite \
+                 having `mojibake_matches`), `peel_declined_reason` explains why -- e.g. \
+                 the peel would itself produce invalid UTF-8, or would not reduce (or \
+                 would increase) the match count, typically because other legitimate \
+                 multi-byte UTF-8 text elsewhere in the file would be corrupted by a \
+                 whole-file reverse-decode. Manual repair is needed in that case. \n\n\
                  Files containing the literal sentinel `encoding-check: allow-mojibake` \
                  are treated as legitimate (test fixtures, regex sources, docs about \
-                 mojibake) and reported as clean. \n\n\
-                 LINE ENDINGS: pass `git_root` to additionally detect files whose on-disk \
-                 line endings differ from git's expected convention for their path (per \
+                 mojibake): the opt-out is honoured (never counted in `total_issues` / \
+                 exit-code failures), but it is never a silent surprise -- a file that \
+                 would otherwise have been flagged still appears in `files` with \
+                 `mojibake_marker_suppressed` (and/or `replacement_char_marker_suppressed`) \
+                 set to the count that was hidden, and `total_marker_suppressed` reports \
+                 how many files that applied to. A file with the marker but genuinely \
+                 nothing to suppress is omitted entirely, same as any other clean file. \n\n\
+                 LINE ENDINGS: repository discovery is automatic. Files whose on-disk line \
+                 endings differ from git's expected convention for their path (per \
                  .gitattributes / core.autocrlf / core.eol); such files are flagged with \
                  an `eol_mismatch` object in the report. Call with `fix: \"eol\"` (line \
-                 endings only) or `fix: \"all\"` (peel + line endings) together with \
-                 `git_root` to normalise them atomically with a `.bak` backup. \n\n\
+                 endings only) or `fix: \"all\"` (peel + line endings) to normalise them \
+                 atomically with a `.bak` backup, including UTF-16 files. \n\n\
                  When a teammate or another tool (e.g. PowerShell `Get-Content` / \
                  `Set-Content`, a misconfigured generator) appears to have introduced \
                  corruption, `git log -p -- <file>` will identify the introducing commit \
@@ -1691,16 +1685,16 @@ pub fn list() -> Value {
                              strictly fewer matches than the original, rewriting it \
                              atomically with a `.bak` backup. `eol` normalises only line \
                              endings to git's expected convention; `all` does both peel \
-                             and eol. `eol` and `all` require the `git_root` argument."
+                             and eol."
                     },
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to a git repository root (no upward \
-                             discovery). When set, doctor additionally reports files whose \
+                            "Optional absolute path to pin Git repository context. Repository \
+                             discovery is automatic when omitted. Doctor reports files whose \
                              on-disk line endings differ from git's expected convention \
                              (per .gitattributes / core.autocrlf / core.eol) via an \
-                             `eol_mismatch` field. Required when `fix` is `eol` or `all`."
+                             `eol_mismatch` field."
                     },
                     "on_error": {
                         "type": "string",
@@ -1739,6 +1733,8 @@ pub fn call(
     args: &Value,
     config: &ServerConfig,
 ) -> Result<ToolResult, Box<dyn std::error::Error>> {
+    tpu::git::begin_operation();
+    EOL_REPO_CACHE.with(|cache| cache.borrow_mut().clear());
     match name {
         "tpu_read_file" => Ok(call_read_file(args)),
         "tpu_write_file" => Ok(call_write_file(args, config)),
@@ -1781,16 +1777,14 @@ fn git_root_arg(args: &Value) -> Option<std::path::PathBuf> {
 }
 
 thread_local! {
-    /// Per-worker cache of opened [`tpu::git::GitEol`] handles, keyed by the
-    /// canonicalised `git_root`.  An agent session issues many reads against
-    /// the same repository; opening the repo (and loading its index) on every
-    /// call is wasteful, so we open once and reuse.
+    /// Per-request cache of opened [`tpu::git::GitEol`] handles, keyed by the
+    /// canonicalised `git_root`. A glob may inspect many files in the same
+    /// repository, so opening it for every path is wasteful.
     ///
     /// The worker loop is single-threaded, so a `thread_local` `RefCell` needs
-    /// no locking and `GitEol` need not be `Sync`.  Entries live for the
-    /// process lifetime; a `.gitattributes`/config change mid-session is not
-    /// observed — acceptable for a best-effort advisory and for opt-in
-    /// normalisation within a single session.
+    /// no locking and `GitEol` need not be `Sync`. The dispatcher clears this
+    /// cache before each tool call so repository changes between calls are
+    /// observed while reuse within one operation remains cheap.
     static EOL_REPO_CACHE: std::cell::RefCell<
         std::collections::HashMap<std::path::PathBuf, Option<std::rc::Rc<tpu::git::GitEol>>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
@@ -1813,19 +1807,17 @@ fn cached_git_eol(root: &std::path::Path) -> Option<std::rc::Rc<tpu::git::GitEol
     })
 }
 
-/// When a `git_root` is supplied and the file's on-disk line endings differ
-/// from git's expected convention, prepend a single `note:` line (identical to
-/// the one `tpu read --git-root` emits) ahead of the returned content.  The
-/// note line is part of the response *preamble*, like the invocation header,
-/// and is omitted entirely when there is no mismatch.
+/// When the file's on-disk line endings differ from Git's expected convention,
+/// prepend a single `note:` line. Repository discovery is automatic unless an
+/// explicit `git_root` pins the context.
 fn prepend_eol_note(args: &Value, file: &str, content: String) -> String {
-    let Some(root) = git_root_arg(args) else {
-        return content;
+    let path = std::path::Path::new(file);
+    let note = if let Some(root) = git_root_arg(args) {
+        cached_git_eol(&root).and_then(|git| git.advisory_note(path))
+    } else {
+        tpu::git::advisory_note_for_path(path)
     };
-    let Some(git) = cached_git_eol(&root) else {
-        return content;
-    };
-    match git.advisory_note(std::path::Path::new(file)) {
+    match note {
         Some(note) => format!("{note}\n{content}"),
         None => content,
     }
@@ -1834,11 +1826,8 @@ fn prepend_eol_note(args: &Value, file: &str, content: String) -> String {
 /// Resolve the write-time line-ending override for a mutating MCP tool.
 ///
 /// Thin wrapper over the shared [`tpu::git::resolve_write_override`] (also used
-/// by the `tpu` CLI): an explicit `line_ending` argument always wins;
-/// otherwise, when the server has line-ending normalisation enabled
-/// (`config.eol_normalize`) and the call supplies a `git_root`, the override is
-/// git's expected convention for the file.  Returns `Ok(None)` when neither
-/// applies.
+/// by the `tpu` CLI): this parses an explicit `line_ending`; otherwise each
+/// command discovers and applies the complete Git policy itself.
 fn eol_write_override(
     args: &Value,
     file: &str,
@@ -1846,12 +1835,12 @@ fn eol_write_override(
 ) -> Result<Option<tpu::encoding::LineEnding>, Box<dyn std::error::Error>> {
     let explicit = args.get("line_ending").and_then(|v| v.as_str());
     let git_root = git_root_arg(args);
-    let git_root = if config.eol_normalize {
-        git_root.as_deref()
-    } else {
-        None
-    };
-    tpu::git::resolve_write_override(explicit, std::path::Path::new(file), git_root, true)
+    tpu::git::resolve_write_override(
+        explicit,
+        std::path::Path::new(file),
+        git_root.as_deref(),
+        config.eol_normalize,
+    )
 }
 
 fn call_read_file(args: &Value) -> ToolResult {
@@ -3249,12 +3238,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
                 }
             },
         };
-        // `eol`/`all` require a repository root to resolve git's expected line
-        // endings; reject early with a clear message rather than silently no-op.
         let git_root = git_root_arg(args);
-        if fix_eol && git_root.is_none() {
-            return Err("doctor: `fix: \"eol\"`/`\"all\"` requires a `git_root` argument".into());
-        }
 
         let on_error = match args.get("on_error") {
             None => config.default_on_error,
@@ -3334,12 +3318,15 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
                     "mojibake_matches": matches,
                     "replacement_char_matches": rc_matches,
                     "peel_suggested": issue.peel_suggested.is_some(),
+                    "peel_declined_reason": issue.peel_declined_reason,
                     "repaired": issue.repaired,
                     "eol_mismatch": issue.eol_mismatch.map(|m| serde_json::json!({
                         "expected": tpu::git::line_ending_name(m.expected),
                         "actual": tpu::git::line_ending_name(m.actual),
                     })),
                     "eol_repaired": issue.eol_repaired,
+                    "mojibake_marker_suppressed": issue.mojibake_marker_suppressed,
+                    "replacement_char_marker_suppressed": issue.replacement_char_marker_suppressed,
                 })
             })
             .collect();
@@ -3350,6 +3337,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
             "total_files_scanned": report.total_files_scanned,
             "total_issues": report.total_issues(),
             "total_repaired": report.total_repaired,
+            "total_marker_suppressed": report.total_marker_suppressed(),
             "walk_warnings": walk_warnings,
         });
         let result_line = serde_json::to_string(&doc)?;
@@ -3471,14 +3459,8 @@ pub struct ServerConfig {
     /// `--no-io-worker` (or `TPU_MCP_NO_IO_WORKER=1`).
     pub io_worker_enabled: bool,
 
-    /// When true, mutating tools (`tpu_write_file`, `tpu_replace_in_file`,
-    /// `tpu_edit_file`, `tpu_append_file`) normalise the target file's line
-    /// endings to git's expected convention — but only when the call also
-    /// supplies a `git_root` and does not pass an explicit `line_ending`.
-    ///
-    /// Off by default (writes never silently change line endings).  Enabled
-    /// by the `--eol-normalize` flag or `TPU_EOL_NORMALIZE=1`, which the VS
-    /// Code extension forwards from its `tpu-mcp.normalizeLineEndings` setting.
+    /// Legacy compatibility setting. Definite Git line-ending policy is now
+    /// discovered and applied automatically.
     pub eol_normalize: bool,
 }
 
@@ -3622,7 +3604,7 @@ fn stamp_and_verify(file: &Path, delay_ms: u64) -> Result<WriteStamp, Box<dyn st
     let meta = std::fs::metadata(file)?;
     let actual_ms = mtime_as_epoch_ms(&meta);
 
-    if actual_ms.abs_diff(now_ms) > 10 {
+    if mtime_drift_exceeds_tolerance(actual_ms, now_ms) {
         return Err(format!(
             "write verification failed for '{}': mtime stamp was {now_ms} ms but \
              read back {actual_ms} ms -- this likely indicates Windows Defender \
@@ -3638,6 +3620,14 @@ fn stamp_and_verify(file: &Path, delay_ms: u64) -> Result<WriteStamp, Box<dyn st
         mtime_epoch_ms: actual_ms,
         size: meta.len(),
     })
+}
+
+/// The verification tolerance (milliseconds) for [`stamp_and_verify`]'s
+/// read-back mtime check, extracted as its own function so the exact `> 10`
+/// boundary is directly testable without needing to force a real
+/// filesystem's mtime read-back to drift by precisely 10ms.
+fn mtime_drift_exceeds_tolerance(actual_ms: u64, expected_ms: u64) -> bool {
+    actual_ms.abs_diff(expected_ms) > 10
 }
 
 /// Extract the last-modified time from metadata as milliseconds since the
@@ -3733,18 +3723,17 @@ fn normalize_bytes_to_lf(bytes: Vec<u8>) -> Vec<u8> {
         return bytes;
     }
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\r' {
+    let mut iter = bytes.iter().copied().peekable();
+    while let Some(b) = iter.next() {
+        if b == b'\r' {
             out.push(b'\n');
             // Skip the \n in a \r\n pair.
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                i += 1;
+            if iter.peek() == Some(&b'\n') {
+                iter.next();
             }
         } else {
-            out.push(bytes[i]);
+            out.push(b);
         }
-        i += 1;
     }
     out
 }
@@ -4255,19 +4244,18 @@ fn is_windows_drive_path(s: &str) -> bool {
 /// independently).
 fn percent_decode_path(s: &str) -> String {
     let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let (Some(hi), Some(lo)) = (hex_nibble(b[i + 1]), hex_nibble(b[i + 2]))
+    let mut rest = s.as_bytes();
+    while let Some((&first, tail)) = rest.split_first() {
+        if first == b'%'
+            && let [h, l, tail2 @ ..] = tail
+            && let (Some(hi), Some(lo)) = (hex_nibble(*h), hex_nibble(*l))
         {
             bytes.push(hi << 4 | lo);
-            i += 3;
+            rest = tail2;
             continue;
         }
-        bytes.push(b[i]);
-        i += 1;
+        bytes.push(first);
+        rest = tail;
     }
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
@@ -4314,6 +4302,250 @@ mod tests {
             .collect();
         let from_const: Vec<String> = TOOL_NAMES.iter().map(|s| (*s).to_owned()).collect();
         assert_eq!(from_const, from_list, "TOOL_NAMES out of sync with list()");
+    }
+
+    #[test]
+    fn tool_names_is_non_empty_and_contains_known_tools() {
+        let names = tool_names();
+        assert!(!names.is_empty());
+        assert!(names.contains(&"tpu_read_file"));
+        assert!(names.contains(&"tpu_write_file"));
+    }
+
+    // ── diff_separator ───────────────────────────────────────────────────────
+
+    #[test]
+    fn diff_separator_adds_newline_only_when_missing() {
+        assert_eq!(diff_separator("no trailing newline"), "\n");
+        assert_eq!(diff_separator("has one\n"), "");
+        assert_eq!(diff_separator(""), "\n");
+    }
+
+    // ── is_binary_selector ───────────────────────────────────────────────────
+
+    #[test]
+    fn is_binary_selector_recognizes_each_prefix_independently() {
+        assert!(is_binary_selector("bytes:0-10"));
+        assert!(is_binary_selector("md5:0-10"));
+        assert!(is_binary_selector("crc32:0-10"));
+        assert!(!is_binary_selector("line:5"));
+        assert!(!is_binary_selector("line-contains:5"));
+        assert!(!is_binary_selector(""));
+    }
+
+    // ── decode_pattern_arg ────────────────────────────────────────────────────
+
+    /// The plain (non-`_format`) path must return the pattern text exactly
+    /// as given, not a constant. Pins a whole-function-replace mutation
+    /// (`Ok(String::new())`) directly, without going through the full
+    /// `tpu_replace_in_file` pipeline (where an unexpectedly-empty pattern
+    /// could hit the underlying replace engine's zero-width-match handling
+    /// instead of failing this assertion immediately).
+    #[test]
+    fn decode_pattern_arg_returns_the_given_pattern_verbatim() {
+        let args = serde_json::json!({ "pattern": "needle" });
+        assert_eq!(decode_pattern_arg(&args, "pattern").unwrap(), "needle");
+    }
+
+    // ── hex_nibble ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn hex_nibble_covers_all_digit_ranges_and_rejects_non_hex() {
+        assert_eq!(hex_nibble(b'0'), Some(0));
+        assert_eq!(hex_nibble(b'9'), Some(9));
+        assert_eq!(hex_nibble(b'a'), Some(10));
+        assert_eq!(hex_nibble(b'f'), Some(15));
+        assert_eq!(hex_nibble(b'A'), Some(10));
+        assert_eq!(hex_nibble(b'F'), Some(15));
+        assert_eq!(hex_nibble(b'g'), None);
+        assert_eq!(hex_nibble(b'G'), None);
+        assert_eq!(hex_nibble(b' '), None);
+    }
+
+    // ── is_windows_drive_path ────────────────────────────────────────────────
+
+    #[test]
+    fn is_windows_drive_path_length_boundary() {
+        // Fewer than 3 bytes can never be a drive path.
+        assert!(!is_windows_drive_path("C:"));
+        assert!(!is_windows_drive_path("C"));
+        // Exactly 3 bytes is the minimal valid form.
+        assert!(is_windows_drive_path("C:/"));
+    }
+
+    #[test]
+    fn is_windows_drive_path_requires_alphabetic_drive_letter() {
+        assert!(!is_windows_drive_path("1:/foo"));
+    }
+
+    #[test]
+    fn is_windows_drive_path_accepts_forward_and_back_slash() {
+        assert!(is_windows_drive_path("C:/foo"));
+        assert!(is_windows_drive_path(r"C:\foo"));
+        assert!(!is_windows_drive_path("C:foo"));
+    }
+
+    #[test]
+    fn is_windows_drive_path_percent_encoded_requires_all_components() {
+        // Each component of "C%3A/" must independently be required: flip
+        // one at a time away from valid and the whole match must fail.
+        assert!(is_windows_drive_path("C%3A/foo"));
+        assert!(is_windows_drive_path("c%3a/foo"), "case-insensitive hex");
+        assert!(!is_windows_drive_path("C%3A"), "too short (< 6 bytes)");
+        assert!(!is_windows_drive_path("C%4Afoo/"), "wrong first hex digit");
+        assert!(!is_windows_drive_path("C%3Zfoo/"), "wrong second hex digit");
+        assert!(!is_windows_drive_path("C%3A#foo"), "wrong separator byte");
+    }
+
+    // ── flatten_validate_pairs ───────────────────────────────────────────────
+
+    #[test]
+    fn flatten_validate_pairs_flattens_selector_value_in_order() {
+        let validates = vec![
+            serde_json::json!({"selector": "line:1", "value": "a"}),
+            serde_json::json!({"selector": "line:2", "value": "b"}),
+        ];
+        let pairs = flatten_validate_pairs(&validates).unwrap();
+        assert_eq!(pairs, vec!["line:1", "a", "line:2", "b"]);
+    }
+
+    #[test]
+    fn flatten_validate_pairs_errors_on_missing_selector_or_value() {
+        let missing_selector = vec![serde_json::json!({"value": "a"})];
+        assert!(flatten_validate_pairs(&missing_selector).is_err());
+
+        let missing_value = vec![serde_json::json!({"selector": "line:1"})];
+        assert!(flatten_validate_pairs(&missing_value).is_err());
+    }
+
+    // ── mojibake_policy_from_args ────────────────────────────────────────────
+
+    #[test]
+    fn mojibake_policy_from_args_respects_allow_mojibake_flag() {
+        let allowed = mojibake_policy_from_args(&serde_json::json!({"allow_mojibake": true}));
+        assert!(!allowed.reject_introduced_mojibake);
+
+        let default_off = mojibake_policy_from_args(&serde_json::json!({}));
+        assert!(default_off.reject_introduced_mojibake);
+
+        let explicit_false =
+            mojibake_policy_from_args(&serde_json::json!({"allow_mojibake": false}));
+        assert!(explicit_false.reject_introduced_mojibake);
+    }
+
+    // ── ServerConfig::to_wire / from_wire ────────────────────────────────────
+
+    #[test]
+    fn server_config_wire_round_trip_default() {
+        let cfg = ServerConfig::default();
+        let wire = cfg.to_wire();
+        let restored = ServerConfig::from_wire(&wire).unwrap();
+        assert_eq!(restored.verify_delay_ms, cfg.verify_delay_ms);
+        assert_eq!(restored.trace, cfg.trace);
+        assert_eq!(restored.default_on_error, cfg.default_on_error);
+        assert_eq!(restored.progress_detail, cfg.progress_detail);
+        assert_eq!(restored.eol_normalize, cfg.eol_normalize);
+    }
+
+    #[test]
+    fn server_config_wire_round_trip_non_default_variants() {
+        let cfg = ServerConfig {
+            verify_delay_ms: 250,
+            trace: false,
+            default_on_error: tpu::cmd::copy::OnError::Fail,
+            progress_detail: ProgressDetail::Summary,
+            ..ServerConfig::default()
+        };
+        let wire = cfg.to_wire();
+        assert_eq!(wire["default_on_error"], "fail");
+        assert_eq!(wire["progress_detail"], "summary");
+        let restored = ServerConfig::from_wire(&wire).unwrap();
+        assert_eq!(restored.default_on_error, tpu::cmd::copy::OnError::Fail);
+        assert_eq!(restored.progress_detail, ProgressDetail::Summary);
+        assert_eq!(restored.verify_delay_ms, 250);
+        assert!(!restored.trace);
+    }
+
+    #[test]
+    fn server_config_from_wire_rejects_unknown_enum_values() {
+        assert!(
+            ServerConfig::from_wire(&serde_json::json!({"default_on_error": "bogus"})).is_err()
+        );
+        assert!(ServerConfig::from_wire(&serde_json::json!({"progress_detail": "bogus"})).is_err());
+    }
+
+    // ── current_version ──────────────────────────────────────────────────────
+
+    // ── stamp_and_verify / mtime_drift_exceeds_tolerance ─────────────────────
+
+    /// `delay_ms == 0` must skip the stamp entirely and behave exactly like
+    /// `read_stamp` (no write access needed). Pins `delay_ms == 0` against a
+    /// `!=` mutation: on a read-only file, correct code succeeds (no write
+    /// attempted), while the mutated code would try to open the file for
+    /// writing and fail.
+    #[test]
+    fn stamp_and_verify_zero_delay_never_opens_file_for_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("readonly.txt");
+        std::fs::write(&f, b"hello").unwrap();
+        let mut perms = std::fs::metadata(&f).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&f, perms.clone()).unwrap();
+
+        let result = stamp_and_verify(&f, 0);
+
+        // Restore write permission before any assertion/panic unwinds so the
+        // tempdir can still be cleaned up.
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(&f, perms);
+
+        result.expect("delay_ms:0 must succeed on a read-only file (no write attempted)");
+    }
+
+    /// The verification tolerance's `> 10` boundary, extracted into
+    /// [`mtime_drift_exceeds_tolerance`] specifically so it's directly
+    /// testable: exactly 10ms of drift must NOT be flagged, but 11ms must
+    /// be. Pins `>` against `==` (would wrongly flag exactly-10 as a
+    /// failure) and against `>=` (same).
+    #[test]
+    fn mtime_drift_exceeds_tolerance_boundary() {
+        assert!(
+            !mtime_drift_exceeds_tolerance(1_000, 1_010),
+            "exactly 10ms must be tolerated"
+        );
+        assert!(
+            !mtime_drift_exceeds_tolerance(1_010, 1_000),
+            "exactly 10ms (reversed) must be tolerated"
+        );
+        assert!(
+            mtime_drift_exceeds_tolerance(1_000, 1_011),
+            "11ms must exceed tolerance"
+        );
+    }
+
+    #[test]
+    fn current_version_missing_file_is_none_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("does_not_exist.txt");
+        assert_eq!(current_version(f.to_str().unwrap()).unwrap(), None);
+    }
+
+    #[test]
+    fn current_version_existing_file_is_some() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("a.txt");
+        std::fs::write(&f, b"hello").unwrap();
+        assert!(current_version(f.to_str().unwrap()).unwrap().is_some());
+    }
+
+    #[test]
+    fn current_version_propagates_non_not_found_errors() {
+        // Passing a directory path (instead of a file) triggers a different
+        // I/O error kind than NotFound, which must propagate as `Err` rather
+        // than being silently mapped to `Ok(None)`.
+        let dir = tempfile::tempdir().unwrap();
+        let result = current_version(dir.path().to_str().unwrap());
+        assert!(result.is_err(), "a directory is not NotFound; must error");
     }
 
     /// Regression (read-side TOCTOU): `stable_content_version` attaches the
@@ -4408,7 +4640,68 @@ mod tests {
         );
     }
 
-    // -- file:// URI stripping --
+    /// A line whose length is exactly `MAX_ECHO_LINE_BYTES` (500) must NOT
+    /// be truncated -- only lines *longer* than that are. Pins `line.len()
+    /// > MAX_ECHO_LINE_BYTES` against a `>=` mutation.
+    #[test]
+    fn render_changed_regions_exact_max_line_bytes_not_truncated() {
+        let exact = "a".repeat(MAX_ECHO_LINE_BYTES);
+        let over = "a".repeat(MAX_ECHO_LINE_BYTES + 1);
+        let regions = vec![
+            tpu::cmd::replace::ChangedRegion {
+                start_line: 1,
+                end_line: 1,
+                new_line_count: 1,
+                new_text: exact.clone(),
+            },
+            tpu::cmd::replace::ChangedRegion {
+                start_line: 2,
+                end_line: 2,
+                new_line_count: 1,
+                new_text: over,
+            },
+        ];
+        let rendered = render_changed_regions(&regions);
+        assert!(
+            rendered.contains(&format!("+{exact}\n")),
+            "an exactly-500-byte line must be shown in full, not truncated; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("[truncated,"),
+            "a 501-byte line must be truncated; got: {rendered:?}"
+        );
+    }
+
+    /// A long line whose byte-500 boundary falls in the middle of a
+    /// multi-byte UTF-8 character must still truncate cleanly at the
+    /// nearest valid char boundary at or before 500, not panic. Pins
+    /// `boundary -= 1` against `+=`/`/=` mutations, either of which would
+    /// walk the search the wrong direction and panic (out-of-range slice
+    /// or an infinite/invalid search) instead of finding the boundary just
+    /// behind position 500.
+    #[test]
+    fn render_changed_regions_truncates_at_char_boundary_not_mid_multibyte_char() {
+        // 499 ASCII bytes, then a 3-byte UTF-8 character straddling the
+        // 500-byte cut point (bytes 499..502), followed by more text.
+        let mut new_text = "a".repeat(499);
+        new_text.push('€'); // U+20AC, 3 bytes in UTF-8
+        new_text.push_str("tail");
+        let regions = vec![tpu::cmd::replace::ChangedRegion {
+            start_line: 1,
+            end_line: 1,
+            new_line_count: 1,
+            new_text,
+        }];
+        let rendered = render_changed_regions(&regions);
+        assert!(rendered.contains("[truncated,"), "got: {rendered:?}");
+        // The truncated prefix must be exactly the 499 'a's (the euro sign
+        // itself is dropped since its first byte already falls at/after
+        // the cut point) -- and, crucially, must not panic.
+        assert!(
+            rendered.contains(&format!("+{}...", "a".repeat(499))),
+            "got: {rendered:?}"
+        );
+    }
 
     #[test]
     fn uri_windows_backslash_absolute() {
@@ -4899,6 +5192,76 @@ mod integration_tests {
         Ok(tr.text)
     }
 
+    // -- dispatcher coverage (call()'s match arms) ------------------------------
+
+    /// The dispatcher must actually route to `call_read_file_binary`, not
+    /// fall through to the `unknown tool` arm. Pins `delete match arm
+    /// "tpu_read_file_binary"` against the mutant that removes it.
+    #[test]
+    fn dispatcher_routes_tpu_read_file_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("bin.dat");
+        fs::write(&f, b"hello").unwrap();
+        let out = call(
+            "tpu_read_file_binary",
+            &serde_json::json!({ "file": f.to_str().unwrap() }),
+        )
+        .expect("must route to call_read_file_binary, not 'unknown tool'");
+        assert!(!out.contains("unknown tool"), "got: {out:?}");
+
+        drop(dir);
+    }
+
+    /// The dispatcher must actually route to `call_validate_file`. Pins
+    /// `delete match arm "tpu_validate_file"` against the mutant that
+    /// removes it.
+    #[test]
+    fn dispatcher_routes_tpu_validate_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("validate.txt");
+        fs::write(&f, b"hello\n").unwrap();
+        let out = call(
+            "tpu_validate_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "selector": "line:1",
+                "value": "hello",
+            }),
+        )
+        .expect("must route to call_validate_file, not 'unknown tool'");
+        assert!(!out.contains("unknown tool"), "got: {out:?}");
+
+        drop(dir);
+    }
+
+    // -- call_read_file_binary --------------------------------------------------
+
+    /// Requesting a `hash` must return the JSON-with-hashes format (an
+    /// `algo`/`range`/`value` entry), not the plain escaped-content format.
+    /// Pins `if !hash_specs.is_empty()` against a `delete !` mutation, which
+    /// would wrongly take the plain-content branch even when a hash was
+    /// requested.
+    #[test]
+    fn read_file_binary_with_hash_returns_hashes_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("hash_me.bin");
+        fs::write(&f, b"hello world").unwrap();
+        let out = call(
+            "tpu_read_file_binary",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "hash": ["crc32:1-$"],
+            }),
+        )
+        .expect("tpu_read_file_binary must succeed");
+        let v = ndjson_result_line(&out);
+        let hashes = v["hashes"].as_array().expect("expected a hashes array");
+        assert_eq!(hashes.len(), 1, "got: {out:?}");
+        assert_eq!(hashes[0]["algo"], "crc32", "got: {out:?}");
+
+        drop(dir);
+    }
+
     /// Regression: a zero-match `tpu_replace_in_file` must leave the file's
     /// mtime untouched **even when write verification is enabled**.
     ///
@@ -5014,6 +5377,32 @@ mod integration_tests {
             "alpha\nbeta\ngamma\n",
             "zero-match must leave file bytes untouched"
         );
+    }
+
+    #[test]
+    fn replace_zero_match_does_not_apply_automatic_git_eol_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        fs::write(dir.path().join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        let f = dir.path().join("zero_match_git.txt");
+        fs::write(&f, "alpha\nbeta\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+
+        let out = call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "NOT_PRESENT",
+                "replacement": "unused",
+                "allow_no_match": true,
+            }),
+        )
+        .unwrap();
+
+        assert_eq!(last_json_line(&out)["count"].as_u64(), Some(0), "{out}");
+        assert_eq!(fs::read(&f).unwrap(), b"alpha\nbeta\n");
+        assert_eq!(fs::metadata(&f).unwrap().modified().unwrap(), before);
+        assert!(!f.with_extension("txt.bak").exists());
     }
 
     /// `count:true` and `dry_run:true` are introspection modes: a zero result
@@ -5152,6 +5541,218 @@ mod integration_tests {
             content_no_match.is_empty(),
             "no-match result must have no content lines; got: {no_match:?}"
         );
+
+        drop(dir);
+    }
+
+    /// A zero-match `tpu_find` result must produce content that is exactly
+    /// empty -- no spurious blank line before the status trailer. Pins the
+    /// first `!` of `if !content.is_empty() && !content.ends_with('\n')`
+    /// against a `delete !` mutation, which would wrongly push a `'\n'` onto
+    /// otherwise-empty content.
+    #[test]
+    fn find_no_match_produces_no_spurious_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("no_match.txt");
+        fs::write(&f, "alpha\nbeta\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "zzz_never_matches_zzz",
+            "path": f.to_str().unwrap(),
+        });
+        let out = call("tpu_find", &args).expect("tpu_find must succeed on no match");
+        let header = invocation_header("tpu_find", &args);
+        assert_eq!(
+            out,
+            format!("{header}\n{{\"status\":\"success\"}}"),
+            "no-match output must have no extra content or blank line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// A `tpu_find` result WITH matches must not gain an extra blank line
+    /// between the (already newline-terminated) match content and the
+    /// status trailer. Pins the second `!` of the same guard (`&&`
+    /// mutated so it always evaluates against `content.ends_with('\n')`
+    /// directly) and the `&&`-to-`||` mutation, both of which would wrongly
+    /// push a second `'\n'` since match content already ends with one.
+    #[test]
+    fn find_with_match_produces_no_extra_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("has_match.txt");
+        fs::write(&f, "alpha fox\nbeta\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "fox",
+            "path": f.to_str().unwrap(),
+        });
+        let out = call("tpu_find", &args).expect("tpu_find must succeed");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            !lines.iter().any(|l| l.trim().is_empty()),
+            "matched output must have no spurious blank line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `on_error:warn` against an inaccessible absolute path must surface a
+    /// `warnings` field in the response (default `ProgressDetail::EachFile`).
+    /// Pins `if !warnings_json.is_empty()` against a `delete !` mutation,
+    /// which would wrongly omit the field even though there are warnings.
+    #[test]
+    fn find_walk_warning_appears_in_each_file_progress_detail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("good.txt");
+        fs::write(&good, "anything here\n").unwrap();
+        let missing = dir.path().join("does_not_exist.txt");
+
+        let args = serde_json::json!({
+            "pattern": "anything",
+            "paths": [good.to_str().unwrap(), missing.to_str().unwrap()],
+            "on_error": "warn",
+        });
+        let out = call("tpu_find", &args).expect("on_error:warn must not itself error");
+        let v = last_json_line(&out);
+        assert!(
+            v.get("warnings").is_some(),
+            "expected a warnings field for an inaccessible path; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// The same inaccessible-path scenario under `ProgressDetail::Summary`
+    /// must collapse the warning(s) into a single summary message. Pins `n
+    /// > 0` (in the `Summary` arm) against a `==`/`<` mutation, which would
+    /// wrongly omit the summary message even though `n == 1`.
+    #[test]
+    fn find_walk_warning_summarized_under_summary_progress_detail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("good.txt");
+        fs::write(&good, "anything here\n").unwrap();
+        let missing = dir.path().join("does_not_exist.txt");
+
+        let args = serde_json::json!({
+            "pattern": "anything",
+            "paths": [good.to_str().unwrap(), missing.to_str().unwrap()],
+            "on_error": "warn",
+        });
+        let config = ServerConfig {
+            verify_delay_ms: 0,
+            trace: false,
+            default_on_error: tpu::cmd::copy::OnError::Warn,
+            progress_detail: ProgressDetail::Summary,
+            io_worker_enabled: false,
+            eol_normalize: false,
+        };
+        let tr = super::call("tpu_find", &args, &config).expect("call must not itself error");
+        assert!(!tr.is_error, "got: {}", tr.text);
+        let v = last_json_line(&tr.text);
+        let warnings = v["warnings"].as_array().expect("warnings must be an array");
+        assert_eq!(warnings.len(), 1, "got: {:?}", tr.text);
+        assert!(
+            warnings[0].as_str().unwrap().contains("path(s) skipped"),
+            "expected a summarized skip message; got: {:?}",
+            tr.text
+        );
+
+        drop(dir);
+    }
+
+    /// A clean `tpu_find` (no walk warnings at all) under
+    /// `ProgressDetail::Summary` must not report a summary message. Pins
+    /// the same `n > 0` against a `>=` mutation, which would wrongly emit a
+    /// summary message for `n == 0`.
+    #[test]
+    fn find_no_warnings_under_summary_progress_detail_omits_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("clean.txt");
+        fs::write(&f, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "alpha",
+            "path": f.to_str().unwrap(),
+        });
+        let config = ServerConfig {
+            verify_delay_ms: 0,
+            trace: false,
+            default_on_error: tpu::cmd::copy::OnError::Warn,
+            progress_detail: ProgressDetail::Summary,
+            io_worker_enabled: false,
+            eol_normalize: false,
+        };
+        let tr = super::call("tpu_find", &args, &config).expect("call must not itself error");
+        assert!(!tr.is_error, "got: {}", tr.text);
+        let v = last_json_line(&tr.text);
+        assert!(
+            v.get("warnings").is_none(),
+            "expected no warnings field with zero skipped paths; got: {:?}",
+            tr.text
+        );
+
+        drop(dir);
+    }
+
+    /// A recursive copy where the destination for one subdirectory is
+    /// blocked by a pre-existing plain file (so `fs::create_dir_all` fails
+    /// for that one entry, producing exactly one `shell.warn()` call) must
+    /// surface a clean, non-corrupted warning message in `log` under
+    /// `ProgressDetail::EachFile`. Pins `SharedWriter::write` against
+    /// returning the wrong byte count: `Ok(1)` would make `write_all`'s
+    /// retry loop re-append overlapping trailing slices of the message
+    /// (since `extend_from_slice` always appends the *entire* slice it's
+    /// given, regardless of the claimed count), corrupting the buffered
+    /// text into a garbled, duplicated mess -- e.g. a clean "abc" would
+    /// become "abcbcc" once the retry loop re-appends shrinking suffixes.
+    /// Also pins `.filter(|l| !l.is_empty())` against a `delete !` mutation
+    /// (which would invert the filter to keep only empty lines, discarding
+    /// every real warning message) by asserting the log is non-empty.
+    #[test]
+    fn copy_file_warning_log_is_not_corrupted_by_writer_byte_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_dir = dir.path().join("src");
+        let sub = src_dir.join("subdir");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.txt"), b"hello").unwrap();
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir(&dest_dir).unwrap();
+        // Block the "subdir" destination with a plain file, so walking into
+        // it triggers exactly one `fs::create_dir_all` failure -> one
+        // `shell.warn()` call.
+        fs::write(dest_dir.join("subdir"), b"blocking file").unwrap();
+
+        let args = serde_json::json!({
+            "source": src_dir.to_str().unwrap(),
+            "dest": dest_dir.to_str().unwrap(),
+            "recursive": true,
+            "on_error": "warn",
+        });
+        let out =
+            call("tpu_copy_file", &args).expect("tpu_copy_file must succeed with on_error:warn");
+        let v = ndjson_result_line(&out);
+        let log = v["log"].as_array().expect("expected a non-empty log array");
+        assert!(
+            !log.is_empty(),
+            "expected at least one warning about the blocked mkdir; got: {out:?}"
+        );
+        for entry in log {
+            let s = entry.as_str().unwrap_or_default();
+            assert!(!s.is_empty(), "log entries must not be empty; got: {out:?}");
+            // A corrupted, duplicated-suffix message (as `Ok(1)` would
+            // cause) repeats an overlapping tail of itself; a clean
+            // message emitted in one shot never does. Check for the
+            // simplest possible symptom: the message's own last 4 bytes
+            // appearing again earlier in the string.
+            if s.len() >= 8 {
+                let tail = &s[s.len() - 4..];
+                assert!(
+                    !s[..s.len() - 4].contains(tail),
+                    "log entry looks corrupted (repeated tail): {s:?}"
+                );
+            }
+        }
 
         drop(dir);
     }
@@ -5335,6 +5936,82 @@ mod integration_tests {
         drop(dir);
     }
 
+    /// `tpu_edit_file` with `diff:true` (text mode, a real change) must show
+    /// the diff. Pins `diff && !diff_buf.is_empty()` against a `delete !`
+    /// mutation (which would wrongly hide the diff whenever there is one).
+    /// The companion `diff && !binary` guard (gating whether `diff_out` is
+    /// captured at all) is confirmed equivalent against a `&&`-to-`||`
+    /// mutation: in binary mode `cmd::edit::run` unconditionally discards
+    /// `diff_out` (`let _ = diff_out;`), so capturing it needlessly has no
+    /// effect; in text mode the mutation would make `diff_out` `Some` even
+    /// when `diff:false`, but this same outer `diff && !diff_buf.is_empty()`
+    /// check re-gates on the original `diff` flag directly, so the needless
+    /// capture is never read regardless.
+    #[test]
+    fn edit_file_diff_true_shows_diff_on_real_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("edit_diff.txt");
+        fs::write(&f, "first\nsecond\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [
+                { "op": "splice", "range": "1-1", "data": "changed\n" }
+            ],
+            "diff": true,
+        });
+        let out = call("tpu_edit_file", &args).expect("tpu_edit_file must succeed");
+        assert!(
+            out.contains("@@"),
+            "diff:true must show a unified diff on a real change; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `tpu_edit_file` with `diff:true` on a *textually no-op* splice (the
+    /// replacement data is byte-identical to what it replaces) must not show
+    /// an empty diff block. Pins the outer `diff && !diff_buf.is_empty()`
+    /// against a `&&`-to-`||` mutation from the opposite direction of the
+    /// test above: edit ops are unconditional (no match/no-match semantics
+    /// like replace_in_file), so a splice whose `data` equals the original
+    /// line content still "succeeds" but produces byte-identical output --
+    /// `diff_buf` ends up completely empty despite `diff:true`. The mutated
+    /// `||` evaluates to `true` from `diff` alone, wrongly enters the
+    /// show-diff branch with an empty `diff_text`, and prints a spurious
+    /// blank line + separator before the status line.
+    #[test]
+    fn edit_file_diff_true_on_textually_noop_splice_has_no_spurious_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("edit_diff_noop.txt");
+        fs::write(&f, "line1\nline2\nline3\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [
+                { "op": "splice", "range": "2-2", "data": "line2\n" }
+            ],
+            "diff": true,
+        });
+        let out = call("tpu_edit_file", &args).expect("tpu_edit_file must succeed");
+        let header = invocation_header("tpu_edit_file", &args);
+        let status_line = out
+            .strip_prefix(&format!("{header}\n"))
+            .expect("output must start with the invocation header");
+        assert!(
+            !status_line.starts_with('\n'),
+            "a textually no-op splice with diff:true must not show an empty diff \
+             block; got: {out:?}"
+        );
+        assert_eq!(
+            status_line.lines().count(),
+            1,
+            "expected exactly one status line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
     /// NL-IT-7: `tpu_edit_file` insert normalizes CRLF in inserted data.
     #[test]
     fn nl_it_7_edit_insert_normalizes_crlf() {
@@ -5488,6 +6165,33 @@ mod integration_tests {
 
         let written = fs::read_to_string(&f).unwrap();
         assert_eq!(written, format!("existing\n{intended}"));
+
+        drop(dir);
+    }
+
+    /// `tpu_append_file` with `diff:true` on a real (non-empty) append must
+    /// report `changed:true` and show the diff. Pins `let changed =
+    /// !diff_buf.is_empty()` against a `delete !` mutation, which would
+    /// invert the flag: `changed:false` and no diff shown despite content
+    /// actually being appended.
+    #[test]
+    fn append_file_diff_true_reports_changed_on_real_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("append_diff.txt");
+        fs::write(&f, "existing\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "more\n",
+            "diff": true,
+        });
+        let out = call("tpu_append_file", &args).expect("tpu_append_file must succeed");
+        let v = last_json_line(&out);
+        assert_eq!(v["changed"], true, "got: {out:?}");
+        assert!(
+            out.contains("@@"),
+            "diff must be shown for a real append; got: {out:?}"
+        );
 
         drop(dir);
     }
@@ -5752,7 +6456,182 @@ mod integration_tests {
         drop(dir);
     }
 
-    /// ER-IT-5: a single-line replacement that is itself very long (e.g. a
+    /// `diff:true` must show the *real* unified diff (with removed "-" lines
+    /// from the old text), not the cheap changed-region echo (which only
+    /// ever shows added "+" lines, since old text isn't retained). Both
+    /// happen to contain "@@" hunk headers, so `out.contains("@@")` alone
+    /// (as in ER-IT-4) cannot distinguish them. Pins two mutants that both
+    /// produce the same symptom (silently falling back to the
+    /// changed-region echo despite `diff:true`): `diff || dry_run`
+    /// (the `diff_out` capture guard) against a `&&` mutation, and `diff &&
+    /// !diff_buf.is_empty()` (the echo-source guard) against a `delete !`
+    /// mutation.
+    #[test]
+    fn replace_diff_true_shows_removed_lines_not_just_changed_region_echo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("diff_removed_lines.txt");
+        fs::write(&f, "hello world\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "world",
+            "replacement": "there",
+            "diff": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        assert!(
+            out.lines().any(|l| l.starts_with("-hello world")),
+            "diff:true must show the removed old line; the changed-region echo \
+             never shows old text, only the real unified diff does; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `diff:true` on a *textually no-op* replace (pattern and replacement
+    /// are identical, e.g. `pattern:"foo", replacement:"foo"`) must still
+    /// show the changed-region echo, not silently suppress it. Pins `diff &&
+    /// !diff_buf.is_empty()` against an `&&`-to-`||` mutation from the
+    /// opposite direction of the test above: here `diff_buf` (the whole-file
+    /// unified diff, built by comparing old/new *file content*) ends up
+    /// completely empty because the file's bytes truly don't change, while
+    /// `regions` (built per-*match*, independent of whether the replacement
+    /// text differs from what it replaced) is non-empty because the pattern
+    /// still matched. So the correct branch is `render_changed_regions(&regions)`
+    /// (non-empty, shows the match). The mutated `||` evaluates to `true`
+    /// from `diff` alone, wrongly selects the empty `diff_buf` as
+    /// `echo_text`, and the subsequent `echo_text.is_empty()` check then
+    /// swallows the echo entirely.
+    #[test]
+    fn replace_diff_true_on_textually_noop_match_still_shows_changed_region_echo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("diff_noop_match.txt");
+        fs::write(&f, "foo bar foo\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "foo",
+            "replacement": "foo",
+            "diff": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+        let header = invocation_header("tpu_replace_in_file", &args);
+        let body = out
+            .strip_prefix(&format!("{header}\n"))
+            .expect("output must start with the invocation header");
+        assert!(
+            !body.starts_with('{'),
+            "a textually no-op match must still show the changed-region echo, \
+             not jump straight to the status line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `count:true` must not wait on the cross-process write lock: it never
+    /// modifies the file, so acquiring the lock is both unnecessary and
+    /// (when another process holds it) an up-to-5-second wait for nothing.
+    /// Pins `!count && !dry_run` against a `delete !` mutation on the first
+    /// operand (`count && !dry_run`, which for `count:true, dry_run:false`
+    /// wrongly evaluates to `true`) and against `&&`-to-`||` (which is also
+    /// wrongly `true` here).
+    #[test]
+    fn replace_count_only_skips_write_lock_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("locked_count.txt");
+        fs::write(&f, "hello world\n").unwrap();
+        let _holder = tpu::acquire_write_lock(&f).expect("must acquire lock for the test");
+
+        let start = std::time::Instant::now();
+        let out = call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "world",
+                "replacement": "there",
+                "count": true,
+            }),
+        )
+        .expect("count:true must succeed even while the write lock is held");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "count:true must not wait on the write lock; took {elapsed:?}"
+        );
+        let v = last_json_line(&out);
+        assert_eq!(v["count"], 1, "got: {out:?}");
+
+        drop(dir);
+    }
+
+    /// `dry_run:true` must likewise not wait on the write lock. Pins `!count
+    /// && !dry_run` against a `delete !` mutation on the *second* operand
+    /// (`!count && dry_run`, which for `count:false, dry_run:true` wrongly
+    /// evaluates to `true`) -- the complementary case to the `count:true`
+    /// test above, needed because that scenario alone cannot distinguish
+    /// this specific mutation (both evaluate to `false`/fast there).
+    #[test]
+    fn replace_dry_run_only_skips_write_lock_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("locked_dry_run.txt");
+        fs::write(&f, "hello world\n").unwrap();
+        let _holder = tpu::acquire_write_lock(&f).expect("must acquire lock for the test");
+
+        let start = std::time::Instant::now();
+        call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "world",
+                "replacement": "there",
+                "dry_run": true,
+            }),
+        )
+        .expect("dry_run:true must succeed even while the write lock is held");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "dry_run:true must not wait on the write lock; took {elapsed:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// A real write (`n > 0`, no `line_ending_override`) must clean up a
+    /// stray pre-existing `.bak` file. Pins `wrote = n > 0 ||
+    /// le_override.is_some()` against both a `>`-to-`<` mutation and an
+    /// `||`-to-`&&` mutation -- either wrongly computes `wrote == false` for
+    /// this exact input (`n == 1`, `le_override == None`), skipping the
+    /// cleanup.
+    #[test]
+    fn replace_real_write_cleans_up_stray_bak_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("cleanup.txt");
+        fs::write(&f, "hello world\n").unwrap();
+        let bak = f.with_extension("txt.bak");
+        fs::write(&bak, "stale backup").unwrap();
+
+        call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "world",
+                "replacement": "there",
+            }),
+        )
+        .expect("tpu_replace_in_file must succeed");
+
+        assert!(
+            !bak.exists(),
+            "a real write must clean up a pre-existing stray .bak file"
+        );
+
+        drop(dir);
+    }
+
     /// minified JSON blob) is truncated with a marker in the default echo,
     /// even though `changed_lines` (2: one old line + one new line) is well
     /// under `echo_max_lines` -- the line-count gate alone can't bound an
@@ -6206,6 +7085,125 @@ mod integration_tests {
         drop(dir);
     }
 
+    /// `tpu_write_file` with `diff:true` on a real content change must show
+    /// the diff. Pins `if diff && !diff_buf.is_empty()` against a `delete !`
+    /// mutation (which would wrongly hide the diff whenever there is one).
+    #[test]
+    fn write_file_diff_true_shows_diff_on_real_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("diff_change.txt");
+        fs::write(&f, "old content\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "new content\n",
+            "diff": true,
+        });
+        let out = call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+        assert!(
+            out.contains("@@"),
+            "diff:true must show a unified diff on a real change; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `tpu_write_file` without `diff` must produce exactly `"{header}\n
+    /// {status_line}"` -- no extra blank line. Pins the same `if diff &&
+    /// !diff_buf.is_empty()` guard against a `&&`-to-`||` mutation: since
+    /// `diff_out` is `None` whenever `diff` is falsy, `diff_buf` stays empty
+    /// regardless, so `||` would wrongly enter the "show diff" branch and
+    /// insert a spurious blank line (`diff_separator("")` returns `"\n"`).
+    #[test]
+    fn write_file_without_diff_has_no_spurious_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("no_diff.txt");
+        fs::write(&f, "old content\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "new content\n",
+        });
+        let out = call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+        let header = invocation_header("tpu_write_file", &args);
+        let status_line = out
+            .strip_prefix(&format!("{header}\n"))
+            .expect("output must start with the invocation header");
+        assert!(
+            !status_line.starts_with('\n'),
+            "no-diff output must not have a spurious blank line; got: {out:?}"
+        );
+        assert_eq!(
+            status_line.lines().count(),
+            1,
+            "expected exactly one status line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `tpu_write_file` with `diff:true` on a write that produces *no actual
+    /// change* (content identical to what's already on disk) must not show
+    /// an empty diff block. Pins the same `if diff && !diff_buf.is_empty()`
+    /// guard against a `&&`-to-`||` mutation from the opposite direction:
+    /// when the write is a genuine no-op, `tpu::cmd::write::run`'s
+    /// `similar`-based unified diff produces a completely empty `diff_buf`
+    /// even though `diff:true` was requested (proven directly against
+    /// `emit_text_diff` by `write_text_diff_no_change_is_empty` in
+    /// `crates/tpu/src/cmd/write.rs`) -- so `diff || !diff_buf.is_empty()`
+    /// (mutated) evaluates to `true` purely from `diff` alone and wrongly
+    /// enters the "show diff" branch with an empty `diff_text`, producing a
+    /// spurious blank line + separator before the status line.
+    #[test]
+    fn write_file_diff_true_on_no_op_write_has_no_spurious_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("diff_no_change.txt");
+        fs::write(&f, "same content\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "same content\n",
+            "diff": true,
+        });
+        let out = call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+        let header = invocation_header("tpu_write_file", &args);
+        let status_line = out
+            .strip_prefix(&format!("{header}\n"))
+            .expect("output must start with the invocation header");
+        assert!(
+            !status_line.starts_with('\n'),
+            "a no-op write with diff:true must not show an empty diff block; got: {out:?}"
+        );
+        assert_eq!(
+            status_line.lines().count(),
+            1,
+            "expected exactly one status line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// An explicit `line_ending:"crlf"` argument must actually be honoured.
+    /// Pins `eol_write_override -> Ok(None)` against a whole-function-replace
+    /// mutation, which would silently drop the override and fall back to
+    /// the file's default (LF for a new file).
+    #[test]
+    fn write_file_explicit_line_ending_override_is_honoured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("crlf_override.txt");
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "a\nb\n",
+            "line_ending": "crlf",
+        });
+        call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+        let bytes = fs::read(&f).unwrap();
+        assert_eq!(bytes, b"a\r\nb\r\n", "line_ending:crlf must be honoured");
+
+        drop(dir);
+    }
+
     /// WV-IT-2: `tpu_replace_in_file` response includes mtime and size.
     #[test]
     fn wv_it_2_replace_response_contains_stamp() {
@@ -6337,6 +7335,63 @@ mod integration_tests {
         drop(dir);
     }
 
+    // -- call_render_file -------------------------------------------------------
+
+    /// A `vars` key with an invalid character (not alphanumeric/`_`/`-`)
+    /// must be rejected, not silently accepted -- even when the template
+    /// never references it. Pins `k.is_empty() || !k.chars().all(...)`
+    /// against a `&&` mutation: since the key here is non-empty, `&&`
+    /// would make the whole guard `false` regardless of the
+    /// character-validity check, silently accepting the bad key.
+    ///
+    /// The template deliberately does *not* contain `{{BAD KEY}}`: if it
+    /// did, `render_str`'s own independent token-name validation (which
+    /// rejects a `{{...}}` placeholder containing a space) would raise an
+    /// unrelated "invalid placeholder" error regardless of whether *this*
+    /// vars-key guard ran at all, masking the mutation (both the correct
+    /// and the mutated code would return an error whose message happens to
+    /// also contain the substring "may only contain"). By using an
+    /// unreferenced bad key with a template that has no placeholders, the
+    /// *only* way an error can occur is via this vars-key guard, and the
+    /// mutated version reports success instead.
+    #[test]
+    fn render_file_invalid_vars_key_character_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out.txt");
+
+        let args = serde_json::json!({
+            "template": "static content, no placeholders",
+            "output": out.to_str().unwrap(),
+            "vars": { "BAD KEY": "value" },
+        });
+        let err = call("tpu_render_file", &args)
+            .expect_err("a vars key containing a space must be rejected even if unused");
+        assert!(err.to_string().contains("may only contain"), "got: {err}");
+    }
+
+    /// A `vars` key containing an underscore or a dash must be accepted.
+    /// Pins the three mutants in `c.is_ascii_alphanumeric() || c == '_' ||
+    /// c == '-'`: either `==` mutated to `!=` (wrongly rejecting that
+    /// specific character) or the joining `||` mutated to `&&` (which,
+    /// since a single char can never be both `'_'` and `'-'` at once,
+    /// would reject *both* characters) would wrongly reject one of these
+    /// two keys.
+    #[test]
+    fn render_file_vars_key_with_underscore_and_dash_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out.txt");
+
+        let args = serde_json::json!({
+            "template": "{{my_var}}-{{my-var}}",
+            "output": out.to_str().unwrap(),
+            "vars": { "my_var": "A", "my-var": "B" },
+        });
+        call("tpu_render_file", &args).expect("underscore/dash keys must be accepted");
+        assert_eq!(fs::read_to_string(&out).unwrap(), "A-B");
+
+        drop(dir);
+    }
+
     // -- call_count_file -------------------------------------------------------
 
     /// CF-IT-1: `tpu_count_file` with no metric flags must return all four
@@ -6435,6 +7490,114 @@ mod integration_tests {
             result["patterns"]["lines"].as_u64().unwrap(),
             1,
             "pattern matching 'two' with label 'lines' must be in patterns sub-object; got: {result:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// A pattern labeled with a standard metric name that was *not*
+    /// requested (only `lines:true` was passed) must route to
+    /// `patterns`, not the top level -- proving that metric was correctly
+    /// excluded from `standard_metric_names`. Pins the *first* `||` in
+    /// `any_standard = lines || words || chars || bytes` against a `&&`
+    /// mutation. Since `&&` binds tighter than `||` in Rust, mutating just
+    /// the first operator gives `(lines && words) || chars || bytes` --
+    /// with only `lines` true, that's `false || false || false = false`,
+    /// wrongly excluding "chars" (and every other standard name) from
+    /// `standard_metric_names`, which pulls the colliding "chars"-labeled
+    /// pattern up to the top level. (The other two `||` operators need
+    /// separate tests below: because `&&` binds tighter, mutating either
+    /// of *them* only tightens an *inner* pair not including `lines`, so
+    /// `lines || (something && something)` still evaluates to `true`
+    /// either way and this scenario can't distinguish them.)
+    #[test]
+    fn count_file_only_lines_requested_excludes_other_standard_names_from_routing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_collision2.txt");
+        fs::write(&f, "one\ntwo\nthree\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "lines": true,
+            "patterns": [{ "pattern": "two", "label": "chars" }],
+        });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+
+        let result = ndjson_result_line(&out);
+        assert!(
+            result.get("chars").is_none(),
+            "'chars' was not requested and must not appear at the top level; got: {result:?}"
+        );
+        assert_eq!(
+            result["patterns"]["chars"].as_u64().unwrap(),
+            1,
+            "the colliding 'chars'-labeled pattern must be routed to patterns; got: {result:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// Same idea as the test above, but with only `words:true`, pinning the
+    /// *second* `||` (between `words` and `chars`). Mutating it gives
+    /// `lines || (words && chars) || bytes`; with `words:true, chars:false`,
+    /// that inner `&&` is `false`, so the whole expression collapses to
+    /// `false || false || false = false`, wrongly excluding "bytes" (used
+    /// here as the colliding label) from `standard_metric_names`.
+    #[test]
+    fn count_file_only_words_requested_excludes_other_standard_names_from_routing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_collision3.txt");
+        fs::write(&f, "one two three\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "words": true,
+            "patterns": [{ "pattern": "two", "label": "bytes" }],
+        });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+
+        let result = ndjson_result_line(&out);
+        assert!(
+            result.get("bytes").is_none(),
+            "'bytes' was not requested and must not appear at the top level; got: {result:?}"
+        );
+        assert_eq!(
+            result["patterns"]["bytes"].as_u64().unwrap(),
+            1,
+            "the colliding 'bytes'-labeled pattern must be routed to patterns; got: {result:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// Same idea again, with only `chars:true`, pinning the *third* `||`
+    /// (between `chars` and `bytes`). Mutating it gives `lines || words ||
+    /// (chars && bytes)`; with `chars:true, bytes:false`, that inner `&&`
+    /// is `false`, collapsing the whole expression to `false`, wrongly
+    /// excluding "lines" (used here as the colliding label) from
+    /// `standard_metric_names`.
+    #[test]
+    fn count_file_only_chars_requested_excludes_other_standard_names_from_routing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_collision4.txt");
+        fs::write(&f, "one\ntwo\nthree\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "chars": true,
+            "patterns": [{ "pattern": "two", "label": "lines" }],
+        });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+
+        let result = ndjson_result_line(&out);
+        assert!(
+            result.get("lines").is_none(),
+            "'lines' was not requested and must not appear at the top level; got: {result:?}"
+        );
+        assert_eq!(
+            result["patterns"]["lines"].as_u64().unwrap(),
+            1,
+            "the colliding 'lines'-labeled pattern must be routed to patterns; got: {result:?}"
         );
 
         drop(dir);

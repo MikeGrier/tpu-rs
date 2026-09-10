@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Michael Grier
 
-//! `tpu write` — write text content (UTF-8/LF) to a file, re-encoding and
-//! denormalising line endings to match the target file's conventions.
+//! `tpu write` — write text content (UTF-8/LF) to a file, applying Git
+//! worktree policy or the target file's detected native format.
 //!
 //! ## Write-time mojibake guard
 //!
@@ -26,10 +26,7 @@
 use std::{fs, io::Write, path::Path};
 
 use encoding_rs::Encoding;
-use harrier::{
-    encoding::{LineEnding, SourceConfig},
-    source::Source,
-};
+use harrier::encoding::LineEnding;
 
 use crate::{
     IoMode,
@@ -37,31 +34,26 @@ use crate::{
     mojibake::{WritePolicy, check_write_does_not_introduce_mojibake},
 };
 
-/// UTF-8 BOM byte sequence (U+FEFF encoded as UTF-8).
-const UTF8_BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
-
 /// Run the `write` subcommand.
 ///
-/// Reads all of `inp` as a UTF-8 string (error if not valid UTF-8), detects
-/// the target file's encoding and dominant line-ending convention, re-encodes
-/// the input bytes, and writes the result atomically.
+/// Reads all of `inp` as UTF-8, resolves Git worktree policy, re-encodes the
+/// text, and writes the result atomically. Without definite Git policy, an
+/// existing file's detected format is preserved.
 ///
 /// If `file` exists: the original is renamed to `<file>.bak` before the new
-/// content is placed at `file`.  If it does not exist: parent directories are
-/// created as needed and the file is written fresh as UTF-8/LF.
+/// content is placed at `file`. If it does not exist, parent directories are
+/// created and Git policy applies, falling back to UTF-8/LF.
 ///
 /// `output_encoding` and `bom_policy` work together:
-/// - [`OutputEncoding::Preserve`] (default): write using the existing file's
-///   encoding; BOM policy is ignored.
+/// - [`OutputEncoding::Preserve`] (default): use Git `working-tree-encoding`
+///   when declared, otherwise the existing file's encoding.
 /// - [`OutputEncoding::Utf8`]: force UTF-8 output regardless of the existing
 ///   file's encoding.  `bom_policy` then controls whether a UTF-8 BOM is
 ///   prepended: `Strip` (default) omits it, `Preserve` includes it only if
 ///   the existing file had one, `Force` always includes it.
 ///
 /// When `line_ending_override` is `Some`, the specified line ending is used
-/// for denormalisation instead of the file's detected dominant ending.  The
-/// file's encoding is still detected and preserved (or overridden by
-/// `output_encoding`).
+/// for denormalisation instead of Git policy or the detected dominant ending.
 ///
 /// When `diff_out` is `Some`, a unified text diff (in LF-normalised UTF-8
 /// space) of the old file vs. the new content is written after a successful
@@ -96,8 +88,13 @@ pub fn run(
 
     // Detect the target file's encoding, line-ending, and whether a BOM was
     // present (needed for BomPolicy::Preserve).
-    let (detected_encoding, detected_le, source_had_bom) = detect_target(file, io_mode)?;
-    let target_le = line_ending_override.unwrap_or(detected_le);
+    let git_policy = crate::git::policy_for_path(file)?;
+    let (detected_encoding, detected_le, source_had_bom) =
+        detect_target(file, io_mode, &git_policy)?;
+    let git_line_ending = git_policy.line_ending_for_text(utf8_text);
+    let target_le = line_ending_override
+        .or(git_line_ending)
+        .unwrap_or(detected_le);
 
     // Mojibake write-time guard.  Decoding the old bytes via the detected
     // encoding gives a UTF-8 string we can compare with `content`.
@@ -115,9 +112,12 @@ pub fn run(
         OutputEncoding::Utf8 => encoding_rs::UTF_8,
     };
 
-    // Only act on bom_policy when --utf8 is active.
+    // Only act on bom_policy when --utf8 is active; Preserve always defers to
+    // Git policy (which itself falls back to `source_had_bom` when no
+    // `working-tree-encoding` attribute is declared for this path — the
+    // common case for most files).
     let write_bom = match output_encoding {
-        OutputEncoding::Preserve => false,
+        OutputEncoding::Preserve => git_policy.write_bom(source_had_bom),
         OutputEncoding::Utf8 => match bom_policy {
             BomPolicy::Strip => false,
             BomPolicy::Preserve => source_had_bom,
@@ -125,41 +125,21 @@ pub fn run(
         },
     };
 
-    // Encode the UTF-8/LF input to the target encoding's byte representation.
-    //
-    // encoding_rs::UTF_16LE / UTF_16BE are decode-only encodings per the
-    // WHATWG Encoding spec: calling encode() on them silently falls back to
-    // UTF-8.  We therefore handle these two encodings manually so that the
-    // byte representation is correct for subsequent denormalisation.
-    let encoded: std::borrow::Cow<[u8]> = if target_encoding == encoding_rs::UTF_16LE {
-        std::borrow::Cow::Owned(
-            utf8_text
-                .encode_utf16()
-                .flat_map(|cu| cu.to_le_bytes())
-                .collect(),
-        )
-    } else if target_encoding == encoding_rs::UTF_16BE {
-        std::borrow::Cow::Owned(
-            utf8_text
-                .encode_utf16()
-                .flat_map(|cu| cu.to_be_bytes())
-                .collect(),
-        )
-    } else {
-        target_encoding.encode(utf8_text).0
-    };
+    let encoded = crate::encoding::encode_text_strict(utf8_text, target_encoding)
+        .map_err(|error| format!("write: {}: {error}", file.display()))?;
 
     // Denormalise: substitute each LF code unit with the target line ending.
     let encoded_bytes = match target_le {
-        LineEnding::Lf => encoded.into_owned(),
+        LineEnding::Lf => encoded,
         LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, target_encoding),
         LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, target_encoding),
     };
 
     // Prepend BOM if required.
     let output_bytes: Vec<u8> = if write_bom {
-        let mut v = Vec::with_capacity(UTF8_BOM.len() + encoded_bytes.len());
-        v.extend_from_slice(UTF8_BOM);
+        let bom = crate::encoding::bom_bytes_for(target_encoding);
+        let mut v = Vec::with_capacity(bom.len() + encoded_bytes.len());
+        v.extend_from_slice(bom);
         v.extend_from_slice(&encoded_bytes);
         v
     } else {
@@ -187,33 +167,43 @@ pub fn run(
 /// against and so needs the same defaults without going through the full
 /// read/detect machinery.
 pub(crate) fn encode_new_file_content(
+    file: &Path,
     content: &str,
     output_encoding: OutputEncoding,
     bom_policy: BomPolicy,
     line_ending_override: Option<LineEnding>,
-) -> Vec<u8> {
-    // A file that doesn't exist yet is always treated as UTF-8/LF/no-BOM by
-    // `detect_target`, so both `OutputEncoding` variants resolve to UTF-8
-    // output here and `write_bom` only fires for `Utf8` + `BomPolicy::Force`.
-    let write_bom = output_encoding == OutputEncoding::Utf8 && bom_policy == BomPolicy::Force;
-
-    let encoded_bytes = match line_ending_override.unwrap_or(LineEnding::Lf) {
-        LineEnding::Lf => content.as_bytes().to_vec(),
-        LineEnding::CrLf => {
-            crate::encoding::denormalize_lf_to_crlf(content.as_bytes(), encoding_rs::UTF_8)
-        }
-        LineEnding::Cr => {
-            crate::encoding::denormalize_lf_to_cr(content.as_bytes(), encoding_rs::UTF_8)
-        }
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let git_policy = crate::git::policy_for_path(file)?;
+    let target_encoding = match output_encoding {
+        OutputEncoding::Preserve => git_policy
+            .working_tree_encoding
+            .as_ref()
+            .map_or(encoding_rs::UTF_8, |worktree| worktree.encoding),
+        OutputEncoding::Utf8 => encoding_rs::UTF_8,
+    };
+    let write_bom = match output_encoding {
+        OutputEncoding::Preserve => git_policy.write_bom(false),
+        OutputEncoding::Utf8 => bom_policy == BomPolicy::Force,
+    };
+    let encoded = crate::encoding::encode_text_strict(content, target_encoding)
+        .map_err(|error| format!("write: {}: {error}", file.display()))?;
+    let encoded_bytes = match line_ending_override
+        .or_else(|| git_policy.line_ending_for_text(content))
+        .unwrap_or(LineEnding::Lf)
+    {
+        LineEnding::Lf => encoded,
+        LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, target_encoding),
+        LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, target_encoding),
     };
 
     if write_bom {
-        let mut v = Vec::with_capacity(UTF8_BOM.len() + encoded_bytes.len());
-        v.extend_from_slice(UTF8_BOM);
+        let bom = crate::encoding::bom_bytes_for(target_encoding);
+        let mut v = Vec::with_capacity(bom.len() + encoded_bytes.len());
+        v.extend_from_slice(bom);
         v.extend_from_slice(&encoded_bytes);
-        v
+        Ok(v)
     } else {
-        encoded_bytes
+        Ok(encoded_bytes)
     }
 }
 
@@ -223,20 +213,31 @@ pub(crate) fn encode_new_file_content(
 fn detect_target(
     file: &Path,
     io_mode: IoMode,
+    git_policy: &crate::git::FilePolicy,
 ) -> Result<(&'static Encoding, LineEnding, bool), Box<dyn std::error::Error>> {
+    let policy_defaults = || {
+        (
+            git_policy
+                .working_tree_encoding
+                .as_ref()
+                .map_or(encoding_rs::UTF_8, |worktree| worktree.encoding),
+            LineEnding::Lf,
+            false,
+        )
+    };
     if !file.exists() {
-        return Ok((encoding_rs::UTF_8, LineEnding::Lf, false));
+        return Ok(policy_defaults());
     }
 
     let f = crate::retry_io(|| fs::File::open(file))?;
     // Check length before opening; mapping a 0-byte file is platform-dependent.
     if f.metadata()?.len() == 0 {
-        return Ok((encoding_rs::UTF_8, LineEnding::Lf, false));
+        return Ok(policy_defaults());
     }
     drop(f);
 
     let branch = crate::open_as_branch(file, io_mode)?;
-    let source = Source::new(branch, SourceConfig::default())?;
+    let source = crate::source_from_branch(file, branch)?;
     let had_bom = source.bom_len() > 0;
     Ok((source.encoding(), source.line_ending(), had_bom))
 }
@@ -397,6 +398,103 @@ mod tests {
     fn write_preserves_crlf_line_ending() {
         let result = write_text(Some(b"old\r\n"), "new\n");
         assert_eq!(result, b"new\r\n");
+    }
+
+    #[test]
+    fn write_new_file_honours_discovered_git_encoding_and_eol() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "*.txt text eol=crlf working-tree-encoding=UTF-16LE-BOM\n",
+        )
+        .unwrap();
+        let path = dir.path().join("a.txt");
+
+        run_test(
+            &path,
+            "hello\n",
+            OutputEncoding::Preserve,
+            BomPolicy::Strip,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(path).unwrap(),
+            [
+                &[0xFF, 0xFE][..],
+                &"hello\r\n"
+                    .encode_utf16()
+                    .flat_map(u16::to_le_bytes)
+                    .collect::<Vec<_>>(),
+            ]
+            .concat()
+        );
+    }
+
+    #[test]
+    fn explicit_line_ending_overrides_discovered_git_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        fs::write(dir.path().join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        let path = dir.path().join("a.txt");
+
+        run_test(
+            &path,
+            "hello\n",
+            OutputEncoding::Preserve,
+            BomPolicy::Strip,
+            Some(LineEnding::Lf),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(path).unwrap(), b"hello\n");
+    }
+
+    #[test]
+    fn write_legacy_git_encoding_is_strict() {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "*.txt working-tree-encoding=windows-1252\n",
+        )
+        .unwrap();
+        let encodable = dir.path().join("encodable.txt");
+        let unmappable = dir.path().join("unmappable.txt");
+
+        // This test is about working-tree-encoding strictness, not line-ending
+        // detection, so force LF explicitly (matching
+        // `explicit_line_ending_overrides_discovered_git_policy` above) rather
+        // than relying on ambient git policy: with no `eol=` attribute, line
+        // ending falls back to the host's `core.autocrlf`/`core.eol`, which is
+        // not deterministic across machines (many CI Windows runners default
+        // to `autocrlf=true`) and would otherwise make this assertion flaky.
+        run_test(
+            &encodable,
+            "caf\u{e9}\n",
+            OutputEncoding::Preserve,
+            BomPolicy::Strip,
+            Some(LineEnding::Lf),
+            None,
+        )
+        .unwrap();
+        assert_eq!(fs::read(encodable).unwrap(), b"caf\xe9\n");
+
+        let error = run_test(
+            &unmappable,
+            "snowman \u{2603}\n",
+            OutputEncoding::Preserve,
+            BomPolicy::Strip,
+            Some(LineEnding::Lf),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("cannot be represented"));
+        assert!(!unmappable.exists());
     }
 
     #[test]
@@ -648,5 +746,48 @@ mod tests {
         let bak = format!("{}.bak", path.display());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_file(&bak);
+    }
+
+    // ── detect_target: BOM detection ──────────────────────────────────────────
+
+    /// `source.bom_len()` is a `usize`; pins `> 0` against a `<` mutation
+    /// (always false for an unsigned type) and, together with the next
+    /// test, against `==`/`>=` by covering both a BOM'd and a BOM-less file.
+    #[test]
+    fn detect_target_reports_bom_true_for_existing_bom_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        fs::write(&path, b"\xEF\xBB\xBFhello\n").unwrap();
+        let git_policy = crate::git::policy_for_path(&path).unwrap();
+        let (_, _, had_bom) = detect_target(&path, IoMode::Mmap, &git_policy).unwrap();
+        assert!(had_bom, "expected had_bom == true for a BOM'd file");
+    }
+
+    #[test]
+    fn detect_target_reports_bom_false_for_plain_file() {
+        let tmp = NamedTempFile::new().unwrap();
+        let path = tmp.path().to_path_buf();
+        fs::write(&path, b"hello\n").unwrap();
+        let git_policy = crate::git::policy_for_path(&path).unwrap();
+        let (_, _, had_bom) = detect_target(&path, IoMode::Mmap, &git_policy).unwrap();
+        assert!(!had_bom, "expected had_bom == false for a plain file");
+    }
+
+    /// `OutputEncoding::Preserve` must retain an existing BOM even when the
+    /// path has no `working-tree-encoding` Git attribute declared (the
+    /// common case for most files). Regression test for a bug where `write`
+    /// gated `FilePolicy::write_bom` behind `working_tree_encoding.is_some()`,
+    /// silently discarding `write_bom`'s own correct
+    /// `None => source_had_bom` fallback and stripping the BOM on every
+    /// preserving write to a file outside an explicit `working-tree-encoding`
+    /// rule -- unlike `append`/`edit`/`replace`, which all call
+    /// `git_policy.write_bom(had_bom)` unconditionally.
+    #[test]
+    fn write_preserve_keeps_bom_without_working_tree_encoding_attribute() {
+        let result = write_text(Some(b"\xEF\xBB\xBFold\n"), "new\n");
+        assert_eq!(
+            result, b"\xEF\xBB\xBFnew\n",
+            "a preserving write must not silently strip an existing BOM"
+        );
     }
 }

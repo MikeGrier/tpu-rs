@@ -26,9 +26,8 @@
 //!   an interrupted prior write is first recovered, so a half-completed write
 //!   still counts as "exists".)
 //! - Otherwise the parent directories are created as needed and the content is
-//!   written fresh.  New files default to UTF-8 with LF line endings; the
-//!   `output_encoding`, `bom_policy`, and `line_ending_override` parameters
-//!   override those defaults exactly as they do for [`crate::cmd::write::run`].
+//!   written fresh. Git worktree encoding and EOL policy apply automatically;
+//!   without them, new files default to UTF-8/LF.
 //! - The write-time mojibake guard applies (see [`crate::cmd::write::run`]);
 //!   pass [`WritePolicy::permissive`] to disable it.
 //!
@@ -102,23 +101,29 @@ pub fn run(
     }
 
     let bytes = crate::cmd::write::encode_new_file_content(
+        file,
         content,
         output_encoding,
         bom_policy,
         line_ending_override,
-    );
+    )?;
 
-    crate::atomic_create_new(file, &bytes).map_err(|e| -> Box<dyn std::error::Error> {
-        if e.kind() == std::io::ErrorKind::AlreadyExists {
-            format!(
-                "create: {}: file already exists (use write to overwrite)",
-                file.display()
-            )
-            .into()
-        } else {
-            format!("create: {}: {e}", file.display()).into()
-        }
-    })
+    crate::atomic_create_new(file, &bytes).map_err(|e| map_atomic_create_error(file, e))
+}
+
+/// Translate an `atomic_create_new` I/O error into a user-facing message:
+/// a friendlier "already exists (use write to overwrite)" hint for the
+/// no-clobber race case, or the raw error for anything else.
+fn map_atomic_create_error(file: &Path, e: std::io::Error) -> Box<dyn std::error::Error> {
+    if e.kind() == std::io::ErrorKind::AlreadyExists {
+        format!(
+            "create: {}: file already exists (use write to overwrite)",
+            file.display()
+        )
+        .into()
+    } else {
+        format!("create: {}: {e}", file.display()).into()
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +186,36 @@ mod tests {
         assert!(err.to_string().contains("already exists"));
         // Original content must be untouched.
         assert_eq!(std::fs::read(&path).unwrap(), b"original");
+    }
+
+    /// When the underlying `atomic_create_new` fails with a *non*-AlreadyExists
+    /// I/O error, the generic `"create: {path}: {e}"` message must be used,
+    /// not the "file already exists" one. Pins `e.kind() ==
+    /// std::io::ErrorKind::AlreadyExists` against a `!=` mutation.
+    #[test]
+    fn map_atomic_create_error_non_already_exists_uses_generic_message() {
+        let path = std::path::Path::new("/some/file.txt");
+        let e = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied");
+        let msg = map_atomic_create_error(path, e).to_string();
+        assert!(
+            !msg.contains("already exists") && !msg.contains("use write to overwrite"),
+            "expected the generic error message, not the already-exists one; got: {msg}"
+        );
+        assert!(
+            msg.contains("denied"),
+            "expected raw error text; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn map_atomic_create_error_already_exists_uses_friendly_message() {
+        let path = std::path::Path::new("/some/file.txt");
+        let e = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "exists");
+        let msg = map_atomic_create_error(path, e).to_string();
+        assert!(
+            msg.contains("already exists") && msg.contains("use write to overwrite"),
+            "expected the friendly already-exists message; got: {msg}"
+        );
     }
 
     #[test]

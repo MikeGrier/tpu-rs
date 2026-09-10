@@ -222,17 +222,68 @@ pub fn allowed_by_marker(text: &str) -> bool {
 /// This is intentionally conservative — applying multiple peels in
 /// sequence is the caller's responsibility, and each round must
 /// independently demonstrate progress.
+///
+/// A thin wrapper over [`attempt_one_layer_peel`] for callers that only
+/// need the peeled text and don't need to distinguish *why* a peel wasn't
+/// offered; see that function's doc for a machine-readable breakdown of
+/// each decline reason (used by `tpu doctor` to explain a declined repair
+/// rather than silently reporting `peel_suggested: false`).
+#[allow(dead_code)] // public API, only invoked from tests (`tpu doctor` now calls attempt_one_layer_peel directly)
 pub fn looks_like_one_layer_peel(text: &str) -> Option<String> {
+    match attempt_one_layer_peel(text) {
+        PeelAttempt::Improved(peeled) => Some(peeled),
+        PeelAttempt::NothingToPeel
+        | PeelAttempt::WouldProduceInvalidUtf8
+        | PeelAttempt::NotBeneficial { .. } => None,
+    }
+}
+
+/// Outcome of attempting one round of [`looks_like_one_layer_peel`], with
+/// enough detail to explain *why* a peel wasn't offered when `text` had at
+/// least one mojibake match — so a caller (e.g. `tpu doctor`) can report a
+/// declined repair with its cause instead of a bare `false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeelAttempt {
+    /// The peel reduced the match count; here is the peeled text.
+    Improved(String),
+    /// `text` had zero mojibake matches to begin with; there was nothing to
+    /// peel.
+    NothingToPeel,
+    /// Reverse-decoding `text` as Windows-1252 would itself produce invalid
+    /// UTF-8, so the peel was never offered (it would corrupt the file).
+    WouldProduceInvalidUtf8,
+    /// The peel did not reduce (or increased) the mojibake match count —
+    /// typically because `text` also contains other legitimate multi-byte
+    /// UTF-8 characters (em-dashes, box-drawing, accented names, …) that a
+    /// whole-file byte-for-byte reverse-decode would itself misinterpret.
+    NotBeneficial {
+        /// Number of matches in `text` before the peel was attempted.
+        original_match_count: usize,
+        /// Number of matches the peeled text would have had.
+        peeled_match_count: usize,
+    },
+}
+
+/// Attempt one round of "decode each char as a Windows-1252 byte where
+/// possible, then re-decode as UTF-8", returning enough detail to explain a
+/// decline. See [`looks_like_one_layer_peel`] for the simpler `Option`-based
+/// wrapper most callers want.
+pub fn attempt_one_layer_peel(text: &str) -> PeelAttempt {
     let original = scan(text).matches.len();
     if original == 0 {
-        return None;
+        return PeelAttempt::NothingToPeel;
     }
-    let peeled = try_peel_once(text)?;
+    let Some(peeled) = try_peel_once(text) else {
+        return PeelAttempt::WouldProduceInvalidUtf8;
+    };
     let peeled_count = scan(&peeled).matches.len();
     if peeled_count < original {
-        Some(peeled)
+        PeelAttempt::Improved(peeled)
     } else {
-        None
+        PeelAttempt::NotBeneficial {
+            original_match_count: original,
+            peeled_match_count: peeled_count,
+        }
     }
 }
 
@@ -856,6 +907,264 @@ mod tests {
         assert_eq!(scan(double).matches.len(), 0);
         assert_eq!(looks_like_one_layer_peel(double), None);
     }
+
+    // ── attempt_one_layer_peel ──────────────────────────────────────────────
+    //
+    // The richer variant used by `tpu doctor` to explain *why* a peel
+    // wasn't offered (rather than a bare `None`), so a declined repair is
+    // never a silent surprise.
+
+    #[test]
+    fn attempt_peel_reports_improved_on_success() {
+        let mojibake = "cafÃ©";
+        match attempt_one_layer_peel(mojibake) {
+            PeelAttempt::Improved(peeled) => assert_eq!(peeled, "café"),
+            other => panic!("expected Improved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attempt_peel_reports_nothing_to_peel_for_clean_text() {
+        assert_eq!(
+            attempt_one_layer_peel("hello world"),
+            PeelAttempt::NothingToPeel
+        );
+        assert_eq!(attempt_one_layer_peel("café"), PeelAttempt::NothingToPeel);
+    }
+
+    #[test]
+    fn attempt_peel_reports_would_produce_invalid_utf8() {
+        // 'Ã' (U+00C3, cp1252-identity-maps to byte 0xC3) followed by
+        // '\u{0080}' (not cp1252-mappable, so preserved as its own 2-byte
+        // UTF-8 encoding C2 80) triggers scan()'s Latin1 pattern (U+00C3
+        // immediately followed by a char in U+0080..=U+00BF), but peeling
+        // produces the byte sequence [0xC3, 0xC2, 0x80] -- 0xC3 is a valid
+        // 2-byte UTF-8 lead byte, but 0xC2 is not a valid continuation byte
+        // (continuation bytes are 0x80..=0xBF), so the result is not valid
+        // UTF-8. Confirmed directly: `String::from_utf8(vec![0xC3, 0xC2,
+        // 0x80])` is `Err`.
+        let text = "Ã\u{0080}";
+        assert_eq!(
+            scan(text).matches.len(),
+            1,
+            "must have a real match to peel"
+        );
+        assert_eq!(
+            attempt_one_layer_peel(text),
+            PeelAttempt::WouldProduceInvalidUtf8
+        );
+    }
+
+    #[test]
+    fn attempt_peel_reports_not_beneficial_when_reapplied_to_clean_text() {
+        // Peeling text that has already been peeled once (and is now
+        // clean) is the same as peeling clean text: NothingToPeel, not
+        // NotBeneficial (there's nothing left to try to improve).  This
+        // documents the boundary between the two "no repair offered"
+        // variants that don't involve invalid UTF-8.
+        let once_peeled = match attempt_one_layer_peel("cafÃ©") {
+            PeelAttempt::Improved(s) => s,
+            other => panic!("expected Improved, got {other:?}"),
+        };
+        assert_eq!(
+            attempt_one_layer_peel(&once_peeled),
+            PeelAttempt::NothingToPeel
+        );
+    }
+
+    // ── is_clean ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn is_clean_reports_false_when_matches_present() {
+        // Companion to the existing `is_clean() == true` assertions on clean
+        // input: without this, a report with real matches was never checked
+        // to actually report `false`.
+        let r = scan("cafÃ©");
+        assert!(!r.matches.is_empty());
+        assert!(!r.is_clean());
+    }
+
+    // ── char_to_cp1252 (exercised via try_peel_once / looks_like_one_layer_peel) ──
+
+    #[test]
+    fn char_to_cp1252_ascii_and_gap_boundary() {
+        // The ASCII fast path covers 0x00..=0x7F; 0x80 falls in the gap
+        // between the ASCII branch and the C1 special-case table (the
+        // table's first defined codepoint is 0x0081), so it must be `None`.
+        // These two values pin both edges of the `cp < 0x80` comparison.
+        assert_eq!(char_to_cp1252('\u{007F}'), Some(0x7F));
+        assert_eq!(char_to_cp1252('\u{0080}'), None);
+    }
+
+    #[test]
+    fn char_to_cp1252_identity_range_boundary() {
+        // 0x00A0..=0x00FF round-trips as its own low byte; 0x009F (just
+        // below it) is not defined in the C1 table below and must be None.
+        assert_eq!(char_to_cp1252('\u{009F}'), None);
+        assert_eq!(char_to_cp1252('\u{00A0}'), Some(0xA0));
+        assert_eq!(char_to_cp1252('\u{00FF}'), Some(0xFF));
+    }
+
+    /// Every documented Windows-1252 C1-range special mapping. `char_to_cp1252`
+    /// is private but reachable directly from `mod tests`.
+    #[test]
+    fn char_to_cp1252_covers_full_c1_special_table() {
+        // (codepoint, expected cp1252 byte)
+        const TABLE: &[(char, u8)] = &[
+            ('\u{20AC}', 0x80),
+            ('\u{0081}', 0x81),
+            ('\u{201A}', 0x82),
+            ('\u{0192}', 0x83),
+            ('\u{201E}', 0x84),
+            ('\u{2026}', 0x85),
+            ('\u{2020}', 0x86),
+            ('\u{2021}', 0x87),
+            ('\u{02C6}', 0x88),
+            ('\u{2030}', 0x89),
+            ('\u{0160}', 0x8A),
+            ('\u{2039}', 0x8B),
+            ('\u{0152}', 0x8C),
+            ('\u{008D}', 0x8D),
+            ('\u{017D}', 0x8E),
+            ('\u{008F}', 0x8F),
+            ('\u{0090}', 0x90),
+            ('\u{2018}', 0x91),
+            ('\u{2019}', 0x92),
+            ('\u{201C}', 0x93),
+            ('\u{201D}', 0x94),
+            ('\u{2022}', 0x95),
+            ('\u{2013}', 0x96),
+            ('\u{2014}', 0x97),
+            ('\u{02DC}', 0x98),
+            ('\u{2122}', 0x99),
+            ('\u{0161}', 0x9A),
+            ('\u{203A}', 0x9B),
+            ('\u{0153}', 0x9C),
+            ('\u{009D}', 0x9D),
+            ('\u{017E}', 0x9E),
+            ('\u{0178}', 0x9F),
+        ];
+        for &(codepoint, expected_byte) in TABLE {
+            assert_eq!(
+                char_to_cp1252(codepoint),
+                Some(expected_byte),
+                "codepoint U+{:04X} should map to cp1252 byte 0x{:02X}",
+                codepoint as u32,
+                expected_byte
+            );
+        }
+    }
+
+    #[test]
+    fn char_to_cp1252_undefined_c1_codepoint_returns_none() {
+        // A C1 codepoint with no cp1252 assignment at all (outside the
+        // table above and outside the identity/ASCII ranges).
+        assert_eq!(char_to_cp1252('\u{0082}'), None);
+    }
+
+    // ── scan_replacement_chars ──────────────────────────────────────────────
+
+    #[test]
+    fn scan_replacement_chars_reports_precise_byte_offsets() {
+        // Multi-byte chars before each U+FFFD make the byte offset diverge
+        // from the char index, pinning the cumulative `pos += c.len_utf8()`
+        // arithmetic (a `pos *= ...` mutant would collapse every offset to
+        // 0; a `pos -= ...` would underflow/panic).
+        // Chars:  a(1) é(2) FFFD(3) b(1) FFFD(3) c(1)
+        // Offset: 0    1    3       6    7       10
+        let text = "aé\u{FFFD}b\u{FFFD}c";
+        let matches = scan_replacement_chars(text, false);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].byte_offset, 3);
+        assert_eq!(matches[1].byte_offset, 7);
+    }
+
+    #[test]
+    fn scan_replacement_chars_returns_empty_for_clean_text() {
+        assert_eq!(scan_replacement_chars("hello world", false), vec![]);
+    }
+
+    #[test]
+    fn scan_replacement_chars_context_window_is_byte_and_char_exact() {
+        // 20 'a's + FFFD + 20 'b's: long enough on both sides that the
+        // `(i + 1 + WINDOW).min(len)` / `i.saturating_sub(WINDOW)` bounds
+        // are determined by the arithmetic, not the clamp, so a `+` -> `-`
+        // or `+` -> `*` mutant produces an observably different (or
+        // panicking, for `-`) context window.
+        let text = format!("{}{}{}", "a".repeat(20), '\u{FFFD}', "b".repeat(20));
+        let matches = scan_replacement_chars(&text, false);
+        assert_eq!(matches.len(), 1);
+        let expected_context = format!("{}{}{}", "a".repeat(20), '\u{FFFD}', "b".repeat(20));
+        assert_eq!(matches[0].context, expected_context);
+        assert_eq!(matches[0].context.chars().count(), 41);
+    }
+
+    #[test]
+    fn scan_replacement_chars_context_window_clamps_at_start_and_end() {
+        // FFFD at the very start and very end: the window must clamp to
+        // the string bounds rather than underflow or run past the end.
+        let text = "\u{FFFD}hello\u{FFFD}";
+        let matches = scan_replacement_chars(text, false);
+        assert_eq!(matches.len(), 2);
+        assert_eq!(matches[0].context, "\u{FFFD}hello\u{FFFD}");
+        assert_eq!(matches[1].context, "\u{FFFD}hello\u{FFFD}");
+    }
+
+    #[test]
+    fn scan_replacement_chars_without_guess_never_suggests() {
+        let matches = scan_replacement_chars("a \u{FFFD} b", false);
+        assert_eq!(matches[0].suggested, None);
+    }
+
+    // ── guess_replacement_char ───────────────────────────────────────────────
+
+    #[test]
+    fn guess_replacement_char_em_dash_requires_both_flanking_spaces() {
+        let both = scan_replacement_chars("a \u{FFFD} b", true);
+        assert_eq!(both[0].suggested, Some('\u{2014}'));
+
+        // Only the left side is a space: the `&&` must not degrade to `||`.
+        let left_only = scan_replacement_chars("a \u{FFFD}b", true);
+        assert_eq!(left_only[0].suggested, None);
+
+        // Only the right side is a space.
+        let right_only = scan_replacement_chars("a\u{FFFD} b", true);
+        assert_eq!(right_only[0].suggested, None);
+    }
+
+    #[test]
+    fn guess_replacement_char_en_dash_requires_both_flanking_digits() {
+        let both = scan_replacement_chars("1\u{FFFD}9", true);
+        assert_eq!(both[0].suggested, Some('\u{2013}'));
+
+        // Only the left side is a digit.
+        let left_only = scan_replacement_chars("1\u{FFFD}x", true);
+        assert_eq!(left_only[0].suggested, None);
+
+        // Only the right side is a digit.
+        let right_only = scan_replacement_chars("x\u{FFFD}9", true);
+        assert_eq!(right_only[0].suggested, None);
+    }
+
+    #[test]
+    fn guess_replacement_char_none_at_string_boundaries() {
+        // No previous char (start of string) and no next char (end of
+        // string): `idx.checked_sub(1)` / `chars.get(idx + 1)` both `None`,
+        // so neither heuristic can fire.
+        let start = scan_replacement_chars("\u{FFFD} b", true);
+        assert_eq!(start[0].suggested, None);
+        let end = scan_replacement_chars("a \u{FFFD}", true);
+        assert_eq!(end[0].suggested, None);
+    }
+
+    // ── first_match ──────────────────────────────────────────────────────────
+    //
+    // NOTE: `first_match`'s tie-break (`candidate.byte_offset < b.byte_offset`)
+    // is very likely an *equivalent mutant* under `<=`: every pattern in
+    // `patterns()` requires a distinct leading character (Ã / â.../ Â), so
+    // two different patterns can never produce a match starting at the same
+    // byte offset, and the tie-break branch is therefore unreachable by any
+    // real input. Not pursued further.
 
     // ── WritePolicy ─────────────────────────────────────────────────────────
 

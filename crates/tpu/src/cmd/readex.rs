@@ -9,9 +9,7 @@
 //! This makes the output safe for shell variables, JSON string values, and
 //! agent/tool output where 8-bit bytes can be misinterpreted.
 
-use std::{fmt::Write as FmtWrite, io::Write, path::Path, sync::Arc};
-
-use harrier::{encoding::SourceConfig, source::Source};
+use std::{fmt::Write as FmtWrite, io::Write, path::Path};
 
 use crate::{
     IoMode,
@@ -83,21 +81,9 @@ pub fn run(
     }
     drop(f);
 
-    let branch = crate::open_as_branch(file, io_mode)?;
-    let file_len = branch.byte_len();
-
-    let source = Source::new(Arc::clone(&branch), SourceConfig::default())?;
-    let bom_len = source.bom_len();
-    let source_had_bom = bom_len > 0;
-    let encoding = source.encoding();
-    let lines = source.as_lines()?;
-    // Start the view range at bom_len so the BOM bytes themselves are not
-    // included in the decoded content (they are file-encoding metadata, not
-    // document text).
-    let view = lines.view_range(bom_len as u64..file_len)?;
-
-    // Decode from the original encoding (LF-normalised bytes) to UTF-8.
-    let (text, _) = encoding.decode_without_bom_handling(&view.bytes);
+    let decoded = crate::read_text_file(file, io_mode)?;
+    let source_had_bom = decoded.bom_len > 0;
+    let text = decoded.text;
 
     // Read-time advisory (Milestone 4).
     if let Some(notes) = notes {

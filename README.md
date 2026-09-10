@@ -64,12 +64,17 @@ win32-arm64).
   optionally repairs existing damage.
 - **Round-trips real-world encodings.** UTF-8, UTF-16LE/BE, Windows-1252,
   Shift-JIS, and CRLF/LF/CR line endings are detected and preserved.
-- **Git-aware line endings (opt-in).** Pass a repository root (`--git-root`
-  on the CLI, or a `git_root` argument over MCP) to detect when a file's
-  on-disk line endings disagree with git's expected convention (per
-  `.gitattributes` / `core.autocrlf` / `core.eol`); reads surface a `note:`,
-  and `tpu doctor --fix=eol` (or `tpu_doctor` with `fix: "eol"`) normalises
-  them. Write-time normalisation is available but off by default.
+- **Automatic Git worktree policy.** Within a repository, `.gitattributes`
+  `working-tree-encoding`, `text`, and `eol` policy (plus `core.autocrlf` /
+  `core.eol`) is discovered automatically. Reads decode the declared worktree
+  encoding, writes preserve it and normalise to a definite Git EOL convention,
+  and `tpu doctor --fix=eol` repairs existing mismatches, including UTF-16.
+  Discovery and open handles are cached for each operation, so a glob rooted
+  above multiple repositories opens each worktree at most once while later
+  operations still notice repository or configuration changes. Multi-file
+  operations resolve policy as each path is encountered; they do not snapshot
+  or lock `.gitattributes` for the entire operation, so concurrent attribute
+  edits can cause earlier and later paths to use different policies.
 - **Safer than shelling out.** Atomic writes, automatic `.bak` backups,
   pre-flight `validate` selectors, and walk tools that warn on
   inaccessible entries instead of aborting mid-tree.

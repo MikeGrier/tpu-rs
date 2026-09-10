@@ -65,6 +65,49 @@ pub const DISABLE_ARG: &str = "--no-io-worker";
 /// user-visible operation still succeeds.
 const BACKOFFS_MS: &[u64] = &[200, 500, 1000];
 
+/// Total attempts across one `try_call` invocation: 1 initial attempt plus
+/// one retry per configured backoff delay.
+///
+/// Split out as a pure function (rather than an inline `let` in `try_call`)
+/// so it is directly unit-testable without spawning a real worker process --
+/// see `tests::max_attempts_is_one_plus_backoff_count`.
+fn max_attempts() -> u32 {
+    1 + BACKOFFS_MS.len() as u32
+}
+
+/// What `try_call`'s retry loop should do after attempt number `attempt`
+/// (1-based) has just failed, given a total budget of `max_attempts`.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryDecision {
+    /// Sleep `delay_ms`, then retry as attempt number `next_attempt`.
+    Retry { delay_ms: u64, next_attempt: u32 },
+    /// The budget is exhausted; fall back to in-process execution.
+    GiveUp,
+}
+
+/// Pure decision logic for `try_call`'s retry loop, shared by both retry
+/// sites (worker-spawn failure and worker-death-mid-call). Extracted as a
+/// standalone function -- independent of any real spawn/IPC -- so the
+/// attempt-counting and backoff-indexing arithmetic can be unit-tested
+/// directly instead of only through a real (hard to fail on demand)
+/// subprocess round trip.
+fn decide_retry(attempt: u32, max_attempts: u32) -> RetryDecision {
+    if attempt >= max_attempts {
+        RetryDecision::GiveUp
+    } else {
+        RetryDecision::Retry {
+            delay_ms: BACKOFFS_MS[(attempt - 1) as usize],
+            next_attempt: attempt + 1,
+        }
+    }
+}
+
+/// Whether `try_call` should log a "succeeded on retry" progress message:
+/// only when the call needed more than one attempt.
+fn should_log_retry_success(attempt: u32) -> bool {
+    attempt > 1
+}
+
 // -- per-process worker handle ------------------------------------------------
 
 /// Connection to a single child `tpu-mcp --io-worker` process.
@@ -96,6 +139,26 @@ impl IoWorker {
         })
     }
 
+    /// Two of this function's mutants (`n == 0` -> `n != 0`, and
+    /// `resp_id != id` -> `resp_id == id`) are excluded from mutation
+    /// testing (see the `mutants::skip` reasoning below).
+    ///
+    /// Both require a real spawned `--io-worker` child process to reach at
+    /// all -- `stdin`/`stdout` here are concrete `ChildStdin`/
+    /// `BufReader<ChildStdout>`, not generic `Read`/`Write`, so there is no
+    /// way to feed this function a controlled fake response without either
+    /// a real subprocess or a deeper refactor to make `IoWorker` generic
+    /// over `Read + Write`. And a real subprocess round trip is not cheap
+    /// per-mutant: this function has no already-caught mutants of its own
+    /// to lose by skipping it wholesale (verified against a full
+    /// `cargo mutants` baseline before adding this attribute), and the
+    /// existing coverage for it (`tests/io_worker_chaos.rs`) drives dozens
+    /// of real round trips per test -- under either of these two mutations
+    /// every one of those round trips is misclassified as a dead worker,
+    /// respawning and backing off (up to ~1.7s) each time, which
+    /// accumulates well past `cargo mutants`' own per-mutant timeout long
+    /// before the chaos suite would ever report the resulting failure.
+    #[cfg_attr(test, mutants::skip)]
     fn call(
         &mut self,
         name: &str,
@@ -248,7 +311,7 @@ impl IoWorkerHandle {
 
         // attempt counter is 1-based for human-readable progress messages.
         // Total attempts = 1 initial + BACKOFFS_MS.len() retries.
-        let max_attempts: u32 = 1 + BACKOFFS_MS.len() as u32;
+        let max_attempts: u32 = max_attempts();
         let mut attempt: u32 = 1;
 
         loop {
@@ -275,17 +338,36 @@ impl IoWorkerHandle {
                 }
             };
 
+            // NOTE (mutation testing): the `!` here (`if !have_worker`) has
+            // a known cargo-mutants timeout when deleted -- under that
+            // mutation, every successful spawn is misclassified as a
+            // failure, and this function's *other* mutants (a few lines
+            // above and below) are already caught by existing tests, so a
+            // function-level `#[mutants::skip]` would sacrifice that
+            // coverage for the sake of this one site. `mutants::exclude_re`
+            // would let us exclude just this mutation while keeping the
+            // rest, but it isn't in the currently-published `mutants` crate
+            // (max 0.0.4; needs 0.0.5+). Deliberately left uncovered for
+            // now rather than losing the sibling coverage or spawning a
+            // real subprocess-with-test-only-misbehavior just for this one
+            // mutation; revisit once `exclude_re` ships.
             if !have_worker {
-                if attempt >= max_attempts {
-                    progress(&format!(
-                        "io worker unavailable after {max_attempts} attempts; running '{name}' in-process"
-                    ));
-                    return None;
+                match decide_retry(attempt, max_attempts) {
+                    RetryDecision::GiveUp => {
+                        progress(&format!(
+                            "io worker unavailable after {max_attempts} attempts; running '{name}' in-process"
+                        ));
+                        return None;
+                    }
+                    RetryDecision::Retry {
+                        delay_ms,
+                        next_attempt,
+                    } => {
+                        std::thread::sleep(Duration::from_millis(delay_ms));
+                        attempt = next_attempt;
+                        continue;
+                    }
                 }
-                let delay_ms = BACKOFFS_MS[(attempt - 1) as usize];
-                std::thread::sleep(Duration::from_millis(delay_ms));
-                attempt += 1;
-                continue;
             }
 
             // Phase B: make the call.
@@ -299,7 +381,7 @@ impl IoWorkerHandle {
 
             match result {
                 Ok(tr) => {
-                    if attempt > 1 {
+                    if should_log_retry_success(attempt) {
                         progress(&format!(
                             "io worker succeeded on attempt {attempt}/{max_attempts} for '{name}'"
                         ));
@@ -317,19 +399,25 @@ impl IoWorkerHandle {
                     let reason = match &e {
                         WorkerCallError::PipeBroken(m) | WorkerCallError::Protocol(m) => m.as_str(),
                     };
-                    if attempt >= max_attempts {
-                        progress(&format!(
-                            "io worker died ({reason}) on attempt {attempt}/{max_attempts} for '{name}'; running this call in-process"
-                        ));
-                        return None;
+                    match decide_retry(attempt, max_attempts) {
+                        RetryDecision::GiveUp => {
+                            progress(&format!(
+                                "io worker died ({reason}) on attempt {attempt}/{max_attempts} for '{name}'; running this call in-process"
+                            ));
+                            return None;
+                        }
+                        RetryDecision::Retry {
+                            delay_ms,
+                            next_attempt,
+                        } => {
+                            progress(&format!(
+                                "io worker died ({reason}) on attempt {attempt}/{max_attempts} for '{name}'; respawning and retrying in {delay_ms} ms"
+                            ));
+                            std::thread::sleep(Duration::from_millis(delay_ms));
+                            attempt = next_attempt;
+                            continue;
+                        }
                     }
-                    let delay_ms = BACKOFFS_MS[(attempt - 1) as usize];
-                    progress(&format!(
-                        "io worker died ({reason}) on attempt {attempt}/{max_attempts} for '{name}'; respawning and retrying in {delay_ms} ms"
-                    ));
-                    std::thread::sleep(Duration::from_millis(delay_ms));
-                    attempt += 1;
-                    continue;
                 }
             }
         }
@@ -413,5 +501,190 @@ fn write_response(out: &mut impl Write, id: u64, result: Result<crate::tools::To
         s.push('\n');
         let _ = out.write_all(s.as_bytes());
         let _ = out.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `write_response` is generic over `impl Write`, so it can be tested
+    /// directly against an in-memory buffer -- no subprocess, no pipe, no
+    /// possibility of hanging. This is the fix for that mutant's previous
+    /// classification as a `cargo mutants` TIMEOUT: the only prior coverage
+    /// routed through a real end-to-end worker round trip (`write_response`
+    /// mutated to `()` means the child never replies, so the parent's
+    /// blocking `read_line` in `IoWorker::call` waits forever); this test
+    /// exercises the exact same behaviour in milliseconds.
+    #[test]
+    fn write_response_ok_emits_expected_json_line() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_response(
+            &mut buf,
+            7,
+            Ok(crate::tools::ToolResult {
+                text: "hello".to_string(),
+                is_error: false,
+            }),
+        );
+        let line = String::from_utf8(buf).unwrap();
+        assert!(line.ends_with('\n'));
+        let parsed: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["id"], 7);
+        assert_eq!(parsed["ok"], "hello");
+        assert_eq!(parsed["is_error"], false);
+        assert!(parsed.get("err").is_none());
+    }
+
+    #[test]
+    fn write_response_ok_with_is_error_true() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_response(
+            &mut buf,
+            1,
+            Ok(crate::tools::ToolResult {
+                text: "bad input".to_string(),
+                is_error: true,
+            }),
+        );
+        let line = String::from_utf8(buf).unwrap();
+        let parsed: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["id"], 1);
+        assert_eq!(parsed["ok"], "bad input");
+        assert_eq!(parsed["is_error"], true);
+    }
+
+    #[test]
+    fn write_response_err_emits_expected_json_line() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_response(&mut buf, 3, Err("boom".to_string()));
+        let line = String::from_utf8(buf).unwrap();
+        let parsed: Value = serde_json::from_str(line.trim_end()).unwrap();
+        assert_eq!(parsed["id"], 3);
+        assert_eq!(parsed["err"], "boom");
+        assert!(parsed.get("ok").is_none());
+    }
+
+    #[test]
+    fn write_response_always_terminates_with_exactly_one_newline() {
+        let mut buf: Vec<u8> = Vec::new();
+        write_response(
+            &mut buf,
+            0,
+            Ok(crate::tools::ToolResult {
+                text: String::new(),
+                is_error: false,
+            }),
+        );
+        assert_eq!(buf.iter().filter(|&&b| b == b'\n').count(), 1);
+        assert_eq!(*buf.last().unwrap(), b'\n');
+    }
+
+    // -- try_call retry-loop pure logic --------------------------------------
+
+    #[test]
+    fn max_attempts_is_one_plus_backoff_count() {
+        assert_eq!(max_attempts(), 1 + BACKOFFS_MS.len() as u32);
+        assert_eq!(max_attempts(), 4);
+    }
+
+    #[test]
+    fn decide_retry_indexes_the_correct_backoff_for_each_attempt() {
+        assert_eq!(
+            decide_retry(1, 4),
+            RetryDecision::Retry {
+                delay_ms: BACKOFFS_MS[0],
+                next_attempt: 2
+            }
+        );
+        assert_eq!(
+            decide_retry(2, 4),
+            RetryDecision::Retry {
+                delay_ms: BACKOFFS_MS[1],
+                next_attempt: 3
+            }
+        );
+        assert_eq!(
+            decide_retry(3, 4),
+            RetryDecision::Retry {
+                delay_ms: BACKOFFS_MS[2],
+                next_attempt: 4
+            }
+        );
+    }
+
+    /// Exact boundary: once `attempt` reaches `max_attempts` the budget is
+    /// exhausted (`GiveUp`), but the attempt *just before* that must still
+    /// retry -- pins the `>=` comparison against a `<` mutation.
+    #[test]
+    fn decide_retry_gives_up_exactly_at_max_attempts_boundary() {
+        assert_eq!(
+            decide_retry(3, 4),
+            RetryDecision::Retry {
+                delay_ms: BACKOFFS_MS[2],
+                next_attempt: 4
+            }
+        );
+        assert_eq!(decide_retry(4, 4), RetryDecision::GiveUp);
+    }
+
+    #[test]
+    fn should_log_retry_success_only_after_the_first_attempt() {
+        assert!(!should_log_retry_success(1));
+        assert!(should_log_retry_success(2));
+        assert!(should_log_retry_success(4));
+    }
+
+    /// `WorkerCallError` has exactly two variants today (`PipeBroken` and
+    /// `Protocol`), both of which represent a dead worker, so
+    /// `is_worker_dead` is currently always `true` by construction --
+    /// mutating its body to the literal `true` is behaviourally identical
+    /// and not pursued as a mutant to catch (see crates/tpu/CHECKLIST.md
+    /// Milestone 11). This test pins the *intended* semantics (every
+    /// variant reports dead) rather than trying to distinguish the
+    /// unmutated body from the equivalent mutant.
+    #[test]
+    fn is_worker_dead_true_for_every_current_variant() {
+        assert!(WorkerCallError::PipeBroken("x".into()).is_worker_dead());
+        assert!(WorkerCallError::Protocol("x".into()).is_worker_dead());
+    }
+
+    /// `std::process::Child` does *not* kill its child on drop by itself,
+    /// but for a healthy/idle worker this test cannot distinguish that from
+    /// the *other* automatic effect of dropping `IoWorker`: its `stdin`
+    /// field (`ChildStdin`) is closed right after this impl's `drop()` body
+    /// returns, and the worker's own `run_worker` loop exits on the next
+    /// read once it sees that EOF -- so a mutation replacing this `drop()`
+    /// body with `()` still passes this test (confirmed by hand-mutating
+    /// and re-running: see crates/tpu/CHECKLIST.md Milestone 11). The
+    /// explicit `kill()` + `wait()` only matters for an *unresponsive*
+    /// worker, which would require either a flaky timing race (checking
+    /// immediately after `drop()` returns, since only the real `wait()`
+    /// makes that instant deterministic) or new test-only instrumentation
+    /// to make the worker ignore stdin EOF on purpose; not pursued for
+    /// either reason. This test still pins the weaker, always-true
+    /// invariant that the child is *eventually* gone.
+    #[test]
+    fn drop_terminates_the_child_process() {
+        let worker = IoWorker::spawn().expect("spawn io-worker for drop test");
+        let pid = worker.child.id();
+        drop(worker);
+
+        // Give the OS a brief window to finish tearing the process down
+        // after `wait()` returns inside `drop`.
+        let mut sys = sysinfo::System::new();
+        let mut still_alive = true;
+        for _ in 0..50 {
+            sys.refresh_all();
+            if sys.process(sysinfo::Pid::from_u32(pid)).is_none() {
+                still_alive = false;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            !still_alive,
+            "child process {pid} must be terminated after IoWorker is dropped"
+        );
     }
 }

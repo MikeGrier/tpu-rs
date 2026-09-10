@@ -46,6 +46,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       # `--locked` makes CI fail if Cargo would need to update Cargo.lock.
       # CI must build the exact dependency graph that was committed; any
       # version drift should happen in a developer's local edit, not silently
@@ -54,16 +55,29 @@ jobs:
       # a cold cache.)
       - name: cargo build
         run: cargo build --workspace --all-targets --locked
-      # Backtraces + --no-fail-fast make intermittent test failures actionable.
-      # RUST_LIB_BACKTRACE is what libtest's own panic capture reads (without
-      # it some panics still print "note: run with `RUST_BACKTRACE=1` ..."),
-      # and --no-fail-fast ensures one failing crate doesn't mask backtraces
-      # from later test binaries in the workspace.
-      - name: cargo test
+      # nextest (see .config/nextest.toml) runs each test in its own process,
+      # so a genuine hang is forcibly terminated (and reported as a failure)
+      # per that file's slow-timeout config instead of blocking the job
+      # indefinitely — bare `cargo test` has no such per-test cap. The
+      # `default` profile there already sets `fail-fast = false`, matching
+      # this job's prior `--no-fail-fast` policy: one failing crate must
+      # never mask backtraces from other test binaries.
+      - name: cargo nextest run
         env:
           RUST_BACKTRACE: 1
           RUST_LIB_BACKTRACE: 1
-        run: cargo test --workspace --locked --no-fail-fast
+          CARGO_TERM_COLOR: always
+        run: cargo nextest run --workspace --locked
+      # nextest does not run doctests (nextest-rs/nextest#16); run them
+      # separately. The workspace has no runnable doctests as of this
+      # writing (only ```text```/```rust,ignore``` fences), so this step is
+      # cheap today but guards against a future doctest silently going
+      # unexercised in CI.
+      - name: cargo test --doc
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LIB_BACKTRACE: 1
+        run: cargo test --doc --workspace --locked
 
   build-test-windows:
     name: build + test (windows)
@@ -72,13 +86,20 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
       - name: cargo build
         run: cargo build --workspace --all-targets --locked
-      - name: cargo test
+      - name: cargo nextest run
         env:
           RUST_BACKTRACE: 1
           RUST_LIB_BACKTRACE: 1
-        run: cargo test --workspace --locked --no-fail-fast
+          CARGO_TERM_COLOR: always
+        run: cargo nextest run --workspace --locked
+      - name: cargo test --doc
+        env:
+          RUST_BACKTRACE: 1
+          RUST_LIB_BACKTRACE: 1
+        run: cargo test --doc --workspace --locked
 
   msrv:
     name: MSRV check (1.97)

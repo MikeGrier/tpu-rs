@@ -4,7 +4,7 @@
      examples for documentation purposes) -->
 
 <!-- tpu-mcp:setup:begin -->
-<!-- tpu-mcp:setup:version=4.0.2 -->
+<!-- tpu-mcp:setup:version=4.1.0 -->
 
 ## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
 
@@ -240,43 +240,66 @@ Workflow:
    `fix: "peel"`. Only files whose peel produces *strictly fewer* mojibake
    matches are rewritten; the prior content is preserved at `<file>.bak`.
    Re-run `tpu_doctor` after the repair to confirm the report is clean.
+   When a flagged file's peel is declined (`peel_suggested: false` despite
+   having `mojibake_matches`), `peel_declined_reason` explains why — e.g.
+   the peel would itself produce invalid UTF-8, or would not reduce (or
+   would increase) the match count, typically because other legitimate
+   multi-byte UTF-8 text elsewhere in the file would be corrupted by a
+   whole-file reverse-decode. That file needs manual repair; don't treat
+   the unset `repaired` flag as a tool failure.
 4. **Don't paper over it**: if a file legitimately contains mojibake
    digraphs (test fixtures, regex sources, documentation about mojibake),
    add the line `encoding-check: allow-mojibake` (typically inside a
-   comment) — `tpu_doctor` and the write-time guard will treat it as
-   clean.
+   comment) — `tpu_doctor` and the write-time guard will honour the
+   opt-out (it is never counted toward `total_issues` or exit-code
+   failures). This is **not** silent, though: if the file would otherwise
+   have been flagged, it still appears in `tpu_doctor`'s `files` array with
+   `mojibake_marker_suppressed` (and/or `replacement_char_marker_suppressed`)
+   set to the count that was hidden, and the top-level
+   `total_marker_suppressed` reports how many files that applied to across
+   the whole scan. A file with the marker but genuinely nothing to suppress
+   is omitted entirely, same as any other clean file. If you see a nonzero
+   `total_marker_suppressed`, don't assume the marker was placed
+   correctly — a file that merely *discusses* the marker string in prose
+   (rather than opting out real, adjacent corruption) will also suppress
+   whatever mojibake happens to be nearby, since the marker is a
+   whole-file substring match, not scoped to a region.
 
 The write-time guard in `tpu_write_file` / `tpu_append_file` /
 `tpu_replace_in_file` / `tpu_edit_file` already refuses to *introduce* new
 mojibake (pre-existing damage passes through). If you genuinely intend to
 write curated mojibake fixtures, pass `allow_mojibake: true`.
 
-### When line endings disagree with git (CRLF / LF)
+### Git worktree encoding and line endings
 
-A separate, git-aware condition: a file's on-disk line endings can differ
-from what git would materialise in the working tree for that path (per
-`.gitattributes` `text`/`eol` attributes and `core.autocrlf` / `core.eol`).
-This is *not* mojibake — the bytes are valid — but it produces noisy diffs
-and "whole file changed" churn.
+For files in a Git worktree, TPU automatically discovers the nearest repository
+and resolves `.gitattributes` with gitoxide. `working-tree-encoding` controls
+decoding, strict re-encoding, and BOM policy. `text`/`eol` attributes and
+`core.autocrlf` / `core.eol` determine a definite working-tree line ending when
+Git provides one.
 
-Detection is **opt-in per call** via a `git_root` argument (an absolute path
-to the repository root; there is no upward auto-discovery):
+Discovery and open repository handles are cached per tool operation, so a glob
+rooted above multiple repositories opens each worktree at most once. Caches are
+refreshed between operations so repository and configuration changes are
+observed. `git_root` remains a legacy read-advisory hint; encoding and mutation
+policy use nearest-repository discovery.
 
-1. **Detect on read**: pass `git_root` to `tpu_read_file`, `tpu_read_head`,
-   or `tpu_read_tail`. When the file's endings differ from git's expectation
-   the response is prefixed with a single `note:` line and the unchanged
-   content follows.
-2. **Report / repair with doctor**: call `tpu_doctor` with `git_root` to
-   list mismatched files (each flagged with an `eol_mismatch` object). Pass
-   `fix: "eol"` to normalise line endings only, or `fix: "all"` to also peel
-   mojibake. `eol`/`all` require `git_root`; the rewrite is atomic with a
-   `<file>.bak` backup and UTF-16 files are skipped.
-3. **Normalise on write (off by default)**: when the server is started with
-   line-ending normalisation enabled (the `tpu-mcp.normalizeLineEndings` VS Code
-   setting, the `--eol-normalize` flag, or the `TPU_EOL_NORMALIZE` env var),
-   mutating tools given a `git_root` denormalise to git's expected
-   convention unless an explicit `line_ending` is supplied. This is **off by
-   default** so writes never silently rewrite endings without opt-in.
+Policy is resolved independently for each path as it is processed. Multi-file
+operations do not snapshot or lock `.gitattributes` for their full duration.
+Concurrent attribute edits may therefore cause paths resolved before and after
+the edit to use different policies; resolution failures remain per-file errors
+rather than silent defaults.
+
+1. **Read**: text tools decode using `working-tree-encoding`;
+   `tpu_read_file`, `tpu_read_head`, and `tpu_read_tail` also prefix a `note:`
+   when on-disk endings disagree with Git's expectation.
+2. **Write**: text mutations strictly re-encode in the declared worktree
+   encoding, enforce its BOM rules, and normalise all endings when Git supplies
+   a definite convention. An explicit `line_ending` takes precedence.
+3. **Report / repair with doctor**: `tpu_doctor` lists mismatches with an
+   `eol_mismatch` object. `fix: "eol"` normalises endings only; `fix: "all"`
+   also peels mojibake. Repairs are atomic, retain a `<file>.bak`, and support
+   UTF-16.
 
 ### File encoding
 

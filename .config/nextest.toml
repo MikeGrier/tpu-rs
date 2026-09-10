@@ -1,0 +1,43 @@
+# nextest repository configuration — see https://nexte.st/docs/configuration/
+#
+# M11-3: adopted alongside `cargo-mutants` mutation testing (see
+# crates/tpu/CHECKLIST.md, Milestone 11). nextest runs each test in its own
+# OS process, so it can forcibly terminate an individual hung test instead of
+# the whole test binary blocking forever — this is what lets a genuine
+# infinite-loop mutation show up as a normal (fast) test *failure* instead of
+# a multi-minute `cargo mutants` TIMEOUT classification.
+#
+# Chosen thresholds: the slowest legitimate test observed in this workspace
+# (measured via `cargo nextest run` with no config, on 2026-09-08) was
+# `tpu-mcp::io_worker_chaos::chaos_kill_between_writes_all_succeed` at ~8.2s
+# (real subprocess kill/respawn cycles). `period = "20s"` gives ~2.5x margin
+# before a test is even flagged SLOW; `terminate-after = 3` (60s total) gives
+# ~7x margin before a test is forcibly killed, while remaining comfortably
+# below `cargo-mutants`' own auto-computed per-mutant timeout (observed
+# ~112-119s), so nextest's termination — not cargo-mutants' fallback
+# timeout — is what ends a hung mutant test.
+#
+# CAUTION: nextest does not run doctests (github.com/nextest-rs/nextest#16).
+# As of this writing the workspace has zero runnable doctests (only
+# ```text``` / ```rust,ignore``` fences), so this is not a coverage gap
+# today — but if a real ```rust``` doctest is ever added, keep running
+# `cargo test --doc` alongside `cargo nextest run` in CI (already done; see
+# .github/workflows/ci.yml) and be aware that `cargo mutants --test-tool
+# nextest` (see .cargo/mutants.toml) cannot see mutants only caught by a
+# doctest.
+[profile.default]
+# Run every test to completion even after the first failure, matching the
+# `--no-fail-fast` policy `ci.yml` uses with plain `cargo test`: one failing
+# crate should never mask backtraces from other test binaries.
+fail-fast = false
+slow-timeout = { period = "20s", terminate-after = 3 }
+
+[profile.mutants]
+# Used by `cargo mutants --test-tool=nextest --cargo-arg=--profile=mutants`
+# (wired up by default via `.cargo/mutants.toml`'s
+# `additional_cargo_test_args`). Inherits `slow-timeout` from `[profile.default]`
+# above, but restores nextest's own default fail-fast behaviour (stop at the
+# first failing test): cargo-mutants only needs one test to catch a mutant,
+# so exiting as soon as that happens is a meaningful speedup across a run of
+# many hundreds of mutants.
+fail-fast = true
