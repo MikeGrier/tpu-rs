@@ -112,12 +112,12 @@ pub fn run(
         OutputEncoding::Utf8 => encoding_rs::UTF_8,
     };
 
-    // Only act on bom_policy when --utf8 is active.
+    // Only act on bom_policy when --utf8 is active; Preserve always defers to
+    // Git policy (which itself falls back to `source_had_bom` when no
+    // `working-tree-encoding` attribute is declared for this path — the
+    // common case for most files).
     let write_bom = match output_encoding {
-        OutputEncoding::Preserve => git_policy
-            .working_tree_encoding
-            .as_ref()
-            .is_some_and(|_| git_policy.write_bom(source_had_bom)),
+        OutputEncoding::Preserve => git_policy.write_bom(source_had_bom),
         OutputEncoding::Utf8 => match bom_policy {
             BomPolicy::Strip => false,
             BomPolicy::Preserve => source_had_bom,
@@ -764,5 +764,23 @@ mod tests {
         let git_policy = crate::git::policy_for_path(&path).unwrap();
         let (_, _, had_bom) = detect_target(&path, IoMode::Mmap, &git_policy).unwrap();
         assert!(!had_bom, "expected had_bom == false for a plain file");
+    }
+
+    /// `OutputEncoding::Preserve` must retain an existing BOM even when the
+    /// path has no `working-tree-encoding` Git attribute declared (the
+    /// common case for most files). Regression test for a bug where `write`
+    /// gated `FilePolicy::write_bom` behind `working_tree_encoding.is_some()`,
+    /// silently discarding `write_bom`'s own correct
+    /// `None => source_had_bom` fallback and stripping the BOM on every
+    /// preserving write to a file outside an explicit `working-tree-encoding`
+    /// rule -- unlike `append`/`edit`/`replace`, which all call
+    /// `git_policy.write_bom(had_bom)` unconditionally.
+    #[test]
+    fn write_preserve_keeps_bom_without_working_tree_encoding_attribute() {
+        let result = write_text(Some(b"\xEF\xBB\xBFold\n"), "new\n");
+        assert_eq!(
+            result, b"\xEF\xBB\xBFnew\n",
+            "a preserving write must not silently strip an existing BOM"
+        );
     }
 }
