@@ -466,12 +466,19 @@ mod tests {
         let encodable = dir.path().join("encodable.txt");
         let unmappable = dir.path().join("unmappable.txt");
 
+        // This test is about working-tree-encoding strictness, not line-ending
+        // detection, so force LF explicitly (matching
+        // `explicit_line_ending_overrides_discovered_git_policy` above) rather
+        // than relying on ambient git policy: with no `eol=` attribute, line
+        // ending falls back to the host's `core.autocrlf`/`core.eol`, which is
+        // not deterministic across machines (many CI Windows runners default
+        // to `autocrlf=true`) and would otherwise make this assertion flaky.
         run_test(
             &encodable,
             "caf\u{e9}\n",
             OutputEncoding::Preserve,
             BomPolicy::Strip,
-            None,
+            Some(LineEnding::Lf),
             None,
         )
         .unwrap();
@@ -482,7 +489,7 @@ mod tests {
             "snowman \u{2603}\n",
             OutputEncoding::Preserve,
             BomPolicy::Strip,
-            None,
+            Some(LineEnding::Lf),
             None,
         )
         .unwrap_err();
