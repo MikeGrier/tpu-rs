@@ -1634,10 +1634,22 @@ pub fn list() -> Value {
                  the file is rewritten only if the peel produces strictly fewer mojibake \
                  matches than the original. The original content is preserved at \
                  `<file>.bak` (the standard atomic-write backup). To preview without \
-                 writing, leave `fix` unset and inspect `peel_suggested` in the report. \n\n\
+                 writing, leave `fix` unset and inspect `peel_suggested` in the report. \
+                 When a flagged file's peel is declined (`peel_suggested: false` despite \
+                 having `mojibake_matches`), `peel_declined_reason` explains why -- e.g. \
+                 the peel would itself produce invalid UTF-8, or would not reduce (or \
+                 would increase) the match count, typically because other legitimate \
+                 multi-byte UTF-8 text elsewhere in the file would be corrupted by a \
+                 whole-file reverse-decode. Manual repair is needed in that case. \n\n\
                  Files containing the literal sentinel `encoding-check: allow-mojibake` \
                  are treated as legitimate (test fixtures, regex sources, docs about \
-                 mojibake) and reported as clean. \n\n\
+                 mojibake): the opt-out is honoured (never counted in `total_issues` / \
+                 exit-code failures), but it is never a silent surprise -- a file that \
+                 would otherwise have been flagged still appears in `files` with \
+                 `mojibake_marker_suppressed` (and/or `replacement_char_marker_suppressed`) \
+                 set to the count that was hidden, and `total_marker_suppressed` reports \
+                 how many files that applied to. A file with the marker but genuinely \
+                 nothing to suppress is omitted entirely, same as any other clean file. \n\n\
                  LINE ENDINGS: repository discovery is automatic. Files whose on-disk line \
                  endings differ from git's expected convention for their path (per \
                  .gitattributes / core.autocrlf / core.eol); such files are flagged with \
@@ -3306,12 +3318,15 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
                     "mojibake_matches": matches,
                     "replacement_char_matches": rc_matches,
                     "peel_suggested": issue.peel_suggested.is_some(),
+                    "peel_declined_reason": issue.peel_declined_reason,
                     "repaired": issue.repaired,
                     "eol_mismatch": issue.eol_mismatch.map(|m| serde_json::json!({
                         "expected": tpu::git::line_ending_name(m.expected),
                         "actual": tpu::git::line_ending_name(m.actual),
                     })),
                     "eol_repaired": issue.eol_repaired,
+                    "mojibake_marker_suppressed": issue.mojibake_marker_suppressed,
+                    "replacement_char_marker_suppressed": issue.replacement_char_marker_suppressed,
                 })
             })
             .collect();
@@ -3322,6 +3337,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
             "total_files_scanned": report.total_files_scanned,
             "total_issues": report.total_issues(),
             "total_repaired": report.total_repaired,
+            "total_marker_suppressed": report.total_marker_suppressed(),
             "walk_warnings": walk_warnings,
         });
         let result_line = serde_json::to_string(&doc)?;

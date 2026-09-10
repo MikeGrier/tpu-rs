@@ -8,6 +8,21 @@ All milestones below are complete. Moved here from `CHECKLIST.md` on
 
 ---
 
+## Milestone 0 — Primary deliverable
+
+- [x] M0-1: Detect, warn on, and refuse to introduce text-encoding
+      corruption (mojibake) in files the `tpu` library and CLI touch.
+      Delivered as `tpu doctor [paths...]` (Milestone 3) — an active
+      scan-and-repair subcommand (`--format=human|json`, `--fix=peel`,
+      `--quiet`) — further extended by `tpu doctor --guess` (Milestone 6)
+      for U+FFFD residue detection, and backed by two complementary
+      surfaces: the write-time guard (Milestone 2, refuses writes that
+      would *introduce* new mojibake across `write`/`replace`/`edit`/
+      `append`) and the read-time advisory (Milestone 4, warns inline on
+      `read`/`head`/`tail` without blocking).
+
+---
+
 ## Milestone 1 — Detection primitives
 
 **Theme:** a single, reusable library module that answers the question
