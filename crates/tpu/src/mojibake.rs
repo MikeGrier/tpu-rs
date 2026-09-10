@@ -222,17 +222,68 @@ pub fn allowed_by_marker(text: &str) -> bool {
 /// This is intentionally conservative — applying multiple peels in
 /// sequence is the caller's responsibility, and each round must
 /// independently demonstrate progress.
+///
+/// A thin wrapper over [`attempt_one_layer_peel`] for callers that only
+/// need the peeled text and don't need to distinguish *why* a peel wasn't
+/// offered; see that function's doc for a machine-readable breakdown of
+/// each decline reason (used by `tpu doctor` to explain a declined repair
+/// rather than silently reporting `peel_suggested: false`).
+#[allow(dead_code)] // public API, only invoked from tests (`tpu doctor` now calls attempt_one_layer_peel directly)
 pub fn looks_like_one_layer_peel(text: &str) -> Option<String> {
+    match attempt_one_layer_peel(text) {
+        PeelAttempt::Improved(peeled) => Some(peeled),
+        PeelAttempt::NothingToPeel
+        | PeelAttempt::WouldProduceInvalidUtf8
+        | PeelAttempt::NotBeneficial { .. } => None,
+    }
+}
+
+/// Outcome of attempting one round of [`looks_like_one_layer_peel`], with
+/// enough detail to explain *why* a peel wasn't offered when `text` had at
+/// least one mojibake match — so a caller (e.g. `tpu doctor`) can report a
+/// declined repair with its cause instead of a bare `false`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeelAttempt {
+    /// The peel reduced the match count; here is the peeled text.
+    Improved(String),
+    /// `text` had zero mojibake matches to begin with; there was nothing to
+    /// peel.
+    NothingToPeel,
+    /// Reverse-decoding `text` as Windows-1252 would itself produce invalid
+    /// UTF-8, so the peel was never offered (it would corrupt the file).
+    WouldProduceInvalidUtf8,
+    /// The peel did not reduce (or increased) the mojibake match count —
+    /// typically because `text` also contains other legitimate multi-byte
+    /// UTF-8 characters (em-dashes, box-drawing, accented names, …) that a
+    /// whole-file byte-for-byte reverse-decode would itself misinterpret.
+    NotBeneficial {
+        /// Number of matches in `text` before the peel was attempted.
+        original_match_count: usize,
+        /// Number of matches the peeled text would have had.
+        peeled_match_count: usize,
+    },
+}
+
+/// Attempt one round of "decode each char as a Windows-1252 byte where
+/// possible, then re-decode as UTF-8", returning enough detail to explain a
+/// decline. See [`looks_like_one_layer_peel`] for the simpler `Option`-based
+/// wrapper most callers want.
+pub fn attempt_one_layer_peel(text: &str) -> PeelAttempt {
     let original = scan(text).matches.len();
     if original == 0 {
-        return None;
+        return PeelAttempt::NothingToPeel;
     }
-    let peeled = try_peel_once(text)?;
+    let Some(peeled) = try_peel_once(text) else {
+        return PeelAttempt::WouldProduceInvalidUtf8;
+    };
     let peeled_count = scan(&peeled).matches.len();
     if peeled_count < original {
-        Some(peeled)
+        PeelAttempt::Improved(peeled)
     } else {
-        None
+        PeelAttempt::NotBeneficial {
+            original_match_count: original,
+            peeled_match_count: peeled_count,
+        }
     }
 }
 
@@ -855,6 +906,70 @@ mod tests {
         let double = "cafÃƒÂ©";
         assert_eq!(scan(double).matches.len(), 0);
         assert_eq!(looks_like_one_layer_peel(double), None);
+    }
+
+    // ── attempt_one_layer_peel ──────────────────────────────────────────────
+    //
+    // The richer variant used by `tpu doctor` to explain *why* a peel
+    // wasn't offered (rather than a bare `None`), so a declined repair is
+    // never a silent surprise.
+
+    #[test]
+    fn attempt_peel_reports_improved_on_success() {
+        let mojibake = "cafÃ©";
+        match attempt_one_layer_peel(mojibake) {
+            PeelAttempt::Improved(peeled) => assert_eq!(peeled, "café"),
+            other => panic!("expected Improved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attempt_peel_reports_nothing_to_peel_for_clean_text() {
+        assert_eq!(
+            attempt_one_layer_peel("hello world"),
+            PeelAttempt::NothingToPeel
+        );
+        assert_eq!(attempt_one_layer_peel("café"), PeelAttempt::NothingToPeel);
+    }
+
+    #[test]
+    fn attempt_peel_reports_would_produce_invalid_utf8() {
+        // 'Ã' (U+00C3, cp1252-identity-maps to byte 0xC3) followed by
+        // '\u{0080}' (not cp1252-mappable, so preserved as its own 2-byte
+        // UTF-8 encoding C2 80) triggers scan()'s Latin1 pattern (U+00C3
+        // immediately followed by a char in U+0080..=U+00BF), but peeling
+        // produces the byte sequence [0xC3, 0xC2, 0x80] -- 0xC3 is a valid
+        // 2-byte UTF-8 lead byte, but 0xC2 is not a valid continuation byte
+        // (continuation bytes are 0x80..=0xBF), so the result is not valid
+        // UTF-8. Confirmed directly: `String::from_utf8(vec![0xC3, 0xC2,
+        // 0x80])` is `Err`.
+        let text = "Ã\u{0080}";
+        assert_eq!(
+            scan(text).matches.len(),
+            1,
+            "must have a real match to peel"
+        );
+        assert_eq!(
+            attempt_one_layer_peel(text),
+            PeelAttempt::WouldProduceInvalidUtf8
+        );
+    }
+
+    #[test]
+    fn attempt_peel_reports_not_beneficial_when_reapplied_to_clean_text() {
+        // Peeling text that has already been peeled once (and is now
+        // clean) is the same as peeling clean text: NothingToPeel, not
+        // NotBeneficial (there's nothing left to try to improve).  This
+        // documents the boundary between the two "no repair offered"
+        // variants that don't involve invalid UTF-8.
+        let once_peeled = match attempt_one_layer_peel("cafÃ©") {
+            PeelAttempt::Improved(s) => s,
+            other => panic!("expected Improved, got {other:?}"),
+        };
+        assert_eq!(
+            attempt_one_layer_peel(&once_peeled),
+            PeelAttempt::NothingToPeel
+        );
     }
 
     // ── is_clean ────────────────────────────────────────────────────────────

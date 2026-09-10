@@ -187,6 +187,13 @@ pub struct DoctorIssue {
     /// `Some(text)` if a one-layer peel produces strictly fewer matches.
     /// Only populated when at least one mojibake pattern was found.
     pub peel_suggested: Option<String>,
+    /// `Some(reason)` when the file had at least one mojibake match but a
+    /// peel repair was *not* offered (`peel_suggested` is `None`),
+    /// explaining why — so a user is never left wondering whether
+    /// `--fix=peel` silently failed to help versus deliberately declining.
+    /// `None` whenever `mojibake_matches` is empty, or a peel *was*
+    /// offered.
+    pub peel_declined_reason: Option<String>,
     /// `true` once the file has been rewritten with `peel_suggested`.
     pub repaired: bool,
     /// `Some(_)` when the file's on-disk line endings disagree with git's
@@ -195,24 +202,57 @@ pub struct DoctorIssue {
     /// `true` once the file's line endings have been normalised to git's
     /// expectation under `--fix=eol` / `--fix=all`.
     pub eol_repaired: bool,
+    /// `Some(n)` when this file's `encoding-check: allow-mojibake` marker
+    /// suppressed `n` mojibake pattern match(es) that would otherwise have
+    /// been reported here. `None` when no such marker is present, or one is
+    /// present but there was nothing to suppress (the file was already
+    /// clean). This exists so the marker's effect is never a silent
+    /// surprise: a file that would otherwise be flagged still shows up in
+    /// the report with this count, even though it is *not* counted toward
+    /// [`DoctorReport::total_issues`] (the opt-out is honoured; only its
+    /// visibility changes).
+    pub mojibake_marker_suppressed: Option<usize>,
+    /// `Some(n)` when an allow-marker (`encoding-check: allow-mojibake` or
+    /// the narrower `encoding-check: allow-replacement-char`) suppressed
+    /// `n` `U+FFFD` replacement-character match(es) that would otherwise
+    /// have been reported here. `None` when no applicable marker is
+    /// present, or one is present but there was nothing to suppress.
+    pub replacement_char_marker_suppressed: Option<usize>,
 }
 
 impl DoctorIssue {
     /// True when the file has anything worth reporting (invalid encoding,
     /// mojibake matches, replacement-character residue, or a git line-ending
     /// mismatch).
+    ///
+    /// Deliberately does **not** consider [`Self::mojibake_marker_suppressed`]
+    /// / [`Self::replacement_char_marker_suppressed`]: a marker-suppressed
+    /// file is intentionally opted out by its author and must not affect
+    /// `total_issues` / exit-code failures — it is surfaced in the report
+    /// purely for visibility, not as a problem to fix.
     pub fn is_problem(&self) -> bool {
         !self.valid_in_detected_encoding
             || !self.mojibake_matches.is_empty()
             || !self.replacement_char_matches.is_empty()
             || self.eol_mismatch.is_some()
     }
+
+    /// True when this entry exists purely to report that an allow-marker
+    /// suppressed something (no real, counted problem is present).
+    #[allow(dead_code)] // public API, only invoked from integration tests
+    pub fn is_marker_suppression_only(&self) -> bool {
+        !self.is_problem()
+            && (self.mojibake_marker_suppressed.is_some()
+                || self.replacement_char_marker_suppressed.is_some())
+    }
 }
 
 /// Aggregate result of [`run`].
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DoctorReport {
-    /// One entry per *flagged* file (clean files are omitted).
+    /// One entry per file worth reporting: either a real problem, or a
+    /// marker-suppression notice (clean files with nothing to report are
+    /// omitted entirely).
     pub issues: Vec<DoctorIssue>,
     pub total_files_scanned: usize,
     pub total_repaired: usize,
@@ -223,9 +263,23 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
-    /// Number of flagged files (mojibake- or encoding-invalid).
+    /// Number of flagged files (mojibake- or encoding-invalid).  Excludes
+    /// marker-suppression-only entries (see [`DoctorIssue::is_problem`]).
     pub fn total_issues(&self) -> usize {
         self.issues.iter().filter(|i| i.is_problem()).count()
+    }
+
+    /// Number of files where an allow-marker suppressed at least one
+    /// mojibake or replacement-char match that would otherwise have been
+    /// reported.  Not counted in [`Self::total_issues`]; purely informational.
+    pub fn total_marker_suppressed(&self) -> usize {
+        self.issues
+            .iter()
+            .filter(|i| {
+                i.mojibake_marker_suppressed.is_some()
+                    || i.replacement_char_marker_suppressed.is_some()
+            })
+            .count()
     }
 }
 
@@ -484,34 +538,69 @@ fn diagnose_file(
             mojibake_matches: Vec::new(),
             replacement_char_matches: Vec::new(),
             peel_suggested: None,
+            peel_declined_reason: None,
             repaired: false,
             eol_mismatch,
             eol_repaired: false,
+            mojibake_marker_suppressed: None,
+            replacement_char_marker_suppressed: None,
         }));
     }
 
     // Allow-marker opt-out for the *whole file* (suppresses all mojibake /
     // replacement-char diagnostics).  A git line-ending mismatch is a separate
     // concern and is still reported even when the marker is present.
+    //
+    // The opt-out is still honoured (suppressed matches are never counted
+    // toward `total_issues` / exit-code failures), but it must never be a
+    // silent surprise: we still run both scans to find out *how much* was
+    // suppressed, and surface that count in the report. A file whose author
+    // merely discusses the marker in prose (a README, design note, or this
+    // very kind of changelog) rather than genuinely opting out a real
+    // corruption elsewhere in the same file will make that visible instead
+    // of vanishing with zero explanation.
     if mojibake::allowed_by_marker(decoded_text) {
-        return Ok(eol_only_issue(path, encoding_name, eol_mismatch));
+        let would_be_mojibake = mojibake::scan(decoded_text).matches.len();
+        let would_be_rc = mojibake::scan_replacement_chars(decoded_text, false).len();
+        return Ok(marker_suppressed_issue(
+            path,
+            encoding_name,
+            eol_mismatch,
+            would_be_mojibake,
+            would_be_rc,
+        ));
     }
 
     let report = mojibake::scan(decoded_text);
 
-    // Scan for U+FFFD replacement-character residue (unless the file opts out).
-    let rc_matches = if mojibake::has_replacement_char_allow_marker(decoded_text) {
-        Vec::new()
-    } else {
-        let raw_rc = mojibake::scan_replacement_chars(decoded_text, guess);
-        if raw_rc.is_empty() {
-            Vec::new()
+    // Scan for U+FFFD replacement-character residue (unless the file opts out
+    // via its own, narrower marker). As above, the opt-out is honoured but
+    // made visible: `replacement_char_marker_suppressed` records how many
+    // matches were hidden.
+    let raw_rc = mojibake::scan_replacement_chars(decoded_text, guess);
+    let (rc_matches, replacement_char_marker_suppressed) =
+        if mojibake::has_replacement_char_allow_marker(decoded_text) {
+            (
+                Vec::new(),
+                if raw_rc.is_empty() {
+                    None
+                } else {
+                    Some(raw_rc.len())
+                },
+            )
+        } else if raw_rc.is_empty() {
+            (Vec::new(), None)
         } else {
-            annotate_replacement_char_matches(decoded_text, &raw_rc)
-        }
-    };
+            (
+                annotate_replacement_char_matches(decoded_text, &raw_rc),
+                None,
+            )
+        };
 
-    if report.matches.is_empty() && rc_matches.is_empty() {
+    if report.matches.is_empty()
+        && rc_matches.is_empty()
+        && replacement_char_marker_suppressed.is_none()
+    {
         return Ok(eol_only_issue(path, encoding_name, eol_mismatch));
     }
 
@@ -522,10 +611,32 @@ fn diagnose_file(
         annotate_matches(decoded_text, &report.matches)
     };
 
-    let peel_suggested = if report.matches.is_empty() {
-        None
+    let (peel_suggested, peel_declined_reason) = if report.matches.is_empty() {
+        (None, None)
     } else {
-        mojibake::looks_like_one_layer_peel(decoded_text)
+        match mojibake::attempt_one_layer_peel(decoded_text) {
+            mojibake::PeelAttempt::Improved(peeled) => (Some(peeled), None),
+            mojibake::PeelAttempt::NothingToPeel => (None, None),
+            mojibake::PeelAttempt::WouldProduceInvalidUtf8 => (
+                None,
+                Some(
+                    "reverse-decoding this file as Windows-1252 would itself produce invalid \
+                     UTF-8, so the peel was never offered"
+                        .to_string(),
+                ),
+            ),
+            mojibake::PeelAttempt::NotBeneficial {
+                original_match_count,
+                peeled_match_count,
+            } => (
+                None,
+                Some(format!(
+                    "a one-layer peel would not reduce the mojibake match count ({original_match_count} \
+                     before, {peeled_match_count} after) -- likely other legitimate multi-byte UTF-8 \
+                     text elsewhere in the file would itself be corrupted by a whole-file reverse-decode"
+                )),
+            ),
+        }
     };
 
     Ok(Some(DoctorIssue {
@@ -535,10 +646,44 @@ fn diagnose_file(
         mojibake_matches: matches,
         replacement_char_matches: rc_matches,
         peel_suggested,
+        peel_declined_reason,
         repaired: false,
         eol_mismatch,
         eol_repaired: false,
+        mojibake_marker_suppressed: None,
+        replacement_char_marker_suppressed,
     }))
+}
+
+/// Build a [`DoctorIssue`] reporting that the file's allow-marker suppressed
+/// `would_be_mojibake` mojibake match(es) and/or `would_be_rc`
+/// replacement-char match(es), or `None` when there was nothing to suppress
+/// and no git line-ending mismatch either (a genuinely clean, marked file
+/// stays fully silent, matching prior behaviour).
+fn marker_suppressed_issue(
+    path: &Path,
+    encoding_name: &'static str,
+    eol_mismatch: Option<EolMismatch>,
+    would_be_mojibake: usize,
+    would_be_rc: usize,
+) -> Option<DoctorIssue> {
+    if eol_mismatch.is_none() && would_be_mojibake == 0 && would_be_rc == 0 {
+        return None;
+    }
+    Some(DoctorIssue {
+        path: path.to_path_buf(),
+        encoding_detected: encoding_name,
+        valid_in_detected_encoding: true,
+        mojibake_matches: Vec::new(),
+        replacement_char_matches: Vec::new(),
+        peel_suggested: None,
+        peel_declined_reason: None,
+        repaired: false,
+        eol_mismatch,
+        eol_repaired: false,
+        mojibake_marker_suppressed: (would_be_mojibake > 0).then_some(would_be_mojibake),
+        replacement_char_marker_suppressed: (would_be_rc > 0).then_some(would_be_rc),
+    })
 }
 
 /// Build a [`DoctorIssue`] representing an otherwise-clean file that only has a
@@ -555,9 +700,12 @@ fn eol_only_issue(
         mojibake_matches: Vec::new(),
         replacement_char_matches: Vec::new(),
         peel_suggested: None,
+        peel_declined_reason: None,
         repaired: false,
         eol_mismatch: Some(m),
         eol_repaired: false,
+        mojibake_marker_suppressed: None,
+        replacement_char_marker_suppressed: None,
     })
 }
 
@@ -1031,6 +1179,9 @@ fn emit_human(out: &mut dyn Write, report: &DoctorReport, quiet: bool) -> std::i
                         m.byte_offset
                     )?;
                 }
+                if let Some(reason) = &issue.peel_declined_reason {
+                    writeln!(out, "  peel not applied: {reason}")?;
+                }
             }
             if rc_count > 0 {
                 writeln!(
@@ -1077,15 +1228,50 @@ fn emit_human(out: &mut dyn Write, report: &DoctorReport, quiet: bool) -> std::i
                     tag,
                 )?;
             }
+            if let Some(n) = issue.mojibake_marker_suppressed {
+                writeln!(
+                    out,
+                    "{}: {} mojibake match{} hidden by the 'encoding-check: allow-mojibake' \
+                     marker (not counted as an issue; remove the marker or run without it to \
+                     see detail) [{}]",
+                    issue.path.display(),
+                    n,
+                    if n == 1 { "" } else { "es" },
+                    issue.encoding_detected,
+                )?;
+            }
+            if let Some(n) = issue.replacement_char_marker_suppressed {
+                writeln!(
+                    out,
+                    "{}: {} lossy-replacement char{} hidden by an allow-marker (not counted as \
+                     an issue) [{}]",
+                    issue.path.display(),
+                    n,
+                    if n == 1 { "" } else { "s" },
+                    issue.encoding_detected,
+                )?;
+            }
         }
     }
-    writeln!(
-        out,
-        "doctor: scanned {} file(s), {} flagged, {} repaired",
-        report.total_files_scanned,
-        report.total_issues(),
-        report.total_repaired
-    )?;
+    let suppressed = report.total_marker_suppressed();
+    if suppressed > 0 {
+        writeln!(
+            out,
+            "doctor: scanned {} file(s), {} flagged, {} repaired, {} suppressed-by-marker",
+            report.total_files_scanned,
+            report.total_issues(),
+            report.total_repaired,
+            suppressed,
+        )?;
+    } else {
+        writeln!(
+            out,
+            "doctor: scanned {} file(s), {} flagged, {} repaired",
+            report.total_files_scanned,
+            report.total_issues(),
+            report.total_repaired
+        )?;
+    }
     Ok(())
 }
 
@@ -1133,12 +1319,15 @@ fn emit_json(out: &mut dyn Write, report: &DoctorReport) -> std::io::Result<()> 
                 "mojibake_matches": matches,
                 "replacement_char_matches": rc_matches,
                 "peel_suggested": issue.peel_suggested.is_some(),
+                "peel_declined_reason": issue.peel_declined_reason,
                 "repaired": issue.repaired,
                 "eol_mismatch": issue.eol_mismatch.map(|m| json!({
                     "expected": git::line_ending_name(m.expected),
                     "actual": git::line_ending_name(m.actual),
                 })),
                 "eol_repaired": issue.eol_repaired,
+                "mojibake_marker_suppressed": issue.mojibake_marker_suppressed,
+                "replacement_char_marker_suppressed": issue.replacement_char_marker_suppressed,
             })
         })
         .collect();
@@ -1148,6 +1337,7 @@ fn emit_json(out: &mut dyn Write, report: &DoctorReport) -> std::io::Result<()> 
         "total_files_scanned": report.total_files_scanned,
         "total_issues": report.total_issues(),
         "total_repaired": report.total_repaired,
+        "total_marker_suppressed": report.total_marker_suppressed(),
     });
     let s = serde_json::to_string_pretty(&doc).expect("serialise doctor report");
     writeln!(out, "{s}")?;
@@ -1563,10 +1753,36 @@ mod tests {
     }
 
     #[test]
-    fn allow_marker_suppresses_diagnosis() {
+    fn allow_marker_suppresses_diagnosis_but_reports_the_suppression() {
+        // The marker still opts the file out of `total_issues` / exit-code
+        // failures (the mojibake match itself is neither returned in
+        // `mojibake_matches` nor counted by `is_problem()`), but the
+        // suppression itself is no longer invisible: `diagnose_file` must
+        // still return `Some` with `mojibake_marker_suppressed` set to the
+        // count that was hidden, so a caller (and `tpu doctor`'s output)
+        // can see that something was opted out rather than concluding the
+        // file was simply clean.
         let tmp = TempDir::new().unwrap();
         let body = format!("// {}\nthis line has cafÃ© in it\n", mojibake::ALLOW_MARKER);
         let p = write(&tmp, "ok.txt", body.as_bytes());
+        let issue = diagnose_file(&p, IoMode::Buffered, false, &git::FilePolicy::default())
+            .unwrap()
+            .expect("marker-suppressed file with real matches must still be reported");
+        assert!(!issue.is_problem(), "must not count as a problem");
+        assert!(issue.mojibake_matches.is_empty());
+        assert_eq!(issue.mojibake_marker_suppressed, Some(1));
+        assert_eq!(issue.replacement_char_marker_suppressed, None);
+    }
+
+    #[test]
+    fn allow_marker_on_genuinely_clean_file_reports_nothing() {
+        // A marked file with no would-be matches at all must remain
+        // fully silent (matching the pre-fix behaviour for the common,
+        // unremarkable case) -- the transparency fix only changes the
+        // outcome when the marker actually suppressed something.
+        let tmp = TempDir::new().unwrap();
+        let body = format!("// {}\nnothing to see here\n", mojibake::ALLOW_MARKER);
+        let p = write(&tmp, "clean.txt", body.as_bytes());
         let res = diagnose_file(&p, IoMode::Buffered, false, &git::FilePolicy::default()).unwrap();
         assert!(res.is_none());
     }
@@ -1772,9 +1988,12 @@ mod tests {
             mojibake_matches: Vec::new(),
             replacement_char_matches: Vec::new(),
             peel_suggested: None,
+            peel_declined_reason: None,
             repaired: false,
             eol_mismatch: None,
             eol_repaired: false,
+            mojibake_marker_suppressed: None,
+            replacement_char_marker_suppressed: None,
         };
         assert!(!i.is_problem());
         i.valid_in_detected_encoding = false;
@@ -1804,9 +2023,12 @@ mod tests {
             }],
             replacement_char_matches: Vec::new(),
             peel_suggested: None,
+            peel_declined_reason: None,
             repaired: false,
             eol_mismatch: None,
             eol_repaired: false,
+            mojibake_marker_suppressed: None,
+            replacement_char_marker_suppressed: None,
         });
         assert_eq!(r.total_issues(), 1);
     }

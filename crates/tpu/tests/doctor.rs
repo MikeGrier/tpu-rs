@@ -122,7 +122,15 @@ fn plain_run_flags_only_corrupt_files() {
         },
     );
 
-    let flagged: Vec<&PathBuf> = report.issues.iter().map(|i| &i.path).collect();
+    // "Flagged" means counted as a real problem (`is_problem()`), not merely
+    // present in `report.issues` -- a marker-suppression notice can be
+    // present without being a problem (see `with_marker` below).
+    let flagged: Vec<&PathBuf> = report
+        .issues
+        .iter()
+        .filter(|i| i.is_problem())
+        .map(|i| &i.path)
+        .collect();
     let flagged_names: Vec<String> = flagged
         .iter()
         .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
@@ -152,14 +160,36 @@ fn plain_run_flags_only_corrupt_files() {
     assert!(!inv.valid_in_detected_encoding);
     assert!(inv.mojibake_matches.is_empty());
 
-    // None of the clean/marker files may be flagged.
-    for clean in [&f.clean_ascii, &f.clean_utf8, &f.utf16le, &f.with_marker] {
+    // None of the genuinely clean files may be flagged as a problem.
+    for clean in [&f.clean_ascii, &f.clean_utf8, &f.utf16le] {
         let name = clean.file_name().unwrap().to_string_lossy().into_owned();
         assert!(
             !flagged_names.contains(&name),
             "clean fixture wrongly flagged: {name}"
         );
     }
+
+    // `with_marker.txt` has real mojibake content (`cafe()`) alongside its
+    // allow-marker: it must NOT be flagged as a problem (the opt-out is
+    // honoured), but it must still appear in `report.issues` with
+    // `mojibake_marker_suppressed` set -- so the suppression is visible,
+    // not a silent surprise.
+    assert!(
+        !flagged_names.contains(&"with_marker.txt".to_string()),
+        "with_marker.txt must not count as a problem: {flagged_names:?}"
+    );
+    let marked = report
+        .issues
+        .iter()
+        .find(|i| i.path.file_name().unwrap() == "with_marker.txt")
+        .expect("with_marker.txt must still appear in the report (marker suppression notice)");
+    assert!(!marked.is_problem());
+    assert!(marked.is_marker_suppression_only());
+    assert_eq!(
+        marked.mojibake_marker_suppressed,
+        Some(1),
+        "with_marker.txt's single cafe() occurrence must be reported as suppressed"
+    );
 
     // Repair count is zero (no --fix).
     assert_eq!(report.total_repaired, 0);
@@ -574,5 +604,178 @@ fn fix_peel_does_not_corrupt_valid_utf8_box_drawing_file() {
     assert!(
         !after_text.contains('\u{FFFD}'),
         "peel must never introduce U+FFFD into a clean file"
+    );
+}
+
+// ── Scenario 6: allow-marker suppression is visible, not a silent surprise ──
+
+/// A file with a real mojibake match *and* the `allow-mojibake` marker must
+/// not count as a problem, but must still be visible in the report (both
+/// human and JSON output) so the suppression is never a surprise.
+#[test]
+fn marker_suppression_is_visible_in_both_output_formats() {
+    // "cafÃ©" built from raw bytes (Ã©'s UTF-8 encoding) so this source
+    // file needs no allow-mojibake marker of its own.
+    let dirty_text = "this line has caf\u{c3}\u{a9} in it";
+    let body = format!("// encoding-check: allow-mojibake\n{dirty_text}\n");
+
+    let dir = TempDir::new().unwrap();
+    let path = write_file(&dir, "marked.txt", body.as_bytes());
+    let path_str = path.to_string_lossy().to_string();
+
+    // Human format.
+    let mut buf: Vec<u8> = Vec::new();
+    let report = doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Human,
+            fix: DoctorFix::None,
+            quiet: false,
+            guess: false,
+        },
+        &mut buf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+
+    assert_eq!(
+        report.total_issues(),
+        0,
+        "marker suppression is not a problem"
+    );
+    assert_eq!(report.total_marker_suppressed(), 1);
+    let issue = report
+        .issues
+        .iter()
+        .find(|i| i.path.file_name().unwrap() == "marked.txt")
+        .expect("marked.txt must still appear in the report");
+    assert_eq!(issue.mojibake_marker_suppressed, Some(1));
+
+    let human = String::from_utf8(buf).unwrap();
+    assert!(
+        human.contains("hidden by the 'encoding-check: allow-mojibake' marker"),
+        "human output must explain the suppression: {human}"
+    );
+    assert!(
+        human.contains("1 suppressed-by-marker"),
+        "human summary must mention the suppressed count: {human}"
+    );
+
+    // JSON format.
+    let mut jbuf: Vec<u8> = Vec::new();
+    doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Json,
+            fix: DoctorFix::None,
+            quiet: false,
+            guess: false,
+        },
+        &mut jbuf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(jbuf).unwrap())
+        .expect("doctor JSON must be parseable");
+    assert_eq!(v["total_marker_suppressed"], 1);
+    let files = v["files"].as_array().unwrap();
+    let entry = files
+        .iter()
+        .find(|f| f["path"].as_str().unwrap().ends_with("marked.txt"))
+        .expect("marked.txt must appear in JSON files array");
+    assert_eq!(entry["mojibake_marker_suppressed"], 1);
+    assert_eq!(
+        entry["replacement_char_marker_suppressed"],
+        serde_json::Value::Null
+    );
+}
+
+// ── Scenario 7: a declined peel repair explains why, in both formats ───────
+
+/// A file with a real mojibake match that peel cannot repair (because
+/// reverse-decoding it would itself produce invalid UTF-8) must report
+/// `peel_declined_reason` explaining why -- not just a bare
+/// `peel_suggested: false`.
+#[test]
+fn peel_declined_reason_explains_invalid_utf8_case() {
+    // 'Ã' (U+00C3) immediately followed by U+0080 triggers the Latin1
+    // pattern (U+00C3 followed by a char in U+0080..=U+00BF), but peeling
+    // produces byte sequence [0xC3, 0xC2, 0x80] -- 0xC3 needs a
+    // continuation byte in 0x80..=0xBF, and 0xC2 isn't one, so the peel
+    // would itself produce invalid UTF-8. Built from raw bytes: 'Ã' is
+    // C3 83, U+0080 is C2 80.
+    let bytes: &[u8] = b"\xc3\x83\xc2\x80";
+    let text = std::str::from_utf8(bytes).expect("valid UTF-8 fixture");
+    assert_eq!(
+        tpu::mojibake::scan(text).matches.len(),
+        1,
+        "fixture must have exactly one real match"
+    );
+
+    let dir = TempDir::new().unwrap();
+    let path = write_file(&dir, "undopeelable.txt", bytes);
+    let path_str = path.to_string_lossy().to_string();
+
+    let mut buf: Vec<u8> = Vec::new();
+    let report = doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Human,
+            fix: DoctorFix::Peel,
+            quiet: false,
+            guess: false,
+        },
+        &mut buf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+
+    assert_eq!(report.total_issues(), 1);
+    assert_eq!(
+        report.total_repaired, 0,
+        "an unpeelable file must not be repaired"
+    );
+    let issue = &report.issues[0];
+    assert!(!issue.repaired);
+    assert!(issue.peel_suggested.is_none());
+    let reason = issue
+        .peel_declined_reason
+        .as_ref()
+        .expect("must explain why peel was declined");
+    assert!(
+        reason.contains("invalid UTF-8"),
+        "reason must mention the actual cause: {reason}"
+    );
+
+    let human = String::from_utf8(buf).unwrap();
+    assert!(
+        human.contains("peel not applied:"),
+        "human output must surface the declined reason: {human}"
+    );
+
+    // JSON format carries the same reason.
+    let mut jbuf: Vec<u8> = Vec::new();
+    doctor::run(
+        &[&path_str],
+        DoctorOptions {
+            format: DoctorFormat::Json,
+            fix: DoctorFix::Peel,
+            quiet: false,
+            guess: false,
+        },
+        &mut jbuf,
+        IoMode::Buffered,
+    )
+    .expect("doctor::run");
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8(jbuf).unwrap())
+        .expect("doctor JSON must be parseable");
+    let entry = &v["files"][0];
+    assert_eq!(entry["peel_suggested"], false);
+    assert!(
+        entry["peel_declined_reason"]
+            .as_str()
+            .unwrap()
+            .contains("invalid UTF-8"),
+        "JSON must carry the decline reason: {entry}"
     );
 }
