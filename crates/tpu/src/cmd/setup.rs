@@ -288,11 +288,30 @@ Workflow:
    `fix: "peel"`. Only files whose peel produces *strictly fewer* mojibake
    matches are rewritten; the prior content is preserved at `<file>.bak`.
    Re-run `tpu_doctor` after the repair to confirm the report is clean.
+   When a flagged file's peel is declined (`peel_suggested: false` despite
+   having `mojibake_matches`), `peel_declined_reason` explains why — e.g.
+   the peel would itself produce invalid UTF-8, or would not reduce (or
+   would increase) the match count, typically because other legitimate
+   multi-byte UTF-8 text elsewhere in the file would be corrupted by a
+   whole-file reverse-decode. That file needs manual repair; don't treat
+   the unset `repaired` flag as a tool failure.
 4. **Don't paper over it**: if a file legitimately contains mojibake
    digraphs (test fixtures, regex sources, documentation about mojibake),
    add the line `encoding-check: allow-mojibake` (typically inside a
-   comment) — `tpu_doctor` and the write-time guard will treat it as
-   clean.
+   comment) — `tpu_doctor` and the write-time guard will honour the
+   opt-out (it is never counted toward `total_issues` or exit-code
+   failures). This is **not** silent, though: if the file would otherwise
+   have been flagged, it still appears in `tpu_doctor`'s `files` array with
+   `mojibake_marker_suppressed` (and/or `replacement_char_marker_suppressed`)
+   set to the count that was hidden, and the top-level
+   `total_marker_suppressed` reports how many files that applied to across
+   the whole scan. A file with the marker but genuinely nothing to suppress
+   is omitted entirely, same as any other clean file. If you see a nonzero
+   `total_marker_suppressed`, don't assume the marker was placed
+   correctly — a file that merely *discusses* the marker string in prose
+   (rather than opting out real, adjacent corruption) will also suppress
+   whatever mojibake happens to be nearby, since the marker is a
+   whole-file substring match, not scoped to a region.
 
 The write-time guard in `tpu_write_file` / `tpu_append_file` /
 `tpu_replace_in_file` / `tpu_edit_file` already refuses to *introduce* new
