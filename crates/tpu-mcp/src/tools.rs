@@ -3588,7 +3588,7 @@ fn stamp_and_verify(file: &Path, delay_ms: u64) -> Result<WriteStamp, Box<dyn st
     let meta = std::fs::metadata(file)?;
     let actual_ms = mtime_as_epoch_ms(&meta);
 
-    if actual_ms.abs_diff(now_ms) > 10 {
+    if mtime_drift_exceeds_tolerance(actual_ms, now_ms) {
         return Err(format!(
             "write verification failed for '{}': mtime stamp was {now_ms} ms but \
              read back {actual_ms} ms -- this likely indicates Windows Defender \
@@ -3604,6 +3604,14 @@ fn stamp_and_verify(file: &Path, delay_ms: u64) -> Result<WriteStamp, Box<dyn st
         mtime_epoch_ms: actual_ms,
         size: meta.len(),
     })
+}
+
+/// The verification tolerance (milliseconds) for [`stamp_and_verify`]'s
+/// read-back mtime check, extracted as its own function so the exact `> 10`
+/// boundary is directly testable without needing to force a real
+/// filesystem's mtime read-back to drift by precisely 10ms.
+fn mtime_drift_exceeds_tolerance(actual_ms: u64, expected_ms: u64) -> bool {
+    actual_ms.abs_diff(expected_ms) > 10
 }
 
 /// Extract the last-modified time from metadata as milliseconds since the
@@ -3699,18 +3707,17 @@ fn normalize_bytes_to_lf(bytes: Vec<u8>) -> Vec<u8> {
         return bytes;
     }
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] == b'\r' {
+    let mut iter = bytes.iter().copied().peekable();
+    while let Some(b) = iter.next() {
+        if b == b'\r' {
             out.push(b'\n');
             // Skip the \n in a \r\n pair.
-            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
-                i += 1;
+            if iter.peek() == Some(&b'\n') {
+                iter.next();
             }
         } else {
-            out.push(bytes[i]);
+            out.push(b);
         }
-        i += 1;
     }
     out
 }
@@ -4221,19 +4228,18 @@ fn is_windows_drive_path(s: &str) -> bool {
 /// independently).
 fn percent_decode_path(s: &str) -> String {
     let mut bytes: Vec<u8> = Vec::with_capacity(s.len());
-    let b = s.as_bytes();
-    let mut i = 0;
-    while i < b.len() {
-        if b[i] == b'%'
-            && i + 2 < b.len()
-            && let (Some(hi), Some(lo)) = (hex_nibble(b[i + 1]), hex_nibble(b[i + 2]))
+    let mut rest = s.as_bytes();
+    while let Some((&first, tail)) = rest.split_first() {
+        if first == b'%'
+            && let [h, l, tail2 @ ..] = tail
+            && let (Some(hi), Some(lo)) = (hex_nibble(*h), hex_nibble(*l))
         {
             bytes.push(hi << 4 | lo);
-            i += 3;
+            rest = tail2;
             continue;
         }
-        bytes.push(b[i]);
-        i += 1;
+        bytes.push(first);
+        rest = tail;
     }
     String::from_utf8(bytes).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned())
 }
@@ -4309,6 +4315,20 @@ mod tests {
         assert!(!is_binary_selector("line:5"));
         assert!(!is_binary_selector("line-contains:5"));
         assert!(!is_binary_selector(""));
+    }
+
+    // ── decode_pattern_arg ────────────────────────────────────────────────────
+
+    /// The plain (non-`_format`) path must return the pattern text exactly
+    /// as given, not a constant. Pins a whole-function-replace mutation
+    /// (`Ok(String::new())`) directly, without going through the full
+    /// `tpu_replace_in_file` pipeline (where an unexpectedly-empty pattern
+    /// could hit the underlying replace engine's zero-width-match handling
+    /// instead of failing this assertion immediately).
+    #[test]
+    fn decode_pattern_arg_returns_the_given_pattern_verbatim() {
+        let args = serde_json::json!({ "pattern": "needle" });
+        assert_eq!(decode_pattern_arg(&args, "pattern").unwrap(), "needle");
     }
 
     // ── hex_nibble ───────────────────────────────────────────────────────────
@@ -4440,6 +4460,53 @@ mod tests {
 
     // ── current_version ──────────────────────────────────────────────────────
 
+    // ── stamp_and_verify / mtime_drift_exceeds_tolerance ─────────────────────
+
+    /// `delay_ms == 0` must skip the stamp entirely and behave exactly like
+    /// `read_stamp` (no write access needed). Pins `delay_ms == 0` against a
+    /// `!=` mutation: on a read-only file, correct code succeeds (no write
+    /// attempted), while the mutated code would try to open the file for
+    /// writing and fail.
+    #[test]
+    fn stamp_and_verify_zero_delay_never_opens_file_for_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("readonly.txt");
+        std::fs::write(&f, b"hello").unwrap();
+        let mut perms = std::fs::metadata(&f).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&f, perms.clone()).unwrap();
+
+        let result = stamp_and_verify(&f, 0);
+
+        // Restore write permission before any assertion/panic unwinds so the
+        // tempdir can still be cleaned up.
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(&f, perms);
+
+        result.expect("delay_ms:0 must succeed on a read-only file (no write attempted)");
+    }
+
+    /// The verification tolerance's `> 10` boundary, extracted into
+    /// [`mtime_drift_exceeds_tolerance`] specifically so it's directly
+    /// testable: exactly 10ms of drift must NOT be flagged, but 11ms must
+    /// be. Pins `>` against `==` (would wrongly flag exactly-10 as a
+    /// failure) and against `>=` (same).
+    #[test]
+    fn mtime_drift_exceeds_tolerance_boundary() {
+        assert!(
+            !mtime_drift_exceeds_tolerance(1_000, 1_010),
+            "exactly 10ms must be tolerated"
+        );
+        assert!(
+            !mtime_drift_exceeds_tolerance(1_010, 1_000),
+            "exactly 10ms (reversed) must be tolerated"
+        );
+        assert!(
+            mtime_drift_exceeds_tolerance(1_000, 1_011),
+            "11ms must exceed tolerance"
+        );
+    }
+
     #[test]
     fn current_version_missing_file_is_none_not_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -4557,7 +4624,68 @@ mod tests {
         );
     }
 
-    // -- file:// URI stripping --
+    /// A line whose length is exactly `MAX_ECHO_LINE_BYTES` (500) must NOT
+    /// be truncated -- only lines *longer* than that are. Pins `line.len()
+    /// > MAX_ECHO_LINE_BYTES` against a `>=` mutation.
+    #[test]
+    fn render_changed_regions_exact_max_line_bytes_not_truncated() {
+        let exact = "a".repeat(MAX_ECHO_LINE_BYTES);
+        let over = "a".repeat(MAX_ECHO_LINE_BYTES + 1);
+        let regions = vec![
+            tpu::cmd::replace::ChangedRegion {
+                start_line: 1,
+                end_line: 1,
+                new_line_count: 1,
+                new_text: exact.clone(),
+            },
+            tpu::cmd::replace::ChangedRegion {
+                start_line: 2,
+                end_line: 2,
+                new_line_count: 1,
+                new_text: over,
+            },
+        ];
+        let rendered = render_changed_regions(&regions);
+        assert!(
+            rendered.contains(&format!("+{exact}\n")),
+            "an exactly-500-byte line must be shown in full, not truncated; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("[truncated,"),
+            "a 501-byte line must be truncated; got: {rendered:?}"
+        );
+    }
+
+    /// A long line whose byte-500 boundary falls in the middle of a
+    /// multi-byte UTF-8 character must still truncate cleanly at the
+    /// nearest valid char boundary at or before 500, not panic. Pins
+    /// `boundary -= 1` against `+=`/`/=` mutations, either of which would
+    /// walk the search the wrong direction and panic (out-of-range slice
+    /// or an infinite/invalid search) instead of finding the boundary just
+    /// behind position 500.
+    #[test]
+    fn render_changed_regions_truncates_at_char_boundary_not_mid_multibyte_char() {
+        // 499 ASCII bytes, then a 3-byte UTF-8 character straddling the
+        // 500-byte cut point (bytes 499..502), followed by more text.
+        let mut new_text = "a".repeat(499);
+        new_text.push('€'); // U+20AC, 3 bytes in UTF-8
+        new_text.push_str("tail");
+        let regions = vec![tpu::cmd::replace::ChangedRegion {
+            start_line: 1,
+            end_line: 1,
+            new_line_count: 1,
+            new_text,
+        }];
+        let rendered = render_changed_regions(&regions);
+        assert!(rendered.contains("[truncated,"), "got: {rendered:?}");
+        // The truncated prefix must be exactly the 499 'a's (the euro sign
+        // itself is dropped since its first byte already falls at/after
+        // the cut point) -- and, crucially, must not panic.
+        assert!(
+            rendered.contains(&format!("+{}...", "a".repeat(499))),
+            "got: {rendered:?}"
+        );
+    }
 
     #[test]
     fn uri_windows_backslash_absolute() {
@@ -5048,6 +5176,76 @@ mod integration_tests {
         Ok(tr.text)
     }
 
+    // -- dispatcher coverage (call()'s match arms) ------------------------------
+
+    /// The dispatcher must actually route to `call_read_file_binary`, not
+    /// fall through to the `unknown tool` arm. Pins `delete match arm
+    /// "tpu_read_file_binary"` against the mutant that removes it.
+    #[test]
+    fn dispatcher_routes_tpu_read_file_binary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("bin.dat");
+        fs::write(&f, b"hello").unwrap();
+        let out = call(
+            "tpu_read_file_binary",
+            &serde_json::json!({ "file": f.to_str().unwrap() }),
+        )
+        .expect("must route to call_read_file_binary, not 'unknown tool'");
+        assert!(!out.contains("unknown tool"), "got: {out:?}");
+
+        drop(dir);
+    }
+
+    /// The dispatcher must actually route to `call_validate_file`. Pins
+    /// `delete match arm "tpu_validate_file"` against the mutant that
+    /// removes it.
+    #[test]
+    fn dispatcher_routes_tpu_validate_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("validate.txt");
+        fs::write(&f, b"hello\n").unwrap();
+        let out = call(
+            "tpu_validate_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "selector": "line:1",
+                "value": "hello",
+            }),
+        )
+        .expect("must route to call_validate_file, not 'unknown tool'");
+        assert!(!out.contains("unknown tool"), "got: {out:?}");
+
+        drop(dir);
+    }
+
+    // -- call_read_file_binary --------------------------------------------------
+
+    /// Requesting a `hash` must return the JSON-with-hashes format (an
+    /// `algo`/`range`/`value` entry), not the plain escaped-content format.
+    /// Pins `if !hash_specs.is_empty()` against a `delete !` mutation, which
+    /// would wrongly take the plain-content branch even when a hash was
+    /// requested.
+    #[test]
+    fn read_file_binary_with_hash_returns_hashes_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("hash_me.bin");
+        fs::write(&f, b"hello world").unwrap();
+        let out = call(
+            "tpu_read_file_binary",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "hash": ["crc32:1-$"],
+            }),
+        )
+        .expect("tpu_read_file_binary must succeed");
+        let v = ndjson_result_line(&out);
+        let hashes = v["hashes"].as_array().expect("expected a hashes array");
+        assert_eq!(hashes.len(), 1, "got: {out:?}");
+        assert_eq!(hashes[0]["algo"], "crc32", "got: {out:?}");
+
+        drop(dir);
+    }
+
     /// Regression: a zero-match `tpu_replace_in_file` must leave the file's
     /// mtime untouched **even when write verification is enabled**.
     ///
@@ -5331,6 +5529,218 @@ mod integration_tests {
         drop(dir);
     }
 
+    /// A zero-match `tpu_find` result must produce content that is exactly
+    /// empty -- no spurious blank line before the status trailer. Pins the
+    /// first `!` of `if !content.is_empty() && !content.ends_with('\n')`
+    /// against a `delete !` mutation, which would wrongly push a `'\n'` onto
+    /// otherwise-empty content.
+    #[test]
+    fn find_no_match_produces_no_spurious_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("no_match.txt");
+        fs::write(&f, "alpha\nbeta\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "zzz_never_matches_zzz",
+            "path": f.to_str().unwrap(),
+        });
+        let out = call("tpu_find", &args).expect("tpu_find must succeed on no match");
+        let header = invocation_header("tpu_find", &args);
+        assert_eq!(
+            out,
+            format!("{header}\n{{\"status\":\"success\"}}"),
+            "no-match output must have no extra content or blank line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// A `tpu_find` result WITH matches must not gain an extra blank line
+    /// between the (already newline-terminated) match content and the
+    /// status trailer. Pins the second `!` of the same guard (`&&`
+    /// mutated so it always evaluates against `content.ends_with('\n')`
+    /// directly) and the `&&`-to-`||` mutation, both of which would wrongly
+    /// push a second `'\n'` since match content already ends with one.
+    #[test]
+    fn find_with_match_produces_no_extra_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("has_match.txt");
+        fs::write(&f, "alpha fox\nbeta\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "fox",
+            "path": f.to_str().unwrap(),
+        });
+        let out = call("tpu_find", &args).expect("tpu_find must succeed");
+        let lines: Vec<&str> = out.lines().collect();
+        assert!(
+            !lines.iter().any(|l| l.trim().is_empty()),
+            "matched output must have no spurious blank line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `on_error:warn` against an inaccessible absolute path must surface a
+    /// `warnings` field in the response (default `ProgressDetail::EachFile`).
+    /// Pins `if !warnings_json.is_empty()` against a `delete !` mutation,
+    /// which would wrongly omit the field even though there are warnings.
+    #[test]
+    fn find_walk_warning_appears_in_each_file_progress_detail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("good.txt");
+        fs::write(&good, "anything here\n").unwrap();
+        let missing = dir.path().join("does_not_exist.txt");
+
+        let args = serde_json::json!({
+            "pattern": "anything",
+            "paths": [good.to_str().unwrap(), missing.to_str().unwrap()],
+            "on_error": "warn",
+        });
+        let out = call("tpu_find", &args).expect("on_error:warn must not itself error");
+        let v = last_json_line(&out);
+        assert!(
+            v.get("warnings").is_some(),
+            "expected a warnings field for an inaccessible path; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// The same inaccessible-path scenario under `ProgressDetail::Summary`
+    /// must collapse the warning(s) into a single summary message. Pins `n
+    /// > 0` (in the `Summary` arm) against a `==`/`<` mutation, which would
+    /// wrongly omit the summary message even though `n == 1`.
+    #[test]
+    fn find_walk_warning_summarized_under_summary_progress_detail() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let good = dir.path().join("good.txt");
+        fs::write(&good, "anything here\n").unwrap();
+        let missing = dir.path().join("does_not_exist.txt");
+
+        let args = serde_json::json!({
+            "pattern": "anything",
+            "paths": [good.to_str().unwrap(), missing.to_str().unwrap()],
+            "on_error": "warn",
+        });
+        let config = ServerConfig {
+            verify_delay_ms: 0,
+            trace: false,
+            default_on_error: tpu::cmd::copy::OnError::Warn,
+            progress_detail: ProgressDetail::Summary,
+            io_worker_enabled: false,
+            eol_normalize: false,
+        };
+        let tr = super::call("tpu_find", &args, &config).expect("call must not itself error");
+        assert!(!tr.is_error, "got: {}", tr.text);
+        let v = last_json_line(&tr.text);
+        let warnings = v["warnings"].as_array().expect("warnings must be an array");
+        assert_eq!(warnings.len(), 1, "got: {:?}", tr.text);
+        assert!(
+            warnings[0].as_str().unwrap().contains("path(s) skipped"),
+            "expected a summarized skip message; got: {:?}",
+            tr.text
+        );
+
+        drop(dir);
+    }
+
+    /// A clean `tpu_find` (no walk warnings at all) under
+    /// `ProgressDetail::Summary` must not report a summary message. Pins
+    /// the same `n > 0` against a `>=` mutation, which would wrongly emit a
+    /// summary message for `n == 0`.
+    #[test]
+    fn find_no_warnings_under_summary_progress_detail_omits_message() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("clean.txt");
+        fs::write(&f, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "pattern": "alpha",
+            "path": f.to_str().unwrap(),
+        });
+        let config = ServerConfig {
+            verify_delay_ms: 0,
+            trace: false,
+            default_on_error: tpu::cmd::copy::OnError::Warn,
+            progress_detail: ProgressDetail::Summary,
+            io_worker_enabled: false,
+            eol_normalize: false,
+        };
+        let tr = super::call("tpu_find", &args, &config).expect("call must not itself error");
+        assert!(!tr.is_error, "got: {}", tr.text);
+        let v = last_json_line(&tr.text);
+        assert!(
+            v.get("warnings").is_none(),
+            "expected no warnings field with zero skipped paths; got: {:?}",
+            tr.text
+        );
+
+        drop(dir);
+    }
+
+    /// A recursive copy where the destination for one subdirectory is
+    /// blocked by a pre-existing plain file (so `fs::create_dir_all` fails
+    /// for that one entry, producing exactly one `shell.warn()` call) must
+    /// surface a clean, non-corrupted warning message in `log` under
+    /// `ProgressDetail::EachFile`. Pins `SharedWriter::write` against
+    /// returning the wrong byte count: `Ok(1)` would make `write_all`'s
+    /// retry loop re-append overlapping trailing slices of the message
+    /// (since `extend_from_slice` always appends the *entire* slice it's
+    /// given, regardless of the claimed count), corrupting the buffered
+    /// text into a garbled, duplicated mess -- e.g. a clean "abc" would
+    /// become "abcbcc" once the retry loop re-appends shrinking suffixes.
+    /// Also pins `.filter(|l| !l.is_empty())` against a `delete !` mutation
+    /// (which would invert the filter to keep only empty lines, discarding
+    /// every real warning message) by asserting the log is non-empty.
+    #[test]
+    fn copy_file_warning_log_is_not_corrupted_by_writer_byte_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src_dir = dir.path().join("src");
+        let sub = src_dir.join("subdir");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("a.txt"), b"hello").unwrap();
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir(&dest_dir).unwrap();
+        // Block the "subdir" destination with a plain file, so walking into
+        // it triggers exactly one `fs::create_dir_all` failure -> one
+        // `shell.warn()` call.
+        fs::write(dest_dir.join("subdir"), b"blocking file").unwrap();
+
+        let args = serde_json::json!({
+            "source": src_dir.to_str().unwrap(),
+            "dest": dest_dir.to_str().unwrap(),
+            "recursive": true,
+            "on_error": "warn",
+        });
+        let out =
+            call("tpu_copy_file", &args).expect("tpu_copy_file must succeed with on_error:warn");
+        let v = ndjson_result_line(&out);
+        let log = v["log"].as_array().expect("expected a non-empty log array");
+        assert!(
+            !log.is_empty(),
+            "expected at least one warning about the blocked mkdir; got: {out:?}"
+        );
+        for entry in log {
+            let s = entry.as_str().unwrap_or_default();
+            assert!(!s.is_empty(), "log entries must not be empty; got: {out:?}");
+            // A corrupted, duplicated-suffix message (as `Ok(1)` would
+            // cause) repeats an overlapping tail of itself; a clean
+            // message emitted in one shot never does. Check for the
+            // simplest possible symptom: the message's own last 4 bytes
+            // appearing again earlier in the string.
+            if s.len() >= 8 {
+                let tail = &s[s.len() - 4..];
+                assert!(
+                    !s[..s.len() - 4].contains(tail),
+                    "log entry looks corrupted (repeated tail): {s:?}"
+                );
+            }
+        }
+
+        drop(dir);
+    }
+
     /// NL-IT-1: `tpu_write_file` normalizes CRLF in content to LF before writing.
     ///
     /// Write a new file with CRLF-containing content.  The written bytes must
@@ -5510,6 +5920,82 @@ mod integration_tests {
         drop(dir);
     }
 
+    /// `tpu_edit_file` with `diff:true` (text mode, a real change) must show
+    /// the diff. Pins `diff && !diff_buf.is_empty()` against a `delete !`
+    /// mutation (which would wrongly hide the diff whenever there is one).
+    /// The companion `diff && !binary` guard (gating whether `diff_out` is
+    /// captured at all) is confirmed equivalent against a `&&`-to-`||`
+    /// mutation: in binary mode `cmd::edit::run` unconditionally discards
+    /// `diff_out` (`let _ = diff_out;`), so capturing it needlessly has no
+    /// effect; in text mode the mutation would make `diff_out` `Some` even
+    /// when `diff:false`, but this same outer `diff && !diff_buf.is_empty()`
+    /// check re-gates on the original `diff` flag directly, so the needless
+    /// capture is never read regardless.
+    #[test]
+    fn edit_file_diff_true_shows_diff_on_real_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("edit_diff.txt");
+        fs::write(&f, "first\nsecond\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [
+                { "op": "splice", "range": "1-1", "data": "changed\n" }
+            ],
+            "diff": true,
+        });
+        let out = call("tpu_edit_file", &args).expect("tpu_edit_file must succeed");
+        assert!(
+            out.contains("@@"),
+            "diff:true must show a unified diff on a real change; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `tpu_edit_file` with `diff:true` on a *textually no-op* splice (the
+    /// replacement data is byte-identical to what it replaces) must not show
+    /// an empty diff block. Pins the outer `diff && !diff_buf.is_empty()`
+    /// against a `&&`-to-`||` mutation from the opposite direction of the
+    /// test above: edit ops are unconditional (no match/no-match semantics
+    /// like replace_in_file), so a splice whose `data` equals the original
+    /// line content still "succeeds" but produces byte-identical output --
+    /// `diff_buf` ends up completely empty despite `diff:true`. The mutated
+    /// `||` evaluates to `true` from `diff` alone, wrongly enters the
+    /// show-diff branch with an empty `diff_text`, and prints a spurious
+    /// blank line + separator before the status line.
+    #[test]
+    fn edit_file_diff_true_on_textually_noop_splice_has_no_spurious_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("edit_diff_noop.txt");
+        fs::write(&f, "line1\nline2\nline3\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [
+                { "op": "splice", "range": "2-2", "data": "line2\n" }
+            ],
+            "diff": true,
+        });
+        let out = call("tpu_edit_file", &args).expect("tpu_edit_file must succeed");
+        let header = invocation_header("tpu_edit_file", &args);
+        let status_line = out
+            .strip_prefix(&format!("{header}\n"))
+            .expect("output must start with the invocation header");
+        assert!(
+            !status_line.starts_with('\n'),
+            "a textually no-op splice with diff:true must not show an empty diff \
+             block; got: {out:?}"
+        );
+        assert_eq!(
+            status_line.lines().count(),
+            1,
+            "expected exactly one status line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
     /// NL-IT-7: `tpu_edit_file` insert normalizes CRLF in inserted data.
     #[test]
     fn nl_it_7_edit_insert_normalizes_crlf() {
@@ -5663,6 +6149,33 @@ mod integration_tests {
 
         let written = fs::read_to_string(&f).unwrap();
         assert_eq!(written, format!("existing\n{intended}"));
+
+        drop(dir);
+    }
+
+    /// `tpu_append_file` with `diff:true` on a real (non-empty) append must
+    /// report `changed:true` and show the diff. Pins `let changed =
+    /// !diff_buf.is_empty()` against a `delete !` mutation, which would
+    /// invert the flag: `changed:false` and no diff shown despite content
+    /// actually being appended.
+    #[test]
+    fn append_file_diff_true_reports_changed_on_real_append() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("append_diff.txt");
+        fs::write(&f, "existing\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "more\n",
+            "diff": true,
+        });
+        let out = call("tpu_append_file", &args).expect("tpu_append_file must succeed");
+        let v = last_json_line(&out);
+        assert_eq!(v["changed"], true, "got: {out:?}");
+        assert!(
+            out.contains("@@"),
+            "diff must be shown for a real append; got: {out:?}"
+        );
 
         drop(dir);
     }
@@ -5927,7 +6440,182 @@ mod integration_tests {
         drop(dir);
     }
 
-    /// ER-IT-5: a single-line replacement that is itself very long (e.g. a
+    /// `diff:true` must show the *real* unified diff (with removed "-" lines
+    /// from the old text), not the cheap changed-region echo (which only
+    /// ever shows added "+" lines, since old text isn't retained). Both
+    /// happen to contain "@@" hunk headers, so `out.contains("@@")` alone
+    /// (as in ER-IT-4) cannot distinguish them. Pins two mutants that both
+    /// produce the same symptom (silently falling back to the
+    /// changed-region echo despite `diff:true`): `diff || dry_run`
+    /// (the `diff_out` capture guard) against a `&&` mutation, and `diff &&
+    /// !diff_buf.is_empty()` (the echo-source guard) against a `delete !`
+    /// mutation.
+    #[test]
+    fn replace_diff_true_shows_removed_lines_not_just_changed_region_echo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("diff_removed_lines.txt");
+        fs::write(&f, "hello world\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "world",
+            "replacement": "there",
+            "diff": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+
+        assert!(
+            out.lines().any(|l| l.starts_with("-hello world")),
+            "diff:true must show the removed old line; the changed-region echo \
+             never shows old text, only the real unified diff does; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `diff:true` on a *textually no-op* replace (pattern and replacement
+    /// are identical, e.g. `pattern:"foo", replacement:"foo"`) must still
+    /// show the changed-region echo, not silently suppress it. Pins `diff &&
+    /// !diff_buf.is_empty()` against an `&&`-to-`||` mutation from the
+    /// opposite direction of the test above: here `diff_buf` (the whole-file
+    /// unified diff, built by comparing old/new *file content*) ends up
+    /// completely empty because the file's bytes truly don't change, while
+    /// `regions` (built per-*match*, independent of whether the replacement
+    /// text differs from what it replaced) is non-empty because the pattern
+    /// still matched. So the correct branch is `render_changed_regions(&regions)`
+    /// (non-empty, shows the match). The mutated `||` evaluates to `true`
+    /// from `diff` alone, wrongly selects the empty `diff_buf` as
+    /// `echo_text`, and the subsequent `echo_text.is_empty()` check then
+    /// swallows the echo entirely.
+    #[test]
+    fn replace_diff_true_on_textually_noop_match_still_shows_changed_region_echo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("diff_noop_match.txt");
+        fs::write(&f, "foo bar foo\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "foo",
+            "replacement": "foo",
+            "diff": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("tpu_replace_in_file must succeed");
+        let header = invocation_header("tpu_replace_in_file", &args);
+        let body = out
+            .strip_prefix(&format!("{header}\n"))
+            .expect("output must start with the invocation header");
+        assert!(
+            !body.starts_with('{'),
+            "a textually no-op match must still show the changed-region echo, \
+             not jump straight to the status line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `count:true` must not wait on the cross-process write lock: it never
+    /// modifies the file, so acquiring the lock is both unnecessary and
+    /// (when another process holds it) an up-to-5-second wait for nothing.
+    /// Pins `!count && !dry_run` against a `delete !` mutation on the first
+    /// operand (`count && !dry_run`, which for `count:true, dry_run:false`
+    /// wrongly evaluates to `true`) and against `&&`-to-`||` (which is also
+    /// wrongly `true` here).
+    #[test]
+    fn replace_count_only_skips_write_lock_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("locked_count.txt");
+        fs::write(&f, "hello world\n").unwrap();
+        let _holder = tpu::acquire_write_lock(&f).expect("must acquire lock for the test");
+
+        let start = std::time::Instant::now();
+        let out = call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "world",
+                "replacement": "there",
+                "count": true,
+            }),
+        )
+        .expect("count:true must succeed even while the write lock is held");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "count:true must not wait on the write lock; took {elapsed:?}"
+        );
+        let v = last_json_line(&out);
+        assert_eq!(v["count"], 1, "got: {out:?}");
+
+        drop(dir);
+    }
+
+    /// `dry_run:true` must likewise not wait on the write lock. Pins `!count
+    /// && !dry_run` against a `delete !` mutation on the *second* operand
+    /// (`!count && dry_run`, which for `count:false, dry_run:true` wrongly
+    /// evaluates to `true`) -- the complementary case to the `count:true`
+    /// test above, needed because that scenario alone cannot distinguish
+    /// this specific mutation (both evaluate to `false`/fast there).
+    #[test]
+    fn replace_dry_run_only_skips_write_lock_wait() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("locked_dry_run.txt");
+        fs::write(&f, "hello world\n").unwrap();
+        let _holder = tpu::acquire_write_lock(&f).expect("must acquire lock for the test");
+
+        let start = std::time::Instant::now();
+        call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "world",
+                "replacement": "there",
+                "dry_run": true,
+            }),
+        )
+        .expect("dry_run:true must succeed even while the write lock is held");
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "dry_run:true must not wait on the write lock; took {elapsed:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// A real write (`n > 0`, no `line_ending_override`) must clean up a
+    /// stray pre-existing `.bak` file. Pins `wrote = n > 0 ||
+    /// le_override.is_some()` against both a `>`-to-`<` mutation and an
+    /// `||`-to-`&&` mutation -- either wrongly computes `wrote == false` for
+    /// this exact input (`n == 1`, `le_override == None`), skipping the
+    /// cleanup.
+    #[test]
+    fn replace_real_write_cleans_up_stray_bak_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("cleanup.txt");
+        fs::write(&f, "hello world\n").unwrap();
+        let bak = f.with_extension("txt.bak");
+        fs::write(&bak, "stale backup").unwrap();
+
+        call(
+            "tpu_replace_in_file",
+            &serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "pattern": "world",
+                "replacement": "there",
+            }),
+        )
+        .expect("tpu_replace_in_file must succeed");
+
+        assert!(
+            !bak.exists(),
+            "a real write must clean up a pre-existing stray .bak file"
+        );
+
+        drop(dir);
+    }
+
     /// minified JSON blob) is truncated with a marker in the default echo,
     /// even though `changed_lines` (2: one old line + one new line) is well
     /// under `echo_max_lines` -- the line-count gate alone can't bound an
@@ -6381,6 +7069,125 @@ mod integration_tests {
         drop(dir);
     }
 
+    /// `tpu_write_file` with `diff:true` on a real content change must show
+    /// the diff. Pins `if diff && !diff_buf.is_empty()` against a `delete !`
+    /// mutation (which would wrongly hide the diff whenever there is one).
+    #[test]
+    fn write_file_diff_true_shows_diff_on_real_change() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("diff_change.txt");
+        fs::write(&f, "old content\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "new content\n",
+            "diff": true,
+        });
+        let out = call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+        assert!(
+            out.contains("@@"),
+            "diff:true must show a unified diff on a real change; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `tpu_write_file` without `diff` must produce exactly `"{header}\n
+    /// {status_line}"` -- no extra blank line. Pins the same `if diff &&
+    /// !diff_buf.is_empty()` guard against a `&&`-to-`||` mutation: since
+    /// `diff_out` is `None` whenever `diff` is falsy, `diff_buf` stays empty
+    /// regardless, so `||` would wrongly enter the "show diff" branch and
+    /// insert a spurious blank line (`diff_separator("")` returns `"\n"`).
+    #[test]
+    fn write_file_without_diff_has_no_spurious_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("no_diff.txt");
+        fs::write(&f, "old content\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "new content\n",
+        });
+        let out = call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+        let header = invocation_header("tpu_write_file", &args);
+        let status_line = out
+            .strip_prefix(&format!("{header}\n"))
+            .expect("output must start with the invocation header");
+        assert!(
+            !status_line.starts_with('\n'),
+            "no-diff output must not have a spurious blank line; got: {out:?}"
+        );
+        assert_eq!(
+            status_line.lines().count(),
+            1,
+            "expected exactly one status line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// `tpu_write_file` with `diff:true` on a write that produces *no actual
+    /// change* (content identical to what's already on disk) must not show
+    /// an empty diff block. Pins the same `if diff && !diff_buf.is_empty()`
+    /// guard against a `&&`-to-`||` mutation from the opposite direction:
+    /// when the write is a genuine no-op, `tpu::cmd::write::run`'s
+    /// `similar`-based unified diff produces a completely empty `diff_buf`
+    /// even though `diff:true` was requested (proven directly against
+    /// `emit_text_diff` by `write_text_diff_no_change_is_empty` in
+    /// `crates/tpu/src/cmd/write.rs`) -- so `diff || !diff_buf.is_empty()`
+    /// (mutated) evaluates to `true` purely from `diff` alone and wrongly
+    /// enters the "show diff" branch with an empty `diff_text`, producing a
+    /// spurious blank line + separator before the status line.
+    #[test]
+    fn write_file_diff_true_on_no_op_write_has_no_spurious_blank_line() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("diff_no_change.txt");
+        fs::write(&f, "same content\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "same content\n",
+            "diff": true,
+        });
+        let out = call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+        let header = invocation_header("tpu_write_file", &args);
+        let status_line = out
+            .strip_prefix(&format!("{header}\n"))
+            .expect("output must start with the invocation header");
+        assert!(
+            !status_line.starts_with('\n'),
+            "a no-op write with diff:true must not show an empty diff block; got: {out:?}"
+        );
+        assert_eq!(
+            status_line.lines().count(),
+            1,
+            "expected exactly one status line; got: {out:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// An explicit `line_ending:"crlf"` argument must actually be honoured.
+    /// Pins `eol_write_override -> Ok(None)` against a whole-function-replace
+    /// mutation, which would silently drop the override and fall back to
+    /// the file's default (LF for a new file).
+    #[test]
+    fn write_file_explicit_line_ending_override_is_honoured() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("crlf_override.txt");
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "a\nb\n",
+            "line_ending": "crlf",
+        });
+        call("tpu_write_file", &args).expect("tpu_write_file must succeed");
+        let bytes = fs::read(&f).unwrap();
+        assert_eq!(bytes, b"a\r\nb\r\n", "line_ending:crlf must be honoured");
+
+        drop(dir);
+    }
+
     /// WV-IT-2: `tpu_replace_in_file` response includes mtime and size.
     #[test]
     fn wv_it_2_replace_response_contains_stamp() {
@@ -6512,6 +7319,63 @@ mod integration_tests {
         drop(dir);
     }
 
+    // -- call_render_file -------------------------------------------------------
+
+    /// A `vars` key with an invalid character (not alphanumeric/`_`/`-`)
+    /// must be rejected, not silently accepted -- even when the template
+    /// never references it. Pins `k.is_empty() || !k.chars().all(...)`
+    /// against a `&&` mutation: since the key here is non-empty, `&&`
+    /// would make the whole guard `false` regardless of the
+    /// character-validity check, silently accepting the bad key.
+    ///
+    /// The template deliberately does *not* contain `{{BAD KEY}}`: if it
+    /// did, `render_str`'s own independent token-name validation (which
+    /// rejects a `{{...}}` placeholder containing a space) would raise an
+    /// unrelated "invalid placeholder" error regardless of whether *this*
+    /// vars-key guard ran at all, masking the mutation (both the correct
+    /// and the mutated code would return an error whose message happens to
+    /// also contain the substring "may only contain"). By using an
+    /// unreferenced bad key with a template that has no placeholders, the
+    /// *only* way an error can occur is via this vars-key guard, and the
+    /// mutated version reports success instead.
+    #[test]
+    fn render_file_invalid_vars_key_character_is_rejected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out.txt");
+
+        let args = serde_json::json!({
+            "template": "static content, no placeholders",
+            "output": out.to_str().unwrap(),
+            "vars": { "BAD KEY": "value" },
+        });
+        let err = call("tpu_render_file", &args)
+            .expect_err("a vars key containing a space must be rejected even if unused");
+        assert!(err.to_string().contains("may only contain"), "got: {err}");
+    }
+
+    /// A `vars` key containing an underscore or a dash must be accepted.
+    /// Pins the three mutants in `c.is_ascii_alphanumeric() || c == '_' ||
+    /// c == '-'`: either `==` mutated to `!=` (wrongly rejecting that
+    /// specific character) or the joining `||` mutated to `&&` (which,
+    /// since a single char can never be both `'_'` and `'-'` at once,
+    /// would reject *both* characters) would wrongly reject one of these
+    /// two keys.
+    #[test]
+    fn render_file_vars_key_with_underscore_and_dash_accepted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let out = dir.path().join("out.txt");
+
+        let args = serde_json::json!({
+            "template": "{{my_var}}-{{my-var}}",
+            "output": out.to_str().unwrap(),
+            "vars": { "my_var": "A", "my-var": "B" },
+        });
+        call("tpu_render_file", &args).expect("underscore/dash keys must be accepted");
+        assert_eq!(fs::read_to_string(&out).unwrap(), "A-B");
+
+        drop(dir);
+    }
+
     // -- call_count_file -------------------------------------------------------
 
     /// CF-IT-1: `tpu_count_file` with no metric flags must return all four
@@ -6610,6 +7474,114 @@ mod integration_tests {
             result["patterns"]["lines"].as_u64().unwrap(),
             1,
             "pattern matching 'two' with label 'lines' must be in patterns sub-object; got: {result:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// A pattern labeled with a standard metric name that was *not*
+    /// requested (only `lines:true` was passed) must route to
+    /// `patterns`, not the top level -- proving that metric was correctly
+    /// excluded from `standard_metric_names`. Pins the *first* `||` in
+    /// `any_standard = lines || words || chars || bytes` against a `&&`
+    /// mutation. Since `&&` binds tighter than `||` in Rust, mutating just
+    /// the first operator gives `(lines && words) || chars || bytes` --
+    /// with only `lines` true, that's `false || false || false = false`,
+    /// wrongly excluding "chars" (and every other standard name) from
+    /// `standard_metric_names`, which pulls the colliding "chars"-labeled
+    /// pattern up to the top level. (The other two `||` operators need
+    /// separate tests below: because `&&` binds tighter, mutating either
+    /// of *them* only tightens an *inner* pair not including `lines`, so
+    /// `lines || (something && something)` still evaluates to `true`
+    /// either way and this scenario can't distinguish them.)
+    #[test]
+    fn count_file_only_lines_requested_excludes_other_standard_names_from_routing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_collision2.txt");
+        fs::write(&f, "one\ntwo\nthree\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "lines": true,
+            "patterns": [{ "pattern": "two", "label": "chars" }],
+        });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+
+        let result = ndjson_result_line(&out);
+        assert!(
+            result.get("chars").is_none(),
+            "'chars' was not requested and must not appear at the top level; got: {result:?}"
+        );
+        assert_eq!(
+            result["patterns"]["chars"].as_u64().unwrap(),
+            1,
+            "the colliding 'chars'-labeled pattern must be routed to patterns; got: {result:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// Same idea as the test above, but with only `words:true`, pinning the
+    /// *second* `||` (between `words` and `chars`). Mutating it gives
+    /// `lines || (words && chars) || bytes`; with `words:true, chars:false`,
+    /// that inner `&&` is `false`, so the whole expression collapses to
+    /// `false || false || false = false`, wrongly excluding "bytes" (used
+    /// here as the colliding label) from `standard_metric_names`.
+    #[test]
+    fn count_file_only_words_requested_excludes_other_standard_names_from_routing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_collision3.txt");
+        fs::write(&f, "one two three\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "words": true,
+            "patterns": [{ "pattern": "two", "label": "bytes" }],
+        });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+
+        let result = ndjson_result_line(&out);
+        assert!(
+            result.get("bytes").is_none(),
+            "'bytes' was not requested and must not appear at the top level; got: {result:?}"
+        );
+        assert_eq!(
+            result["patterns"]["bytes"].as_u64().unwrap(),
+            1,
+            "the colliding 'bytes'-labeled pattern must be routed to patterns; got: {result:?}"
+        );
+
+        drop(dir);
+    }
+
+    /// Same idea again, with only `chars:true`, pinning the *third* `||`
+    /// (between `chars` and `bytes`). Mutating it gives `lines || words ||
+    /// (chars && bytes)`; with `chars:true, bytes:false`, that inner `&&`
+    /// is `false`, collapsing the whole expression to `false`, wrongly
+    /// excluding "lines" (used here as the colliding label) from
+    /// `standard_metric_names`.
+    #[test]
+    fn count_file_only_chars_requested_excludes_other_standard_names_from_routing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("count_collision4.txt");
+        fs::write(&f, "one\ntwo\nthree\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "chars": true,
+            "patterns": [{ "pattern": "two", "label": "lines" }],
+        });
+        let out = call("tpu_count_file", &args).expect("tpu_count_file must succeed");
+
+        let result = ndjson_result_line(&out);
+        assert!(
+            result.get("lines").is_none(),
+            "'lines' was not requested and must not appear at the top level; got: {result:?}"
+        );
+        assert_eq!(
+            result["patterns"]["lines"].as_u64().unwrap(),
+            1,
+            "the colliding 'lines'-labeled pattern must be routed to patterns; got: {result:?}"
         );
 
         drop(dir);
