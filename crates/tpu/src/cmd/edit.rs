@@ -259,6 +259,10 @@ fn run_line(
     };
 
     let mut patches: Vec<Patch> = Vec::with_capacity(ops.len());
+    // EOF appends are applied after all coordinate-preserving patches (in op
+    // order) so their terminator decision sees the real final-line state — an
+    // adjacent splice may already have terminated it.
+    let mut eof_appends: Vec<Vec<u8>> = Vec::new();
     for op in ops {
         match op {
             EditOp::Delete { start, end } => {
@@ -275,21 +279,30 @@ fn run_line(
                 // EOF_SENTINEL means append — insert at the very end of the file.
                 // Offset == total_lines + 1 is also a valid append ("insert before a
                 // hypothetical line just past the last one"), so treat it the same way.
-                let sb = if offset == EOF_SENTINEL || offset == total_lines + 1 {
-                    old_norm.len()
-                } else {
-                    let (start, _) = line_range_to_normalized_bytes(&old_norm, offset, offset)
-                        .map_err(|e| format!("--insert: {e}"))?;
-                    start
-                };
+                let is_eof_append = offset == EOF_SENTINEL || offset == total_lines + 1;
                 std::str::from_utf8(&data).map_err(|error| {
                     format!("edit: {}: edit data is not UTF-8: {error}", file.display())
                 })?;
-                patches.push(Patch {
-                    start: sb,
-                    end: sb,
-                    data,
-                });
+                // Normalize CLI-supplied CRLF/CR endings to LF so the terminator
+                // checks below match the LF-normalized buffer (the MCP layer already
+                // normalizes; the CLI passes raw argument bytes).
+                let mut data = crate::encoding::normalize_bytes_to_lf(&data);
+                // Line-mode insert introduces whole logical line(s): terminate the
+                // data so it can't weld onto the following line.
+                if !data.is_empty() && !data.ends_with(b"\n") {
+                    data.push(b'\n');
+                }
+                if is_eof_append {
+                    eof_appends.push(data);
+                } else {
+                    let (sb, _) = line_range_to_normalized_bytes(&old_norm, offset, offset)
+                        .map_err(|e| format!("--insert: {e}"))?;
+                    patches.push(Patch {
+                        start: sb,
+                        end: sb,
+                        data,
+                    });
+                }
             }
             EditOp::Splice { start, end, data } => {
                 let (sb, eb) = line_range_to_normalized_bytes(&old_norm, start, end)
@@ -297,6 +310,15 @@ fn run_line(
                 std::str::from_utf8(&data).map_err(|error| {
                     format!("edit: {}: edit data is not UTF-8: {error}", file.display())
                 })?;
+                let mut data = crate::encoding::normalize_bytes_to_lf(&data);
+                // Line-mode splice replaces whole logical lines. When the last line
+                // in range was newline-terminated, keep the replacement a complete
+                // line by terminating data the user left unterminated; when it was
+                // the unterminated final line, preserve that (add no terminator).
+                let replaced_terminated = eb > sb && old_norm[eb - 1] == b'\n';
+                if replaced_terminated && !data.is_empty() && !data.ends_with(b"\n") {
+                    data.push(b'\n');
+                }
                 patches.push(Patch {
                     start: sb,
                     end: eb,
@@ -319,13 +341,25 @@ fn run_line(
         }
     }
 
-    let op_count = patches.len();
+    let op_count = patches.len() + eof_appends.len();
 
     let mut new_norm = old_norm.clone();
     // Apply in reverse order so earlier coordinates retain their original
     // positions undisturbed.
     for p in patches.iter().rev() {
         new_norm.splice(p.start..p.end, p.data.iter().copied());
+    }
+    // Then the EOF appends, in op order. Each terminates an unterminated final
+    // line first — unless the current tail is already terminated (e.g. by an
+    // adjacent splice) or the data itself begins with a newline.
+    for data in &eof_appends {
+        if !data.is_empty()
+            && new_norm.last().is_some_and(|&b| b != b'\n')
+            && !data.starts_with(b"\n")
+        {
+            new_norm.push(b'\n');
+        }
+        new_norm.extend_from_slice(data);
     }
     let new_text = std::str::from_utf8(&new_norm)
         .map_err(|error| format!("edit: generated invalid UTF-8: {error}"))?;
@@ -2083,7 +2117,185 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(read_file_bytes(&p), b"aaa\nbbb\ncccddd\n");
+        // Appending after an unterminated final line terminates that line first,
+        // so `ccc` gains its `\n` rather than welding into `cccddd`.
+        assert_eq!(read_file_bytes(&p), b"aaa\nbbb\nccc\nddd\n");
+    }
+
+    /// Line-mode splice of an interior line with unterminated data must keep
+    /// the line structure: replacing line 2 with `X` yields the line `X`, not
+    /// a weld onto line 3.
+    #[test]
+    fn ed_line_splice_interior_unterminated_data_keeps_structure() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\nC\n");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 2,
+                end: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nX\nC\n");
+    }
+
+    /// Line-mode insert with unterminated data forms a whole new line rather
+    /// than welding onto the line it is inserted before.
+    #[test]
+    fn ed_line_insert_unterminated_data_forms_line() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\nC\n");
+        run_test(
+            &p,
+            vec![EditOp::Insert {
+                offset: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nX\nB\nC\n");
+    }
+
+    /// Splicing the terminated final line keeps its trailing newline.
+    #[test]
+    fn ed_line_splice_last_terminated_line_keeps_newline() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\nC\n");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 3,
+                end: 3,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nB\nX\n");
+    }
+
+    /// Splicing the *unterminated* final line must not introduce a trailing
+    /// newline (guards the fix from over-correcting).
+    #[test]
+    fn ed_line_splice_last_unterminated_line_stays_unterminated() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\nC");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 3,
+                end: 3,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nB\nX");
+    }
+
+    /// CRLF file — a line-mode splice with unterminated data forms a whole
+    /// line with the file's CRLF ending. Regression: the previously-welded
+    /// result was `A\r\nXC\r\n`; the terminator the fix supplies must
+    /// denormalize to `\r\n`, not a bare `\n`.
+    #[test]
+    fn ed_line_splice_crlf_unterminated_data_forms_line() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\r\nB\r\nC\r\n");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 2,
+                end: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\r\nX\r\nC\r\n");
+    }
+
+    /// Appending at EOF with data that already begins with a newline must not
+    /// add a second separator: the data's leading `\n` already terminates the
+    /// unterminated final line.
+    #[test]
+    fn ed_line_insert_eof_leading_newline_no_double_separator() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A");
+        run_test(
+            &p,
+            vec![EditOp::Insert {
+                offset: 2, // total_lines(1) + 1: append
+                data: b"\nX\n".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nX\n");
+    }
+
+    /// A splice that terminates the (previously unterminated) final line plus an
+    /// EOF append in the same edit must not produce a blank line between them:
+    /// the EOF separator is decided against the post-splice tail.
+    #[test]
+    fn ed_line_splice_final_line_then_eof_append_no_blank_line() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB");
+        run_test(
+            &p,
+            vec![
+                EditOp::Splice {
+                    start: 2,
+                    end: 2,
+                    data: b"X\n".to_vec(),
+                },
+                EditOp::Insert {
+                    offset: 3, // total_lines(2) + 1: append
+                    data: b"Y".to_vec(),
+                },
+            ],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nX\nY\n");
+    }
+
+    /// CR-terminated data from the CLI (which, unlike the MCP path, is not
+    /// pre-normalized) must be normalized to LF before terminator handling, so
+    /// no stray `\r` survives on an LF file.
+    #[test]
+    fn ed_line_insert_cr_terminated_cli_data_is_normalized() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\nC\n");
+        run_test(
+            &p,
+            vec![EditOp::Insert {
+                offset: 2,
+                data: b"X\r".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nX\nB\nC\n");
     }
 
     /// Two line-mode ops whose byte ranges are exactly adjacent (one op's
