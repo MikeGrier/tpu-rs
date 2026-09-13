@@ -275,7 +275,8 @@ fn run_line(
                 // EOF_SENTINEL means append — insert at the very end of the file.
                 // Offset == total_lines + 1 is also a valid append ("insert before a
                 // hypothetical line just past the last one"), so treat it the same way.
-                let sb = if offset == EOF_SENTINEL || offset == total_lines + 1 {
+                let is_eof_append = offset == EOF_SENTINEL || offset == total_lines + 1;
+                let sb = if is_eof_append {
                     old_norm.len()
                 } else {
                     let (start, _) = line_range_to_normalized_bytes(&old_norm, offset, offset)
@@ -285,6 +286,18 @@ fn run_line(
                 std::str::from_utf8(&data).map_err(|error| {
                     format!("edit: {}: edit data is not UTF-8: {error}", file.display())
                 })?;
+                // Line-mode insert introduces whole logical line(s): terminate the
+                // data so it can't weld onto the following line, and when appending
+                // after an unterminated final line, terminate that line first.
+                let mut data = data;
+                if !data.is_empty() {
+                    if !data.ends_with(b"\n") {
+                        data.push(b'\n');
+                    }
+                    if is_eof_append && old_norm.last().is_some_and(|&b| b != b'\n') {
+                        data.insert(0, b'\n');
+                    }
+                }
                 patches.push(Patch {
                     start: sb,
                     end: sb,
@@ -297,6 +310,15 @@ fn run_line(
                 std::str::from_utf8(&data).map_err(|error| {
                     format!("edit: {}: edit data is not UTF-8: {error}", file.display())
                 })?;
+                // Line-mode splice replaces whole logical lines. When the last line
+                // in range was newline-terminated, keep the replacement a complete
+                // line by terminating data the user left unterminated; when it was
+                // the unterminated final line, preserve that (add no terminator).
+                let mut data = data;
+                let replaced_terminated = eb > sb && old_norm[eb - 1] == b'\n';
+                if replaced_terminated && !data.is_empty() && !data.ends_with(b"\n") {
+                    data.push(b'\n');
+                }
                 patches.push(Patch {
                     start: sb,
                     end: eb,
@@ -2083,7 +2105,115 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(read_file_bytes(&p), b"aaa\nbbb\ncccddd\n");
+        // Appending after an unterminated final line terminates that line first,
+        // so `ccc` gains its `\n` rather than welding into `cccddd`.
+        assert_eq!(read_file_bytes(&p), b"aaa\nbbb\nccc\nddd\n");
+    }
+
+    /// Line-mode splice of an interior line with unterminated data must keep
+    /// the line structure: replacing line 2 with `X` yields the line `X`, not
+    /// a weld onto line 3.
+    #[test]
+    fn ed_line_splice_interior_unterminated_data_keeps_structure() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\nC\n");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 2,
+                end: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nX\nC\n");
+    }
+
+    /// Line-mode insert with unterminated data forms a whole new line rather
+    /// than welding onto the line it is inserted before.
+    #[test]
+    fn ed_line_insert_unterminated_data_forms_line() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\nC\n");
+        run_test(
+            &p,
+            vec![EditOp::Insert {
+                offset: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nX\nB\nC\n");
+    }
+
+    /// Splicing the terminated final line keeps its trailing newline.
+    #[test]
+    fn ed_line_splice_last_terminated_line_keeps_newline() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\nC\n");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 3,
+                end: 3,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nB\nX\n");
+    }
+
+    /// Splicing the *unterminated* final line must not introduce a trailing
+    /// newline (guards the fix from over-correcting).
+    #[test]
+    fn ed_line_splice_last_unterminated_line_stays_unterminated() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\nC");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 3,
+                end: 3,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\nB\nX");
+    }
+
+    /// CRLF file — a line-mode splice with unterminated data forms a whole
+    /// line with the file's CRLF ending. Regression: the previously-welded
+    /// result was `A\r\nXC\r\n`; the terminator the fix supplies must
+    /// denormalize to `\r\n`, not a bare `\n`.
+    #[test]
+    fn ed_line_splice_crlf_unterminated_data_forms_line() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\r\nB\r\nC\r\n");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 2,
+                end: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\r\nX\r\nC\r\n");
     }
 
     /// Two line-mode ops whose byte ranges are exactly adjacent (one op's
