@@ -1109,9 +1109,9 @@ dependencies = [
 
 [[package]]
 name = "harrier"
-version = "0.3.0"
+version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "020d7c1b198e3a0553a19d7a9dd1dd90c900952d76ebe6dcc8d23181fc4b8c1c"
+checksum = "9fbcc41f16b43e9bbf237fa01fe7d4238b7b61fff4f3744e3fbf22c148c4398e"
 dependencies = [
  "chardetng",
  "encoding_rs",
