@@ -40,10 +40,14 @@ pub const EOF_SENTINEL: usize = usize::MAX;
 
 /// A single targeted edit operation.
 ///
-/// All coordinates are expressed in **source byte offsets** in the original
-/// file (before any edits in this invocation are applied).  Line-mode callers
-/// must resolve 1-based line numbers to source byte ranges before constructing
-/// `EditOp` values.
+/// Coordinates are **mode-specific**, matching the two modes of [`run`]:
+/// - **Binary mode** — `start` / `end` / `offset` are 0-based **byte offsets**
+///   into the original file, and `run` applies them directly.
+/// - **Line mode** — `start` / `end` are 1-based inclusive **line numbers** and
+///   `offset` is the 1-based line to insert before; `run` (via `run_line`)
+///   resolves them to source byte spans internally with a harrier `LineEditor`.
+///
+/// [`EOF_SENTINEL`] is accepted in any position in either mode.
 ///
 /// **Changing the discriminant values or field layout of this enum is a
 /// breaking change.**
@@ -353,12 +357,17 @@ fn run_line(
             let editor2 = src2
                 .as_line_editor()
                 .map_err(|e| format!("edit: {}: {e}", file.display()))?;
-            let mut tail_terminated = editor2.is_trailing_terminated();
+            // Whether the running tail (the post-splice document, then each
+            // appended blob) ends in an unterminated line that a new appended
+            // line must be separated from. A document with no lines — an empty
+            // or BOM-only file — has no tail to separate from.
+            let mut tail_unterminated =
+                editor2.line_count() > 0 && !editor2.is_trailing_terminated();
             let mut blob: Vec<u8> = Vec::new();
             for data in &eof_appends {
                 // Separate an unterminated tail from the appended line, unless the
                 // data already begins with its own newline separator.
-                if !data.is_empty() && !tail_terminated && !data.starts_with(b"\n") {
+                if !data.is_empty() && tail_unterminated && !data.starts_with(b"\n") {
                     blob.extend_from_slice(&editor2.terminator(new_ending));
                 }
                 blob.extend_from_slice(
@@ -366,7 +375,7 @@ fn run_line(
                         .map_err(|e| format!("edit: {}: {e}", file.display()))?,
                 );
                 if !data.is_empty() {
-                    tail_terminated = data.ends_with(b"\n");
+                    tail_unterminated = !data.ends_with(b"\n");
                 }
             }
             let at = editor2.byte_len();
@@ -1876,6 +1885,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(read_file_bytes(&p), b"A\nX\n");
+    }
+
+    /// Appending to an empty (zero-line) file must not prefix a spurious
+    /// separator: there is no prior line to separate from, so the result is
+    /// `X\n`, not `\nX\n`.
+    #[test]
+    fn ed_line_insert_into_empty_file_no_leading_separator() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"");
+        run_test(
+            &p,
+            vec![EditOp::Insert {
+                offset: EOF_SENTINEL,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"X\n");
     }
 
     /// A splice that terminates the (previously unterminated) final line plus an
