@@ -731,9 +731,10 @@ In **line mode** (default), `RANGE` and `OFFSET` are **1-based line numbers**, m
 ### `EditOp` enum
 
 ```rust
-/// A single targeted edit operation.  All coordinates are expressed in the
-/// coordinate space appropriate to the mode (source byte offsets for binary
-/// mode; source byte offsets derived from line numbers for line mode).
+/// A single targeted edit operation.  Coordinates are mode-specific: 0-based
+/// byte offsets in binary mode, and 1-based line numbers in line mode (which
+/// `run_line` resolves to source byte spans internally via harrier's
+/// `LineEditor`).
 /// **Changing the wire representation of this type is a breaking change.**
 pub enum EditOp {
     /// Remove bytes in `[start, end)` from the source.  `end` is exclusive.
@@ -747,9 +748,10 @@ pub enum EditOp {
 }
 ```
 
-All coordinates in `EditOp` are **source byte offsets** in the original file, regardless
-of mode.  Line-mode callers must resolve line numbers to source byte ranges (via harrier)
-before constructing `EditOp` values.
+`EditOp` coordinates are **mode-specific**: 0-based **byte offsets** in binary mode, and
+1-based **line numbers** in line mode.  Line-mode ops carry line numbers directly — `run`
+(via `run_line`) resolves them to source byte spans internally with harrier's
+`LineEditor`, so callers do not pre-convert.
 
 ### `run()` function signature
 
@@ -760,18 +762,18 @@ before constructing `EditOp` values.
 ///
 /// - **Binary mode**: `ops` coordinates are 0-based byte offsets into the
 ///   original file content, identical to the `--bytes` selector space.
-/// - **Line mode**: `ops` coordinates are source byte offsets derived from
-///   1-based line numbers via `line_range_to_source_bytes`.  The caller
-///   (not this function) performs the conversion so that the composability
-///   invariant can be checked before any I/O occurs.
+/// - **Line mode**: `ops` coordinates are 1-based line numbers.  `run_line`
+///   resolves them to source byte spans internally with harrier's `LineEditor`
+///   (via `Source::as_line_editor`); only the edited lines are rewritten and
+///   every other line is preserved verbatim.
 ///
 /// # Composability invariant
 ///
 /// All `ops` coordinates MUST reference the **original file** as it exists
-/// before this call.  `run` resolves them all at once before applying any
-/// splice.  Ops are then applied in **reverse start-offset order** to a
-/// forked redwing branch so that each lower-address op still sees its
-/// original position undisturbed — the same strategy used by `tpu replace`.
+/// before this call.  Binary mode applies the splices in reverse start-offset
+/// order on a forked redwing branch; line mode batches them through harrier's
+/// `LineEditor::apply`, which likewise rejects overlaps and applies every
+/// splice against the original coordinates.
 ///
 /// Across successive `tpu edit` invocations the file is the already-written
 /// result of the previous call (sequential composition for the caller;
@@ -794,34 +796,25 @@ pub fn run(
     ops: Vec<EditOp>,
     binary: bool,
     line_ending_override: Option<LineEnding>,
-    validate: &[(ValidateSelector, &str)],
     diff_out: Option<&mut dyn Write>,
+    io_mode: IoMode,
+    policy: WritePolicy,
 ) -> Result<usize, Box<dyn std::error::Error>>;
 ```
 
 ### Line-number → source-byte-range mapping
 
-```rust
-/// Convert a 1-based inclusive line range `[start_line, end_line]` to the
-/// corresponding source byte range `[byte_start, byte_end)` using the harrier
-/// `Lines` view.
-///
-/// `byte_start` is the first byte of `start_line`'s content in the original
-/// source encoding.  `byte_end` is one past the last byte of `end_line`'s
-/// line terminator (i.e. the entire terminator is included in the range, so
-/// a delete of that range removes the terminator too).
-///
-/// Returns `Err` if either line number is 0 or greater than the number of
-/// lines in the file.
-pub fn line_range_to_source_bytes(
-    source: &Source,
-    start_line: usize,
-    end_line: usize,
-) -> Result<(usize, usize), Box<dyn std::error::Error>>;
-```
+Line-mode resolution lives in harrier's `LineEditor` (reached via
+`Source::as_line_editor`).  `run_line` calls `LineEditor::line_span` to map a
+1-based inclusive line range to a source-byte `LineSpan` that distinguishes the
+line **content** from its terminator, then applies verbatim source splices with
+`LineEditor::apply`.
 
-The implementation uses `source.lines()` and `view.offset_map.to_source()`, the same
-path used by `tpu replace` for regex match coordinate conversion.
+> **Removed public API (breaking).**  The former
+> `tpu::cmd::edit::line_range_to_source_bytes` /
+> `line_range_to_source_bytes_with_encoding` helpers were removed once line-mode
+> `edit` adopted harrier's `LineEditor`.  Resolve line ranges through
+> `Source::as_line_editor().line_span(..)` instead.
 
 ### Interaction with `--validate`
 
