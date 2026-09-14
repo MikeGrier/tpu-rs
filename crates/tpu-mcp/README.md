@@ -349,7 +349,8 @@ error rather than silently replaced with defaults.
   supplies a definite convention. An explicit `line_ending` takes precedence.
   Line-mode `tpu_edit_file` is the exception: it is targeted and preserves each
   untouched line's terminator, re-ending only the lines it edits (the required
-  BOM is still enforced).
+  BOM is still enforced). One special case: appending past an unterminated final
+  line first terminates that line, so the appended text cannot weld onto it.
 - **Report / repair** — `tpu_doctor` lists mismatches with an `eol_mismatch`
   object. `fix: "eol"` normalises endings only; `fix: "all"` also peels
   mojibake. Repairs are atomic, retain a `<file>.bak`, and support UTF-16.

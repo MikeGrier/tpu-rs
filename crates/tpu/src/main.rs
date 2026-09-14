@@ -456,7 +456,8 @@ enum Commands {
     /// mode applies the patches in reverse byte-offset order so no patch shifts
     /// another's position.  Text (line) mode resolves each range to a source
     /// span and batches them together, preserving every untouched line's
-    /// original terminator; only edited lines are re-terminated.
+    /// original terminator; only edited lines are re-terminated (except that
+    /// appending past an unterminated final line first terminates that line).
     Edit {
         /// File to edit.
         file: PathBuf,
