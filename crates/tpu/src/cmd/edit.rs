@@ -484,6 +484,9 @@ fn resolve_line_range(
     if start_line == 0 {
         return Err("edit: line numbers are 1-based (minimum 1)".into());
     }
+    // Ordering is checked on the raw bounds, before EOF_SENTINEL is resolved
+    // (matching `read --lines`): a `$`-anchored start with a smaller numeric end
+    // is an inverted range regardless of the file's line count.
     if start_line > end_line {
         return Err(format!("edit: start line {start_line} is after end line {end_line}").into());
     }
@@ -620,8 +623,11 @@ pub fn parse_line_range(s: &str) -> Result<(usize, usize), Box<dyn std::error::E
     if let Some((lo_s, hi_s)) = s.split_once('-') {
         let lo = parse_line_pos(lo_s).map_err(|e| format!("invalid range start in {s:?}: {e}"))?;
         let hi = parse_line_pos(hi_s).map_err(|e| format!("invalid range end in {s:?}: {e}"))?;
-        // Defer the ordering check to line-mode resolution so that
-        // EOF_SENTINEL is resolved before comparing.
+        // Only order-check plain numeric ranges here; a range that involves
+        // EOF_SENTINEL is left for line-count resolution to validate. Resolution
+        // compares the raw bounds *before* substituting the sentinel (matching
+        // `read --lines`), so a `$`-anchored start with a smaller numeric end is
+        // reported there as an inverted range.
         if lo != EOF_SENTINEL && hi != EOF_SENTINEL && lo > hi {
             return Err(format!("line range start {lo} is after end {hi}").into());
         }
