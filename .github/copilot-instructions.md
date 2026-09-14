@@ -86,6 +86,16 @@ differences.
   **verbatim**: backslashes are never collapsed, so no tpu tool needs
   pre-doubled escapes. (`tpu_replace_in_file` accepts an opt-in
   `expand_escapes: true` for callers that deliberately double-escape.)
+- **Line-mode `tpu_edit_file` edits are targeted** — an insert / delete /
+  splice at line numbers rewrites only the lines it touches. Every other
+  line is preserved byte-for-byte, including its original terminator and
+  encoding. Only the edited or inserted lines get a freshly synthesised
+  terminator, matching the file's detected convention (or an explicit
+  `line_ending`). Consequently a `line_ending` on `tpu_edit_file` re-ends
+  only the touched lines — it does **not** convert the whole file. To
+  normalise every line ending, rewrite the file with `tpu_write_file` or
+  run `tpu_replace_in_file` with a `line_ending` (both operate on the whole
+  file).
 - **A replace that matches nothing is an error** — `tpu_replace_in_file`
   returns `{"status":"error"}` when `pattern` matches zero times, and leaves
   the file completely untouched (mtime preserved, no `.bak`). This is

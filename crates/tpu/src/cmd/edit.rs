@@ -19,8 +19,8 @@
 //! [`WritePolicy::permissive`] / `--allow-mojibake` /
 //! `"allow_mojibake": true` to override.
 
-use harrier::{encoding::LineEnding, view::View};
-use std::{fs, io::Write, path::Path};
+use harrier::{encoding::LineEnding, line_edit::Splice};
+use std::{fs, io::Write, path::Path, sync::Arc};
 
 use crate::{
     IoMode,
@@ -65,10 +65,10 @@ pub enum EditOp {
 
 /// Execute a set of edit operations on `file`.
 ///
-/// Callers must resolve all `ops` coordinates to source byte offsets **before**
-/// calling this function.  For binary mode the CLI strings are 0-based byte
-/// offsets; for line mode the caller uses [`line_range_to_source_bytes`] to
-/// convert 1-based line numbers.
+/// For binary mode the CLI strings are 0-based byte offsets and the caller
+/// passes them through unchanged.  For line mode the ops carry 1-based line
+/// numbers, which `run_line` resolves to source byte spans internally via a
+/// harrier `LineEditor`.
 ///
 /// `--validate` pairs must be checked by the caller (via
 /// `cmd::validate::run_all`) before calling this function.
@@ -230,170 +230,176 @@ fn run_line(
         return Ok(0);
     }
 
-    let decoded = crate::read_text_file(file, io_mode)?;
-    let detected_ending = decoded.line_ending;
-    let file_encoding = decoded.encoding;
-    let had_bom = decoded.bom_len > 0;
-    let old_norm = decoded.text.into_bytes();
+    // Open the file in its native encoding and build a harrier LineEditor. All
+    // line resolution and splicing happens in *source* byte coordinates, so
+    // unedited lines are preserved verbatim (their original terminator and
+    // encoding); only edited regions are rewritten.
+    let branch = crate::open_as_branch(file, io_mode)?;
     let git_policy = crate::git::policy_for_path(file)?;
+    let source = crate::source_from_branch_with_policy(file, Arc::clone(&branch), &git_policy)?;
+    let file_encoding = source.encoding();
+    let detected_ending = source.line_ending();
+    let bom_len = source.bom_len();
+    let old_raw = redwing::materialize(&*branch)?;
+    let old_text = decode_source_to_lf(&old_raw, file_encoding, bom_len)
+        .map_err(|e| format!("edit: {}: {e}", file.display()))?;
+    let editor = source
+        .as_line_editor()
+        .map_err(|e| format!("edit: {}: {e}", file.display()))?;
+    let line_count = editor.line_count();
 
-    // Normalise all ops to UTF-8/LF byte ranges.
-    // Op start/end are 1-based line numbers at this stage.
-    struct Patch {
-        start: usize,
-        end: usize,
-        data: Vec<u8>,
-    }
+    // The terminator to synthesise for newly written / edited lines. Unedited
+    // lines keep their own source terminator; this only affects replacements,
+    // inserts, and appends. An explicit `--line-ending` wins; otherwise the
+    // file's detected convention is used.
+    let new_ending = line_ending_override.unwrap_or(detected_ending);
 
-    // Count lines from the normalised view so the Insert arm can allow
-    // offset == total_lines + 1 as a valid append position.
-    let total_lines = {
-        let b = &old_norm;
-        if b.is_empty() {
-            0
-        } else if b.last() == Some(&b'\n') {
-            b.iter().filter(|&&c| c == b'\n').count()
-        } else {
-            b.iter().filter(|&&c| c == b'\n').count() + 1
-        }
-    };
-
-    let mut patches: Vec<Patch> = Vec::with_capacity(ops.len());
-    // EOF appends are applied after all coordinate-preserving patches (in op
-    // order) so their terminator decision sees the real final-line state — an
-    // adjacent splice may already have terminated it.
+    let mut splices: Vec<Splice> = Vec::with_capacity(ops.len());
+    // EOF appends are folded in after all coordinate-preserving splices so their
+    // terminator/separator decision sees the real post-splice final-line state —
+    // an adjacent splice may already have terminated it. Stored as LF-normalised
+    // UTF-8 line text (already `\n`-terminated when non-empty).
     let mut eof_appends: Vec<Vec<u8>> = Vec::new();
     for op in ops {
         match op {
             EditOp::Delete { start, end } => {
-                let (sb, eb) = line_range_to_normalized_bytes(&old_norm, start, end)
+                let range = resolve_line_range(line_count, start, end)
                     .map_err(|e| format!("--delete: {e}"))?;
-                patches.push(Patch {
-                    start: sb,
-                    end: eb,
-                    data: vec![],
+                let span = editor
+                    .line_span(range)
+                    .map_err(|e| format!("edit: {}: {e}", file.display()))?;
+                splices.push(Splice {
+                    range: span.full,
+                    replacement: Vec::new(),
                 });
             }
             EditOp::Insert { offset, data } => {
-                // Insert before line `offset`: use the source-byte start of that line.
-                // EOF_SENTINEL means append — insert at the very end of the file.
-                // Offset == total_lines + 1 is also a valid append ("insert before a
-                // hypothetical line just past the last one"), so treat it the same way.
-                let is_eof_append = offset == EOF_SENTINEL || offset == total_lines + 1;
                 std::str::from_utf8(&data).map_err(|error| {
                     format!("edit: {}: edit data is not UTF-8: {error}", file.display())
                 })?;
-                // Normalize CLI-supplied CRLF/CR endings to LF so the terminator
-                // checks below match the LF-normalized buffer (the MCP layer already
-                // normalizes; the CLI passes raw argument bytes).
+                // EOF_SENTINEL and offset == line_count + 1 both mean "append
+                // after the last line".
+                let is_eof_append = offset == EOF_SENTINEL || offset == line_count + 1;
+                // Normalize CLI-supplied CRLF/CR endings to LF (the MCP layer
+                // already normalizes; the CLI passes raw argument bytes).
                 let mut data = crate::encoding::normalize_bytes_to_lf(&data);
-                // Line-mode insert introduces whole logical line(s): terminate the
-                // data so it can't weld onto the following line.
+                // A line-mode insert introduces whole logical line(s): terminate
+                // the data so it can't weld onto the following line.
                 if !data.is_empty() && !data.ends_with(b"\n") {
                     data.push(b'\n');
                 }
                 if is_eof_append {
                     eof_appends.push(data);
                 } else {
-                    let (sb, _) = line_range_to_normalized_bytes(&old_norm, offset, offset)
+                    let range = resolve_line_range(line_count, offset, offset)
                         .map_err(|e| format!("--insert: {e}"))?;
-                    patches.push(Patch {
-                        start: sb,
-                        end: sb,
-                        data,
+                    // Zero-width insertion point at the start of line `offset`.
+                    let span = editor
+                        .line_span(range.start..range.start)
+                        .map_err(|e| format!("edit: {}: {e}", file.display()))?;
+                    splices.push(Splice {
+                        range: span.content,
+                        replacement: encode_replacement(&data, file_encoding, new_ending)
+                            .map_err(|e| format!("edit: {}: {e}", file.display()))?,
                     });
                 }
             }
             EditOp::Splice { start, end, data } => {
-                let (sb, eb) = line_range_to_normalized_bytes(&old_norm, start, end)
-                    .map_err(|e| format!("--splice: {e}"))?;
                 std::str::from_utf8(&data).map_err(|error| {
                     format!("edit: {}: edit data is not UTF-8: {error}", file.display())
                 })?;
+                let range = resolve_line_range(line_count, start, end)
+                    .map_err(|e| format!("--splice: {e}"))?;
+                let span = editor
+                    .line_span(range)
+                    .map_err(|e| format!("edit: {}: {e}", file.display()))?;
                 let mut data = crate::encoding::normalize_bytes_to_lf(&data);
-                // Line-mode splice replaces whole logical lines. When the last line
-                // in range was newline-terminated, keep the replacement a complete
-                // line by terminating data the user left unterminated; when it was
-                // the unterminated final line, preserve that (add no terminator).
-                let replaced_terminated = eb > sb && old_norm[eb - 1] == b'\n';
-                if replaced_terminated && !data.is_empty() && !data.ends_with(b"\n") {
+                // Line-mode splice replaces whole logical lines (the `full` span
+                // includes the range's terminator). When the last replaced line
+                // was terminated, keep the replacement a complete line by
+                // terminating data the user left unterminated; when it was the
+                // unterminated final line, preserve that (add no terminator).
+                if span.terminated && !data.is_empty() && !data.ends_with(b"\n") {
                     data.push(b'\n');
                 }
-                patches.push(Patch {
-                    start: sb,
-                    end: eb,
-                    data,
+                splices.push(Splice {
+                    range: span.full,
+                    replacement: encode_replacement(&data, file_encoding, new_ending)
+                        .map_err(|e| format!("edit: {}: {e}", file.display()))?,
                 });
             }
         }
     }
 
-    // Ascending sort for overlap check.
-    patches.sort_unstable_by_key(|p| p.start);
+    let op_count = splices.len() + eof_appends.len();
 
-    for w in patches.windows(2) {
-        if w[0].end > w[1].start {
-            return Err(format!(
-                "edit: overlapping ranges [{}, {}) and [{}, {})",
-                w[0].start, w[0].end, w[1].start, w[1].end
-            )
-            .into());
+    // Phase 1: apply all coordinate-preserving splices atomically (harrier
+    // rejects overlaps). Phase 2: fold the EOF appends against the post-splice
+    // tail so the leading-separator decision sees any terminator an adjacent
+    // splice just added.
+    let final_branch = {
+        let phase1 = if splices.is_empty() {
+            Arc::clone(&branch)
+        } else {
+            editor
+                .apply(&splices)
+                .map_err(|e| format!("edit: {}: {e}", file.display()))?
+        };
+        if eof_appends.is_empty() {
+            phase1
+        } else {
+            let src2 =
+                crate::source_from_branch_with_policy(file, Arc::clone(&phase1), &git_policy)?;
+            let editor2 = src2
+                .as_line_editor()
+                .map_err(|e| format!("edit: {}: {e}", file.display()))?;
+            let mut tail_terminated = editor2.is_trailing_terminated();
+            let mut blob: Vec<u8> = Vec::new();
+            for data in &eof_appends {
+                // Separate an unterminated tail from the appended line, unless the
+                // data already begins with its own newline separator.
+                if !data.is_empty() && !tail_terminated && !data.starts_with(b"\n") {
+                    blob.extend_from_slice(&editor2.terminator(new_ending));
+                }
+                blob.extend_from_slice(
+                    &encode_replacement(data, file_encoding, new_ending)
+                        .map_err(|e| format!("edit: {}: {e}", file.display()))?,
+                );
+                if !data.is_empty() {
+                    tail_terminated = data.ends_with(b"\n");
+                }
+            }
+            let at = editor2.byte_len();
+            editor2
+                .apply(&[Splice {
+                    range: at..at,
+                    replacement: blob,
+                }])
+                .map_err(|e| format!("edit: {}: {e}", file.display()))?
         }
-    }
+    };
 
-    let op_count = patches.len() + eof_appends.len();
+    let out_bytes = redwing::materialize(&*final_branch)?;
+    let new_text = decode_source_to_lf(&out_bytes, file_encoding, bom_len)
+        .map_err(|e| format!("edit: {}: {e}", file.display()))?;
 
-    let mut new_norm = old_norm.clone();
-    // Apply in reverse order so earlier coordinates retain their original
-    // positions undisturbed.
-    for p in patches.iter().rev() {
-        new_norm.splice(p.start..p.end, p.data.iter().copied());
-    }
-    // Then the EOF appends, in op order. Each terminates an unterminated final
-    // line first — unless the current tail is already terminated (e.g. by an
-    // adjacent splice) or the data itself begins with a newline.
-    for data in &eof_appends {
-        if !data.is_empty()
-            && new_norm.last().is_some_and(|&b| b != b'\n')
-            && !data.starts_with(b"\n")
-        {
-            new_norm.push(b'\n');
-        }
-        new_norm.extend_from_slice(data);
-    }
-    let new_text = std::str::from_utf8(&new_norm)
-        .map_err(|error| format!("edit: generated invalid UTF-8: {error}"))?;
-    let line_ending = line_ending_override
-        .or_else(|| git_policy.line_ending_for_text(new_text))
-        .unwrap_or(detected_ending);
     if policy.reject_introduced_mojibake {
-        let old_text = std::str::from_utf8(&old_norm)?;
-        check_write_does_not_introduce_mojibake(old_text, new_text)
+        check_write_does_not_introduce_mojibake(&old_text, &new_text)
             .map_err(|e| format!("edit: {}: {e}", file.display()))?;
     }
 
-    let encoded = crate::encoding::encode_text_strict(new_text, file_encoding)
-        .map_err(|error| format!("edit: {}: {error}", file.display()))?;
-    let encoded = match line_ending {
-        LineEnding::Lf => encoded,
-        LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, file_encoding),
-        LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, file_encoding),
-    };
-    let mut out_bytes = encoded;
-    if git_policy.write_bom(had_bom) {
-        let bom = crate::encoding::bom_bytes_for(file_encoding);
-        let mut with_bom = Vec::with_capacity(bom.len() + out_bytes.len());
-        with_bom.extend_from_slice(bom);
-        with_bom.extend_from_slice(&out_bytes);
-        out_bytes = with_bom;
-    }
+    // Release every branch handle before file-system work — a memory-mapped
+    // file cannot be renamed while mapped on Windows.
+    drop(final_branch);
+    drop(editor);
+    drop(branch);
 
     // Atomic write via the shared temp→.bak→persist→restore helper.
     crate::atomic_write(file, &out_bytes)?;
 
     // Emit the unified text diff after a successful write.
     if let Some(out) = diff_out {
-        emit_unified_diff(file, &old_norm, &new_norm, out)?;
+        emit_unified_diff(file, old_text.as_bytes(), new_text.as_bytes(), out)?;
     }
 
     Ok(op_count)
@@ -419,198 +425,86 @@ fn emit_unified_diff(
     Ok(())
 }
 
-// ── Line-coordinate helper ──────────────────────────────────────────────────────
+// ── Line-coordinate helpers ─────────────────────────────────────────────────────
 
-fn line_range_to_normalized_bytes(
-    bytes: &[u8],
+/// Resolve a 1-based inclusive line range (with [`EOF_SENTINEL`] support) to a
+/// 0-based half-open range for [`harrier::line_edit::LineEditor::line_span`].
+///
+/// Produces tpu's canonical out-of-range / inverted-range error messages
+/// (without a mode prefix; callers add `--delete: ` etc.).
+fn resolve_line_range(
+    line_count: usize,
     start_line: usize,
     end_line: usize,
-) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+) -> Result<std::ops::Range<usize>, Box<dyn std::error::Error>> {
     if start_line == 0 {
         return Err("edit: line numbers are 1-based (minimum 1)".into());
     }
     if start_line > end_line {
         return Err(format!("edit: start line {start_line} is after end line {end_line}").into());
     }
-
-    let mut line_starts = vec![0];
-    for (i, &byte) in bytes.iter().enumerate() {
-        if byte == b'\n' {
-            line_starts.push(i + 1);
-        }
-    }
-    let total_lines = if bytes.is_empty() {
-        0
-    } else if bytes.last() == Some(&b'\n') {
-        line_starts.len() - 1
-    } else {
-        line_starts.len()
-    };
     let start_line = if start_line == EOF_SENTINEL {
-        total_lines
+        line_count
     } else {
         start_line
     };
     let end_line = if end_line == EOF_SENTINEL {
-        total_lines
+        line_count
     } else {
         end_line
     };
+    // A file with no content lines resolves EOF_SENTINEL to 0, which slips past
+    // the 1-based guard above (that ran before resolution). Report it as the
+    // out-of-range condition it is rather than underflowing below.
     if start_line == 0 || end_line == 0 {
-        return Err(format!("edit: line 1 is out of range (file has {total_lines} lines)").into());
+        return Err(format!("edit: line 1 is out of range (file has {line_count} lines)").into());
     }
-    if start_line > total_lines {
+    if start_line > line_count {
         return Err(format!(
-            "edit: line {start_line} is out of range (file has {total_lines} line{})",
-            if total_lines == 1 { "" } else { "s" }
+            "edit: line {start_line} is out of range (file has {line_count} line{})",
+            if line_count == 1 { "" } else { "s" }
         )
         .into());
     }
-    if end_line > total_lines {
+    if end_line > line_count {
         return Err(format!(
-            "edit: line {end_line} is out of range (file has {total_lines} line{})",
-            if total_lines == 1 { "" } else { "s" }
+            "edit: line {end_line} is out of range (file has {line_count} line{})",
+            if line_count == 1 { "" } else { "s" }
         )
         .into());
     }
-    let start = line_starts[start_line - 1];
-    let end = if end_line < line_starts.len() {
-        line_starts[end_line]
-    } else {
-        bytes.len()
-    };
-    Ok((start, end))
+    Ok((start_line - 1)..end_line)
 }
 
-/// Map a 1-based inclusive line range to source byte offsets `(start, end)`
-/// where `end` is exclusive.
-///
-/// `view` must be a `harrier::view::View` built from the full file range
-/// (or at least from the region that contains the requested lines).
-/// Lines are counted in the normalised (LF-only) byte sequence: each `\n`
-/// terminates a line, and a file that does not end with `\n` has a final
-/// line without terminator.
-///
-/// Returned offsets are **branch-absolute source byte offsets** (i.e.,
-/// they account for CRLF/CR source expansion and any BOM start offset
-/// encoded in `view.byte_range_start()`).
-///
-/// # Errors
-///
-/// Returns an error if:
-/// - either line number is 0 (line numbers are 1-based)
-/// - `start_line > end_line` (checked before resolving [`EOF_SENTINEL`], which
-///   is why a sentinel start with a numeric end is rejected here)
-/// - either line number exceeds the number of lines in the view (after
-///   resolving), including the zero-line case where [`EOF_SENTINEL`] itself
-///   resolves to 0
-///
-/// [`EOF_SENTINEL`] in either position resolves to the total line count of the
-/// file (the last line number).
-pub fn line_range_to_source_bytes(
-    view: &View,
-    start_line: usize,
-    end_line: usize,
-) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-    line_range_to_source_bytes_with_encoding(view, encoding_rs::UTF_8, start_line, end_line)
-}
-
-fn line_range_to_source_bytes_with_encoding(
-    view: &View,
+/// Encode LF-normalised UTF-8 line text into the file's native encoding with
+/// its line-ending convention, for use as a splice replacement.
+fn encode_replacement(
+    text_lf: &[u8],
     encoding: &'static encoding_rs::Encoding,
-    start_line: usize,
-    end_line: usize,
-) -> Result<(usize, usize), Box<dyn std::error::Error>> {
-    if start_line == 0 {
-        return Err("edit: line numbers are 1-based (minimum 1)".into());
+    ending: LineEnding,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let text = std::str::from_utf8(text_lf)?;
+    let encoded = crate::encoding::encode_text_strict(text, encoding)?;
+    Ok(match ending {
+        LineEnding::Lf => encoded,
+        LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, encoding),
+        LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, encoding),
+    })
+}
+
+/// Decode native-encoded source bytes (BOM stripped) to LF-normalised UTF-8
+/// text, for the mojibake guard and the unified diff.
+fn decode_source_to_lf(
+    raw: &[u8],
+    encoding: &'static encoding_rs::Encoding,
+    bom_len: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let body = &raw[bom_len.min(raw.len())..];
+    let (decoded, had_errors) = encoding.decode_without_bom_handling(body);
+    if had_errors {
+        return Err(format!("not valid {}", encoding.name()).into());
     }
-    if start_line > end_line {
-        return Err(format!("edit: start line {start_line} is after end line {end_line}").into());
-    }
-
-    // Build the normalised start-of-line position table.
-    // line_starts[i] is the normalised byte offset of the start of line i+1.
-    let mut line_starts: Vec<usize> = vec![0];
-    let newline_width = if encoding == encoding_rs::UTF_16LE || encoding == encoding_rs::UTF_16BE {
-        2
-    } else {
-        1
-    };
-    let newline = if encoding == encoding_rs::UTF_16LE {
-        &[0x0A, 0x00][..]
-    } else if encoding == encoding_rs::UTF_16BE {
-        &[0x00, 0x0A][..]
-    } else {
-        &[0x0A][..]
-    };
-    let mut i = 0;
-    while i + newline_width <= view.bytes.len() {
-        if &view.bytes[i..i + newline_width] == newline {
-            line_starts.push(i + newline_width);
-        }
-        i += newline_width;
-    }
-
-    // Total number of content lines.
-    let total_lines = if view.bytes.is_empty() {
-        0
-    } else if view.bytes.ends_with(newline) {
-        // The final push added a past-EOF position; discount it.
-        line_starts.len() - 1
-    } else {
-        line_starts.len()
-    };
-
-    // Resolve EOF_SENTINEL to the total line count (last line).
-    let start_line = if start_line == EOF_SENTINEL {
-        total_lines
-    } else {
-        start_line
-    };
-    let end_line = if end_line == EOF_SENTINEL {
-        total_lines
-    } else {
-        end_line
-    };
-
-    // A file with no content lines resolves EOF_SENTINEL to 0, which would slip
-    // past the 1-based guard above (that ran before resolution) and underflow
-    // `start_line - 1` below.  Report it as the out-of-range condition it is.
-    if start_line == 0 || end_line == 0 {
-        return Err(format!("edit: line 1 is out of range (file has {total_lines} lines)").into());
-    }
-
-    if start_line > total_lines {
-        return Err(format!(
-            "edit: line {start_line} is out of range (file has {total_lines} line{})",
-            if total_lines == 1 { "" } else { "s" }
-        )
-        .into());
-    }
-    if end_line > total_lines {
-        return Err(format!(
-            "edit: line {end_line} is out of range (file has {total_lines} line{})",
-            if total_lines == 1 { "" } else { "s" }
-        )
-        .into());
-    }
-
-    // Normalised byte range for [start_line, end_line] (inclusive).
-    let norm_start = line_starts[start_line - 1];
-    // line_starts[end_line] is the start of the next line (just past the
-    // '\n' of end_line).  If end_line is the last line and has no trailing
-    // '\n', there is no such entry and we use view.bytes.len() instead.
-    let norm_end = if end_line < line_starts.len() {
-        line_starts[end_line]
-    } else {
-        view.bytes.len()
-    };
-
-    // Translate normalised offsets to branch-absolute source byte offsets.
-    let source_start = view.byte_range_start() + view.offset_map.to_source(norm_start as u64);
-    let source_end = view.byte_range_start() + view.offset_map.to_source(norm_end as u64);
-
-    Ok((source_start as usize, source_end as usize))
+    Ok(decoded.replace("\r\n", "\n").replace('\r', "\n"))
 }
 
 // ── CLI parsing helpers ───────────────────────────────────────────────────────
@@ -660,7 +554,7 @@ pub fn parse_byte_pos(s: &str) -> Result<usize, Box<dyn std::error::Error>> {
 /// - `N`   — single line N (1-based inclusive).
 /// - `N-M` — lines N through M (1-based inclusive).
 /// - `$` or `EOF` (case-insensitive) in either position — [`EOF_SENTINEL`];
-///   resolves to the total line count in [`line_range_to_source_bytes`].
+///   resolves to the total line count during line-mode resolution.
 ///
 /// Returns `(start_line, end_line)` both 1-based inclusive.
 pub fn parse_line_range(s: &str) -> Result<(usize, usize), Box<dyn std::error::Error>> {
@@ -682,7 +576,7 @@ pub fn parse_line_range(s: &str) -> Result<(usize, usize), Box<dyn std::error::E
     if let Some((lo_s, hi_s)) = s.split_once('-') {
         let lo = parse_line_pos(lo_s).map_err(|e| format!("invalid range start in {s:?}: {e}"))?;
         let hi = parse_line_pos(hi_s).map_err(|e| format!("invalid range end in {s:?}: {e}"))?;
-        // Defer ordering check to line_range_to_source_bytes so that
+        // Defer the ordering check to line-mode resolution so that
         // EOF_SENTINEL is resolved before comparing.
         if lo != EOF_SENTINEL && hi != EOF_SENTINEL && lo > hi {
             return Err(format!("line range start {lo} is after end {hi}").into());
@@ -735,9 +629,8 @@ pub fn parse_usize_maybe_hex(s: &str) -> Result<usize, Box<dyn std::error::Error
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, sync::Arc};
+    use std::fs;
 
-    use harrier::{encoding::SourceConfig, source::Source};
     use tempfile::TempDir;
 
     use super::*;
@@ -1221,177 +1114,6 @@ mod tests {
         let n = run_test(&p, vec![], false, None, None).unwrap();
         assert_eq!(n, 0);
         assert_eq!(read_file_bytes(&p), b"hello\n");
-    }
-
-    // ── line_range_to_source_bytes ────────────────────────────────────────────
-
-    // Build a View over the given raw file content for use in line-range tests.
-    fn make_view(content: &[u8]) -> (View, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("test.txt");
-        fs::write(&path, content).unwrap();
-
-        let branch = crate::open_as_branch(&path, IoMode::Mmap).unwrap();
-        let file_len = branch.byte_len();
-        let source = Source::new(Arc::clone(&branch), SourceConfig::default()).unwrap();
-        let lines = source.as_lines().unwrap();
-        let view = lines.view_range(0..file_len).unwrap();
-        (view, dir)
-    }
-
-    // 21. First line of an LF file.
-    #[test]
-    fn lrsb_lf_first_line() {
-        let (view, _dir) = make_view(b"abc\ndef\nghi\n");
-        assert_eq!(line_range_to_source_bytes(&view, 1, 1).unwrap(), (0, 4));
-    }
-
-    // 22. Middle line of an LF file.
-    #[test]
-    fn lrsb_lf_middle_line() {
-        let (view, _dir) = make_view(b"abc\ndef\nghi\n");
-        assert_eq!(line_range_to_source_bytes(&view, 2, 2).unwrap(), (4, 8));
-    }
-
-    // 23. Last line of an LF file (trailing newline).
-    #[test]
-    fn lrsb_lf_last_line_with_nl() {
-        let (view, _dir) = make_view(b"abc\ndef\nghi\n");
-        assert_eq!(line_range_to_source_bytes(&view, 3, 3).unwrap(), (8, 12));
-    }
-
-    // 24. Last line of an LF file (no trailing newline).
-    #[test]
-    fn lrsb_lf_last_line_no_nl() {
-        let (view, _dir) = make_view(b"abc\ndef\nghi");
-        assert_eq!(line_range_to_source_bytes(&view, 3, 3).unwrap(), (8, 11));
-    }
-
-    // 25. Multi-line range spanning first two lines.
-    #[test]
-    fn lrsb_lf_multi_first_two() {
-        let (view, _dir) = make_view(b"abc\ndef\nghi\n");
-        assert_eq!(line_range_to_source_bytes(&view, 1, 2).unwrap(), (0, 8));
-    }
-
-    // 26. Multi-line range spanning last two lines.
-    #[test]
-    fn lrsb_lf_multi_last_two() {
-        let (view, _dir) = make_view(b"abc\ndef\nghi\n");
-        assert_eq!(line_range_to_source_bytes(&view, 2, 3).unwrap(), (4, 12));
-    }
-
-    // 27. Multi-line range spanning entire file.
-    #[test]
-    fn lrsb_lf_entire_file() {
-        let (view, _dir) = make_view(b"abc\ndef\nghi\n");
-        assert_eq!(line_range_to_source_bytes(&view, 1, 3).unwrap(), (0, 12));
-    }
-
-    // 28. Single-line file with trailing newline.
-    #[test]
-    fn lrsb_lf_single_line_file_with_nl() {
-        let (view, _dir) = make_view(b"hello\n");
-        assert_eq!(line_range_to_source_bytes(&view, 1, 1).unwrap(), (0, 6));
-    }
-
-    // 29. Single-line file without trailing newline.
-    #[test]
-    fn lrsb_lf_single_line_file_no_nl() {
-        let (view, _dir) = make_view(b"hello");
-        assert_eq!(line_range_to_source_bytes(&view, 1, 1).unwrap(), (0, 5));
-    }
-
-    // 30. Empty line in file (blank line between two content lines).
-    #[test]
-    fn lrsb_lf_empty_line_in_middle() {
-        // "abc\n\ndef\n" — line 2 is an empty line (just a newline)
-        let (view, _dir) = make_view(b"abc\n\ndef\n");
-        assert_eq!(line_range_to_source_bytes(&view, 2, 2).unwrap(), (4, 5));
-    }
-
-    // 31. CRLF file — first line.
-    #[test]
-    fn lrsb_crlf_first_line() {
-        let (view, _dir) = make_view(b"abc\r\ndef\r\nghi\r\n");
-        // Line 1 = "abc\r\n" at source [0, 5)
-        assert_eq!(line_range_to_source_bytes(&view, 1, 1).unwrap(), (0, 5));
-    }
-
-    // 32. CRLF file — middle line.
-    #[test]
-    fn lrsb_crlf_middle_line() {
-        let (view, _dir) = make_view(b"abc\r\ndef\r\nghi\r\n");
-        // Line 2 = "def\r\n" at source [5, 10)
-        assert_eq!(line_range_to_source_bytes(&view, 2, 2).unwrap(), (5, 10));
-    }
-
-    // 33. CRLF file — last line.
-    #[test]
-    fn lrsb_crlf_last_line() {
-        let (view, _dir) = make_view(b"abc\r\ndef\r\nghi\r\n");
-        // Line 3 = "ghi\r\n" at source [10, 15)
-        assert_eq!(line_range_to_source_bytes(&view, 3, 3).unwrap(), (10, 15));
-    }
-
-    // 34. CRLF file — multi-line range.
-    #[test]
-    fn lrsb_crlf_multi_line() {
-        let (view, _dir) = make_view(b"abc\r\ndef\r\nghi\r\n");
-        // Lines 1-2 = "abc\r\ndef\r\n" at source [0, 10)
-        assert_eq!(line_range_to_source_bytes(&view, 1, 2).unwrap(), (0, 10));
-    }
-
-    // 35. CR file — first line.
-    #[test]
-    fn lrsb_cr_first_line() {
-        let (view, _dir) = make_view(b"abc\rdef\rghi\r");
-        // CR is 1:1 with LF so source offsets equal normalised offsets.
-        // Line 1 = "abc\r" at source [0, 4)
-        assert_eq!(line_range_to_source_bytes(&view, 1, 1).unwrap(), (0, 4));
-    }
-
-    // 36. CR file — multi-line range.
-    #[test]
-    fn lrsb_cr_multi_line() {
-        let (view, _dir) = make_view(b"abc\rdef\rghi\r");
-        // Lines 2-3 = "def\rghi\r" at source [4, 12)
-        assert_eq!(line_range_to_source_bytes(&view, 2, 3).unwrap(), (4, 12));
-    }
-
-    // 37. Out-of-range start line → error.
-    #[test]
-    fn lrsb_out_of_range_start() {
-        let (view, _dir) = make_view(b"abc\ndef\n");
-        assert!(line_range_to_source_bytes(&view, 3, 3).is_err());
-    }
-
-    // 38. Out-of-range end line → error.
-    #[test]
-    fn lrsb_out_of_range_end() {
-        let (view, _dir) = make_view(b"abc\ndef\n");
-        assert!(line_range_to_source_bytes(&view, 1, 5).is_err());
-    }
-
-    // 39. start > end → error.
-    #[test]
-    fn lrsb_start_after_end() {
-        let (view, _dir) = make_view(b"abc\ndef\n");
-        assert!(line_range_to_source_bytes(&view, 2, 1).is_err());
-    }
-
-    // 40. Line number 0 → error (1-based).
-    #[test]
-    fn lrsb_zero_line_number() {
-        let (view, _dir) = make_view(b"abc\ndef\n");
-        assert!(line_range_to_source_bytes(&view, 0, 1).is_err());
-    }
-
-    // 41. Empty file → error.
-    #[test]
-    fn lrsb_empty_file() {
-        let (view, _dir) = make_view(b"");
-        assert!(line_range_to_source_bytes(&view, 1, 1).is_err());
     }
 
     // ── run_line (via run) ────────────────────────────────────────────────────
@@ -1880,99 +1602,6 @@ mod tests {
         );
     }
 
-    // 79. line_range_to_source_bytes: EOF_SENTINEL as end → last line's end.
-    #[test]
-    fn lrtsb_eof_end() {
-        let (view, _dir) = make_view(b"line1\nline2\nline3\n");
-        // EOF_SENTINEL end resolves to total_lines=3; range 1-3.
-        let (start, end) = line_range_to_source_bytes(&view, 1, EOF_SENTINEL).unwrap();
-        let content = b"line1\nline2\nline3\n";
-        assert_eq!(&content[start..end], b"line1\nline2\nline3\n");
-    }
-
-    // 80. line_range_to_source_bytes: EOF_SENTINEL as both → last line only.
-    #[test]
-    fn lrtsb_eof_both() {
-        let (view, _dir) = make_view(b"line1\nline2\nline3\n");
-        let (start, end) = line_range_to_source_bytes(&view, EOF_SENTINEL, EOF_SENTINEL).unwrap();
-        let content = b"line1\nline2\nline3\n";
-        assert_eq!(&content[start..end], b"line3\n");
-    }
-
-    // ── EOF_SENTINEL against a zero-line view ────────────────────────────────
-    //
-    // Regression: `EOF_SENTINEL` is resolved to `total_lines` *after* the
-    // 1-based guard has run, so on a file with no content lines it became 0,
-    // slipped past `start_line > total_lines` (`0 > 0` is false), and reached
-    // `line_starts[start_line - 1]` — an arithmetic underflow that aborted the
-    // process (exit 101) and, under tpu-mcp, killed the io worker.
-
-    /// Build a `View` over a file with zero content lines.  `Buffered` I/O is
-    /// required because an empty file cannot be memory-mapped.
-    fn make_empty_view() -> (View, TempDir) {
-        let dir = TempDir::new().unwrap();
-        let path = dir.path().join("empty.txt");
-        fs::write(&path, b"").unwrap();
-
-        let branch = crate::open_as_branch(&path, IoMode::Buffered).unwrap();
-        let file_len = branch.byte_len();
-        let source = Source::new(Arc::clone(&branch), SourceConfig::default()).unwrap();
-        let lines = source.as_lines().unwrap();
-        let view = lines.view_range(0..file_len).unwrap();
-        (view, dir)
-    }
-
-    #[test]
-    fn lrtsb_eof_both_on_empty_view_is_error_not_underflow() {
-        let (view, _dir) = make_empty_view();
-        let err = line_range_to_source_bytes(&view, EOF_SENTINEL, EOF_SENTINEL).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "edit: line 1 is out of range (file has 0 lines)"
-        );
-    }
-
-    #[test]
-    fn lrtsb_eof_end_on_empty_view_is_error_not_underflow() {
-        let (view, _dir) = make_empty_view();
-        assert!(line_range_to_source_bytes(&view, 1, EOF_SENTINEL).is_err());
-    }
-
-    #[test]
-    fn lrtsb_numeric_on_empty_view_is_error() {
-        // The numeric path already reported this; the sentinel path must agree.
-        let (view, _dir) = make_empty_view();
-        assert!(line_range_to_source_bytes(&view, 1, 1).is_err());
-    }
-
-    #[test]
-    fn lrtsb_every_bound_combination_on_empty_view_is_error() {
-        // No combination of sentinel/numeric bounds may panic on a zero-line
-        // file; every one must be a clean Err.
-        let (view, _dir) = make_empty_view();
-        for (start, end) in [
-            (EOF_SENTINEL, EOF_SENTINEL),
-            (1, EOF_SENTINEL),
-            (1, 1),
-            (1, 2),
-            (2, 2),
-            (usize::MAX - 1, EOF_SENTINEL),
-        ] {
-            assert!(
-                line_range_to_source_bytes(&view, start, end).is_err(),
-                "({start}, {end}) on a zero-line view must be an error"
-            );
-        }
-    }
-
-    #[test]
-    fn lrtsb_eof_still_works_on_single_line_file() {
-        // The fix must not reject legitimate EOF use on a non-empty file.
-        let (view, _dir) = make_view(b"only\n");
-        let (start, end) = line_range_to_source_bytes(&view, EOF_SENTINEL, EOF_SENTINEL).unwrap();
-        assert_eq!(&b"only\n"[start..end], b"only\n");
-    }
-
     // 81. run_test() line Delete $: deletes the last line.
     #[test]
     fn ed10_line_delete_dollar() {
@@ -2319,7 +1948,7 @@ mod tests {
         assert_eq!(read_file_bytes(&p), b"ccc\n");
     }
 
-    /// `line_range_to_normalized_bytes`: a numeric start beyond a
+    /// `resolve_line_range`: a numeric start beyond a
     /// `EOF_SENTINEL` end that resolves to 0 lines (empty file) must report
     /// "line 1 is out of range", not "line {start_line} is out of range".
     /// Pins `start_line == 0 || end_line == 0` against a `&&` mutation: only
@@ -2343,42 +1972,6 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "--delete: edit: line 1 is out of range (file has 0 lines)"
-        );
-    }
-
-    // ── line_range_to_source_bytes_with_encoding: encoding-specific mutants ──
-
-    /// The UTF-16LE newline-scanning width (2 bytes) is only selected when
-    /// `encoding == UTF_16LE || encoding == UTF_16BE`. Pins that `||` against
-    /// a `&&` mutation, which is never true for a single concrete encoding
-    /// and would silently fall back to scanning 1 byte at a time against a
-    /// 2-byte newline pattern -- finding no newlines at all.
-    #[test]
-    fn lrtsb_with_encoding_utf16le_newline_width() {
-        // Two UTF-16LE "lines": "AB\n" then "CD\n" (LE code units, LF-only).
-        let content: &[u8] = &[
-            0x41, 0x00, 0x42, 0x00, 0x0A, 0x00, // "AB\n"
-            0x43, 0x00, 0x44, 0x00, 0x0A, 0x00, // "CD\n"
-        ];
-        let (view, _dir) = make_view(content);
-        let (start, end) =
-            line_range_to_source_bytes_with_encoding(&view, encoding_rs::UTF_16LE, 1, 1).unwrap();
-        assert_eq!(&content[start..end], &content[0..6]);
-        let (start, end) =
-            line_range_to_source_bytes_with_encoding(&view, encoding_rs::UTF_16LE, 2, 2).unwrap();
-        assert_eq!(&content[start..end], &content[6..12]);
-    }
-
-    /// Same "numeric start past a zero-lines EOF end" scenario as
-    /// `ed_line_delete_numeric_start_past_eof_end_on_empty_file`, but for
-    /// `line_range_to_source_bytes_with_encoding`'s own copy of the guard.
-    #[test]
-    fn lrtsb_numeric_start_past_eof_end_on_empty_view() {
-        let (view, _dir) = make_empty_view();
-        let err = line_range_to_source_bytes(&view, 5, EOF_SENTINEL).unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "edit: line 1 is out of range (file has 0 lines)"
         );
     }
 
