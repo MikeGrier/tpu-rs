@@ -1866,6 +1866,79 @@ mod tests {
         assert_eq!(read_file_bytes(&p), b"A\r\nX\r\nC\r\n");
     }
 
+    /// Line-mode splice of a UTF-16LE file operates on 2-byte code units: the
+    /// BOM and every untouched line are preserved verbatim, and the replaced
+    /// line is re-encoded in UTF-16LE with the file's LF terminator.
+    #[test]
+    fn ed_line_splice_utf16le_preserves_bom_and_other_lines() {
+        let dir = TempDir::new().unwrap();
+        let mut content = vec![0xFF, 0xFE];
+        content.extend("a\nb\nc\n".encode_utf16().flat_map(u16::to_le_bytes));
+        let p = write_tmp(&dir, "u16le.txt", &content);
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 2,
+                end: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut expected = vec![0xFF, 0xFE];
+        expected.extend("a\nX\nc\n".encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(read_file_bytes(&p), expected);
+    }
+
+    /// Line-mode delete of a UTF-16LE file removes the whole 2-byte-unit line
+    /// including its terminator, preserving the BOM and the surrounding lines.
+    #[test]
+    fn ed_line_delete_utf16le_removes_whole_line() {
+        let dir = TempDir::new().unwrap();
+        let mut content = vec![0xFF, 0xFE];
+        content.extend("a\nb\nc\n".encode_utf16().flat_map(u16::to_le_bytes));
+        let p = write_tmp(&dir, "u16le.txt", &content);
+        run_test(
+            &p,
+            vec![EditOp::Delete { start: 2, end: 2 }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut expected = vec![0xFF, 0xFE];
+        expected.extend("a\nc\n".encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(read_file_bytes(&p), expected);
+    }
+
+    /// The same span/replacement arithmetic must hold for big-endian UTF-16:
+    /// the BE BOM (`FE FF`) and untouched lines survive, and the replacement is
+    /// encoded as UTF-16BE code units.
+    #[test]
+    fn ed_line_splice_utf16be_preserves_bom_and_other_lines() {
+        let dir = TempDir::new().unwrap();
+        let mut content = vec![0xFE, 0xFF];
+        content.extend("a\nb\nc\n".encode_utf16().flat_map(u16::to_be_bytes));
+        let p = write_tmp(&dir, "u16be.txt", &content);
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 2,
+                end: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut expected = vec![0xFE, 0xFF];
+        expected.extend("a\nX\nc\n".encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(read_file_bytes(&p), expected);
+    }
+
     /// Appending at EOF with data that already begins with a newline must not
     /// add a second separator: the data's leading `\n` already terminates the
     /// unterminated final line.
