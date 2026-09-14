@@ -1934,6 +1934,67 @@ mod tests {
         assert_eq!(read_file_bytes(&p), b"A\r\nX\r\nC\r\n");
     }
 
+    /// Heterogeneous line endings: a line-mode splice must leave every *other*
+    /// line's terminator byte-for-byte intact — the property the old whole-file
+    /// normalization would have lost. In `A\r\nB\nC\r` (CRLF / LF / CR), splicing
+    /// line 2 keeps the leading `A\r\n` and the trailing `C\r` exactly.
+    #[test]
+    fn ed_line_splice_preserves_heterogeneous_terminators() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "mixed.txt", b"A\r\nB\nC\r");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 2,
+                end: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let out = read_file_bytes(&p);
+        assert!(
+            out.starts_with(b"A\r\n"),
+            "line 1 CRLF must be preserved: {out:?}"
+        );
+        assert!(
+            out.ends_with(b"C\r"),
+            "line 3 CR must be preserved: {out:?}"
+        );
+        assert_eq!(
+            out[3], b'X',
+            "edited line 2 content follows line 1 verbatim: {out:?}"
+        );
+        assert!(
+            !out.contains(&b'B'),
+            "old line 2 content must be gone: {out:?}"
+        );
+    }
+
+    /// The same preservation must hold under an explicit `--line-ending`
+    /// override: it re-ends only the edited line, leaving the untouched
+    /// heterogeneous terminators (`A\r\n`, `C\r`) intact.
+    #[test]
+    fn ed_line_splice_heterogeneous_override_is_targeted() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "mixed.txt", b"A\r\nB\nC\r");
+        run_test(
+            &p,
+            vec![EditOp::Splice {
+                start: 2,
+                end: 2,
+                data: b"X".to_vec(),
+            }],
+            false,
+            Some(LineEnding::Lf),
+            None,
+        )
+        .unwrap();
+        assert_eq!(read_file_bytes(&p), b"A\r\nX\nC\r");
+    }
+
     /// Line-mode splice of a UTF-16LE file operates on 2-byte code units: the
     /// BOM and every untouched line are preserved verbatim, and the replaced
     /// line is re-encoded in UTF-16LE with the file's LF terminator.
