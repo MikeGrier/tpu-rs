@@ -53,12 +53,15 @@ pub const EOF_SENTINEL: usize = usize::MAX;
 /// breaking change.**
 #[derive(Debug)]
 pub enum EditOp {
-    /// Remove bytes in `[start, end)` from the source.  `end` is exclusive.
+    /// Remove the range `[start, end)`: byte offsets in binary mode, or the
+    /// 1-based inclusive line numbers `start..=end` in line mode.
     Delete { start: usize, end: usize },
-    /// Insert `data` immediately before byte offset `offset` in the source.
-    /// Equivalent to `Splice { start: offset, end: offset, data }`.
+    /// Insert `data` before `offset`: a byte offset in binary mode, or the
+    /// 1-based line to insert before in line mode.  Equivalent to a
+    /// zero-width `Splice` at `offset`.
     Insert { offset: usize, data: Vec<u8> },
-    /// Replace bytes in `[start, end)` with `data`.  `end` is exclusive.
+    /// Replace the range `[start, end)` with `data`: byte offsets in binary
+    /// mode, or the 1-based inclusive line numbers `start..=end` in line mode.
     /// `data` may have any length (shorter, same, or longer).
     Splice {
         start: usize,
@@ -79,10 +82,12 @@ pub enum EditOp {
 ///
 /// # Composability invariant
 ///
-/// All `ops` coordinates reference the **original file**.  `run` checks for
-/// overlapping ranges, then applies ops in reverse start-offset order on a
-/// forked redwing branch so each lower-address op sees its original position
-/// undisturbed.
+/// All `ops` coordinates reference the **original file**.  Binary mode checks
+/// for overlaps and applies the ops in reverse start-offset order on a forked
+/// redwing branch, so each lower-address op sees its original position
+/// undisturbed.  Line mode resolves each op to a source span and batches them
+/// through harrier's `LineEditor::apply` (which likewise rejects overlaps),
+/// then folds any end-of-file appends against the post-splice tail.
 ///
 /// # Overlapping-patch policy
 ///
@@ -252,13 +257,10 @@ fn run_line(
         .map_err(|e| format!("edit: {}: {e}", file.display()))?;
     let line_count = editor.line_count();
 
-    // The terminator to synthesise for newly written / edited lines. Unedited
-    // lines keep their own source terminator; this only affects replacements,
-    // inserts, and appends. An explicit `--line-ending` wins; otherwise the
-    // file's detected convention is used.
-    let new_ending = line_ending_override.unwrap_or(detected_ending);
-
-    let mut splices: Vec<Splice> = Vec::with_capacity(ops.len());
+    // Resolve every op to a source range + LF replacement text now. Only the
+    // final encoding to the file's line ending is ending-dependent, so the
+    // specs are built once and (re-)encoded per candidate ending below.
+    let mut splice_specs: Vec<(std::ops::Range<u64>, Vec<u8>)> = Vec::with_capacity(ops.len());
     // EOF appends are folded in after all coordinate-preserving splices so their
     // terminator/separator decision sees the real post-splice final-line state —
     // an adjacent splice may already have terminated it. Stored as LF-normalised
@@ -272,10 +274,7 @@ fn run_line(
                 let span = editor
                     .line_span(range)
                     .map_err(|e| format!("edit: {}: {e}", file.display()))?;
-                splices.push(Splice {
-                    range: span.full,
-                    replacement: Vec::new(),
-                });
+                splice_specs.push((span.full, Vec::new()));
             }
             EditOp::Insert { offset, data } => {
                 std::str::from_utf8(&data).map_err(|error| {
@@ -301,11 +300,7 @@ fn run_line(
                     let span = editor
                         .line_span(range.start..range.start)
                         .map_err(|e| format!("edit: {}: {e}", file.display()))?;
-                    splices.push(Splice {
-                        range: span.content,
-                        replacement: encode_replacement(&data, file_encoding, new_ending)
-                            .map_err(|e| format!("edit: {}: {e}", file.display()))?,
-                    });
+                    splice_specs.push((span.content, data));
                 }
             }
             EditOp::Splice { start, end, data } => {
@@ -326,75 +321,115 @@ fn run_line(
                 if span.terminated && !data.is_empty() && !data.ends_with(b"\n") {
                     data.push(b'\n');
                 }
-                splices.push(Splice {
-                    range: span.full,
-                    replacement: encode_replacement(&data, file_encoding, new_ending)
-                        .map_err(|e| format!("edit: {}: {e}", file.display()))?,
-                });
+                splice_specs.push((span.full, data));
             }
         }
     }
 
-    let op_count = splices.len() + eof_appends.len();
+    let op_count = splice_specs.len() + eof_appends.len();
 
-    // Phase 1: apply all coordinate-preserving splices atomically (harrier
-    // rejects overlaps). Phase 2: fold the EOF appends against the post-splice
-    // tail so the leading-separator decision sees any terminator an adjacent
-    // splice just added.
-    let final_branch = {
-        let phase1 = if splices.is_empty() {
-            Arc::clone(&branch)
+    // Pass 1 encodes with the ending derived from the original file (or an
+    // explicit override). For a git `text=auto` file an edit can flip the
+    // content between binary and text, changing the required ending; pass 2
+    // re-evaluates the policy against the *post-edit* content and re-encodes
+    // only when it actually changed.
+    let provisional_ending = line_ending_override.unwrap_or(detected_ending);
+    let (final_branch, mut out_bytes, new_text) = {
+        // Encode the specs for `ending` and apply them: phase 1 batches the
+        // coordinate-preserving splices through `LineEditor::apply` (which
+        // rejects overlaps); phase 2 folds the EOF appends against the
+        // post-splice tail so the leading-separator decision sees any terminator
+        // an adjacent splice just added.
+        let build =
+            |ending: LineEnding| -> Result<Arc<dyn redwing::Branch>, Box<dyn std::error::Error>> {
+                let mut splices: Vec<Splice> = Vec::with_capacity(splice_specs.len());
+                for (range, data_lf) in &splice_specs {
+                    splices.push(Splice {
+                        range: range.clone(),
+                        replacement: encode_replacement(data_lf, file_encoding, ending)
+                            .map_err(|e| format!("edit: {}: {e}", file.display()))?,
+                    });
+                }
+                let phase1 = if splices.is_empty() {
+                    Arc::clone(&branch)
+                } else {
+                    editor
+                        .apply(&splices)
+                        .map_err(|e| format!("edit: {}: {e}", file.display()))?
+                };
+                if eof_appends.is_empty() {
+                    return Ok(phase1);
+                }
+                let src2 =
+                    crate::source_from_branch_with_policy(file, Arc::clone(&phase1), &git_policy)?;
+                let editor2 = src2
+                    .as_line_editor()
+                    .map_err(|e| format!("edit: {}: {e}", file.display()))?;
+                // Whether the running tail (the post-splice document, then each
+                // appended blob) ends in an unterminated line that a new appended
+                // line must be separated from. A document with no lines — an empty
+                // or BOM-only file — has no tail to separate from.
+                let mut tail_unterminated =
+                    editor2.line_count() > 0 && !editor2.is_trailing_terminated();
+                let mut blob: Vec<u8> = Vec::new();
+                for data in &eof_appends {
+                    // Separate an unterminated tail from the appended line, unless the
+                    // data already begins with its own newline separator.
+                    if !data.is_empty() && tail_unterminated && !data.starts_with(b"\n") {
+                        blob.extend_from_slice(&editor2.terminator(ending));
+                    }
+                    blob.extend_from_slice(
+                        &encode_replacement(data, file_encoding, ending)
+                            .map_err(|e| format!("edit: {}: {e}", file.display()))?,
+                    );
+                    if !data.is_empty() {
+                        tail_unterminated = !data.ends_with(b"\n");
+                    }
+                }
+                let at = editor2.byte_len();
+                Ok(editor2
+                    .apply(&[Splice {
+                        range: at..at,
+                        replacement: blob,
+                    }])
+                    .map_err(|e| format!("edit: {}: {e}", file.display()))?)
+            };
+
+        let branch1 = build(provisional_ending)?;
+        let bytes1 = redwing::materialize(&*branch1)?;
+        let text1 = decode_source_to_lf(&bytes1, file_encoding, bom_len)
+            .map_err(|e| format!("edit: {}: {e}", file.display()))?;
+        let resolved_ending = line_ending_override
+            .or_else(|| git_policy.line_ending_for_text(&text1))
+            .unwrap_or(detected_ending);
+        if resolved_ending == provisional_ending {
+            (branch1, bytes1, text1)
         } else {
-            editor
-                .apply(&splices)
-                .map_err(|e| format!("edit: {}: {e}", file.display()))?
-        };
-        if eof_appends.is_empty() {
-            phase1
-        } else {
-            let src2 =
-                crate::source_from_branch_with_policy(file, Arc::clone(&phase1), &git_policy)?;
-            let editor2 = src2
-                .as_line_editor()
+            let branch2 = build(resolved_ending)?;
+            let bytes2 = redwing::materialize(&*branch2)?;
+            let text2 = decode_source_to_lf(&bytes2, file_encoding, bom_len)
                 .map_err(|e| format!("edit: {}: {e}", file.display()))?;
-            // Whether the running tail (the post-splice document, then each
-            // appended blob) ends in an unterminated line that a new appended
-            // line must be separated from. A document with no lines — an empty
-            // or BOM-only file — has no tail to separate from.
-            let mut tail_unterminated =
-                editor2.line_count() > 0 && !editor2.is_trailing_terminated();
-            let mut blob: Vec<u8> = Vec::new();
-            for data in &eof_appends {
-                // Separate an unterminated tail from the appended line, unless the
-                // data already begins with its own newline separator.
-                if !data.is_empty() && tail_unterminated && !data.starts_with(b"\n") {
-                    blob.extend_from_slice(&editor2.terminator(new_ending));
-                }
-                blob.extend_from_slice(
-                    &encode_replacement(data, file_encoding, new_ending)
-                        .map_err(|e| format!("edit: {}: {e}", file.display()))?,
-                );
-                if !data.is_empty() {
-                    tail_unterminated = !data.ends_with(b"\n");
-                }
-            }
-            let at = editor2.byte_len();
-            editor2
-                .apply(&[Splice {
-                    range: at..at,
-                    replacement: blob,
-                }])
-                .map_err(|e| format!("edit: {}: {e}", file.display()))?
+            (branch2, bytes2, text2)
         }
     };
-
-    let out_bytes = redwing::materialize(&*final_branch)?;
-    let new_text = decode_source_to_lf(&out_bytes, file_encoding, bom_len)
-        .map_err(|e| format!("edit: {}: {e}", file.display()))?;
 
     if policy.reject_introduced_mojibake {
         check_write_does_not_introduce_mojibake(&old_text, &new_text)
             .map_err(|e| format!("edit: {}: {e}", file.display()))?;
+    }
+
+    // Preserve the git BOM policy: a required BOM (e.g. `working-tree-encoding`
+    // = UTF-8-BOM / UTF-16LE-BOM) must be present even when the source had none
+    // — `validate_worktree_bom` allows an empty file without one, and the
+    // targeted write otherwise only carries through whatever BOM the source had.
+    if git_policy.write_bom(bom_len > 0) {
+        let bom = crate::encoding::bom_bytes_for(file_encoding);
+        if !bom.is_empty() && !out_bytes.starts_with(bom) {
+            let mut with_bom = Vec::with_capacity(bom.len() + out_bytes.len());
+            with_bom.extend_from_slice(bom);
+            with_bom.extend_from_slice(&out_bytes);
+            out_bytes = with_bom;
+        }
     }
 
     // Release every branch handle before file-system work — a memory-mapped
@@ -1936,6 +1971,37 @@ mod tests {
         .unwrap();
         let mut expected = vec![0xFE, 0xFF];
         expected.extend("a\nX\nc\n".encode_utf16().flat_map(u16::to_be_bytes));
+        assert_eq!(read_file_bytes(&p), expected);
+    }
+
+    /// A line-mode insert into an *empty* file under a git `working-tree-encoding`
+    /// that requires a BOM must still write the BOM. `validate_worktree_bom`
+    /// allows the empty source to lack one, so the targeted write is responsible
+    /// for adding it (the old whole-file path did this via `write_bom`).
+    #[test]
+    fn ed_line_insert_empty_file_required_bom_is_written() {
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "*.txt text eol=lf working-tree-encoding=UTF-16LE-BOM\n",
+        )
+        .unwrap();
+        let p = dir.path().join("a.txt");
+        fs::write(&p, b"").unwrap();
+        run_test(
+            &p,
+            vec![EditOp::Insert {
+                offset: EOF_SENTINEL,
+                data: b"X".to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut expected = vec![0xFF, 0xFE];
+        expected.extend("X\n".encode_utf16().flat_map(u16::to_le_bytes));
         assert_eq!(read_file_bytes(&p), expected);
     }
 
