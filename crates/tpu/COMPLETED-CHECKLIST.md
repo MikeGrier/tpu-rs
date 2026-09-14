@@ -1487,8 +1487,12 @@ Full workspace: `cargo nextest run` all tests passed, 0 skipped; `cargo fmt
 this milestone's work; the pre-existing `line_range_to_source_bytes`/`_
 with_encoding` dead-code warning in `cmd/edit.rs`'s `--bin` build predates
 this session — that pair is genuinely unused by any production code path,
-only by its own test suite, and `pub fn line_range_to_source_bytes` is kept
-as a documented, stable helper for future callers).
+only by its own test suite, and `pub fn line_range_to_source_bytes` was kept
+at the time as a documented, stable helper for future callers).
+
+> **Superseded.** `line_range_to_source_bytes` / `_with_encoding` were later
+> removed when line-mode `edit` adopted harrier's `LineEditor` (a breaking API
+> change); resolve line ranges via `Source::as_line_editor().line_span(..)`.
 
 **Status:** ✅ Complete. Every item (M12-1 through M12-12) is done. Missed
 mutants across all fourteen Tier 3 files down from 87 to 14 (all

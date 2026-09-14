@@ -355,6 +355,10 @@ rather than silent defaults.
 2. **Write**: text mutations strictly re-encode in the declared worktree
    encoding, enforce its BOM rules, and normalise all endings when Git supplies
    a definite convention. An explicit `line_ending` takes precedence.
+   **Exception:** line-mode `tpu_edit_file` is *targeted* — it rewrites only the
+   lines it touches and preserves every other line's original terminator, so it
+   re-ends only edited / inserted / appended lines rather than the whole file
+   (see the `tpu_edit_file` bullet above). It still enforces the required BOM.
 3. **Report / repair with doctor**: `tpu_doctor` lists mismatches with an
    `eol_mismatch` object. `fix: "eol"` normalises endings only; `fix: "all"`
    also peels mojibake. Repairs are atomic, retain a `<file>.bak`, and support
