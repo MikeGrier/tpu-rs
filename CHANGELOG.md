@@ -1,5 +1,30 @@
 # Changelog
 
+## [5.0.0](https://github.com/MikeGrier/tpu-rs/compare/v4.1.0...v5.0.0) (2026-09-14)
+
+
+### ⚠ BREAKING CHANGES
+
+* **edit:** the public `tpu::cmd::edit::line_range_to_source_bytes` and `line_range_to_source_bytes_with_encoding` functions have been removed. Line-mode `edit` now resolves line ranges internally via harrier's LineEditor; downstream callers should use `Source::as_line_editor().line_span(..)` instead.
+
+### Features
+
+* **tpu:** rewrite line-mode edit on harrier LineEditor ([5df1b46](https://github.com/MikeGrier/tpu-rs/commit/5df1b46da4a5bc419336707b954d20cbe5ab2470))
+
+
+### Bug Fixes
+
+* **edit:** BOM prepend keys off source state; coalesce same-anchor inserts ([7bbd265](https://github.com/MikeGrier/tpu-rs/commit/7bbd2653bc3f5141c100d685adb241b636ed4fd4))
+* **edit:** correct EOF-append separator on empty files and EditOp coord docs ([864bcd8](https://github.com/MikeGrier/tpu-rs/commit/864bcd89b6aed6712e7991905b27fe63094a7672))
+* **edit:** preserve required BOM and re-evaluate text=auto ending in line mode ([085db5c](https://github.com/MikeGrier/tpu-rs/commit/085db5c5945738db43d1a96de9b889d5e5717381))
+* **tpu:** normalize edit data endings and fix EOF-append separator edges ([69816a5](https://github.com/MikeGrier/tpu-rs/commit/69816a5fcb9df825454f94680fe54040fc340bcd))
+* **tpu:** preserve line terminators in line-mode splice/insert ([fc1f776](https://github.com/MikeGrier/tpu-rs/commit/fc1f7767793c96ae561f9384ad51d1855297f603))
+
+
+### Documentation
+
+* **edit:** record LineEditor-based line mode; remove line_range_to_source_bytes ([b521de5](https://github.com/MikeGrier/tpu-rs/commit/b521de5e24d2bc2f1145b9c10ee74ca6beca1f68))
+
 ## [4.1.0](https://github.com/MikeGrier/tpu-rs/compare/v4.0.2...v4.1.0) (2026-09-10)
 
 
