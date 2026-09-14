@@ -398,11 +398,14 @@ calls) is documented in "MCP Architecture" above.
 
 ## MCP Boundary Line-Ending Normalization
 
-All `tpu::cmd::*::run()` functions have an implicit contract: **text input must be
-UTF-8 with LF-only line endings**.  The `DenormaliseWriter` used internally by write,
-replace, edit, and append only recognizes bare `\n` bytes — it forwards `\r` verbatim
-and then substitutes the `\n` that follows.  Consequently, if text content arrives
-containing CRLF:
+The `write`, `replace`, and `append` `run()` functions have an implicit contract:
+**text input must be UTF-8 with LF-only line endings**.  The `DenormaliseWriter` they
+use only recognizes bare `\n` bytes — it forwards `\r` verbatim and then substitutes
+the `\n` that follows.  (`edit` is the exception: `run_line` normalizes its own
+Insert/Splice `data` with `normalize_bytes_to_lf` before applying it, so the raw-CLI
+path is safe too, and it no longer uses `DenormaliseWriter` at all — it splices in
+source byte space via harrier's `LineEditor`.)  Consequently, for the
+`DenormaliseWriter` callers, if text content arrives containing CRLF:
 
 - **LF-target file**: `\r\n` → `\r` (verbatim) + `\n` (substituted to LF) = `\r\n`
   — CRLF is injected into an LF file, producing mixed line endings.
@@ -429,13 +432,16 @@ function.  Two helpers handle this:
   not modified.
 
 This normalization is applied at the outermost boundary (the `call_*` functions in
-`tools.rs`) rather than inside the tpu library.  The tpu library's contract of
-"LF-only input" is unchanged; the MCP server just ensures it is honored.
+`tools.rs`) rather than inside the tpu library.  The `write` / `replace` / `append`
+library contract of "LF-only input" is unchanged; the MCP server just ensures it is
+honored.  `edit` additionally normalizes its own Insert/Splice `data` inside
+`run_line`, so both its MCP and raw-CLI callers are covered.
 
 Affected call sites:
 - `call_write_file` — normalizes `content` before `write::run()`
 - `call_replace_in_file` — normalizes `replacement` before `replace::run()`
-- `call_edit_file` — normalizes Insert/Splice `data` bytes (text mode only)
+- `call_edit_file` — normalizes Insert/Splice `data` bytes (text mode only); this is
+  now belt-and-suspenders, since `run_line` also normalizes CLI-supplied `data`
 - `call_append_file` — normalizes `content` before `append::run()`
 
 The MCP tool schema descriptions document that CRLF/CR in input text is normalized to

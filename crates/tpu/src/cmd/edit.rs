@@ -328,6 +328,30 @@ fn run_line(
 
     let op_count = splice_specs.len() + eof_appends.len();
 
+    // Coalesce inserts anchored at the same zero-width position (e.g.
+    // `--insert 2 X --insert 2 Y`): `LineEditor::apply` does not accept two
+    // zero-width splices at one offset, so merge their data in op order into a
+    // single splice. Non-zero-width ranges that collide are genuine overlaps and
+    // stay separate so `apply` reports them.
+    let splice_specs = {
+        let mut merged: Vec<(std::ops::Range<u64>, Vec<u8>)> =
+            Vec::with_capacity(splice_specs.len());
+        for (range, data) in splice_specs {
+            let existing = if range.start == range.end {
+                merged
+                    .iter_mut()
+                    .find(|(r, _)| r.start == r.end && r.start == range.start)
+            } else {
+                None
+            };
+            match existing {
+                Some((_, buf)) => buf.extend_from_slice(&data),
+                None => merged.push((range, data)),
+            }
+        }
+        merged
+    };
+
     // Pass 1 encodes with the ending derived from the original file (or an
     // explicit override). For a git `text=auto` file an edit can flip the
     // content between binary and text, changing the required ending; pass 2
@@ -420,11 +444,14 @@ fn run_line(
 
     // Preserve the git BOM policy: a required BOM (e.g. `working-tree-encoding`
     // = UTF-8-BOM / UTF-16LE-BOM) must be present even when the source had none
-    // — `validate_worktree_bom` allows an empty file without one, and the
-    // targeted write otherwise only carries through whatever BOM the source had.
-    if git_policy.write_bom(bom_len > 0) {
+    // — `validate_worktree_bom` allows an empty file without one. Key off the
+    // *source* state, not the output bytes: a source that already had a BOM kept
+    // it through `apply` (never double it), and inserted content that merely
+    // begins with BOM-like bytes (a leading U+FEFF) must not be mistaken for the
+    // policy BOM.
+    if bom_len == 0 && git_policy.write_bom(false) {
         let bom = crate::encoding::bom_bytes_for(file_encoding);
-        if !bom.is_empty() && !out_bytes.starts_with(bom) {
+        if !bom.is_empty() {
             let mut with_bom = Vec::with_capacity(bom.len() + out_bytes.len());
             with_bom.extend_from_slice(bom);
             with_bom.extend_from_slice(&out_bytes);
@@ -2009,6 +2036,65 @@ mod tests {
         let mut expected = vec![0xFF, 0xFE];
         expected.extend("X\n".encode_utf16().flat_map(u16::to_le_bytes));
         assert_eq!(read_file_bytes(&p), expected);
+    }
+
+    /// The required-BOM prepend must key off the *source* state, not the output
+    /// bytes: inserted content that itself begins with the BOM bytes (a leading
+    /// U+FEFF, which is `FF FE` in UTF-16LE) must not be mistaken for the policy
+    /// BOM, so the file gets both the policy BOM and the content's own U+FEFF.
+    #[test]
+    fn ed_line_insert_bom_like_content_still_prepends_policy_bom() {
+        let dir = TempDir::new().unwrap();
+        gix::init(dir.path()).unwrap();
+        fs::write(
+            dir.path().join(".gitattributes"),
+            "*.txt text eol=lf working-tree-encoding=UTF-16LE-BOM\n",
+        )
+        .unwrap();
+        let p = dir.path().join("a.txt");
+        fs::write(&p, b"").unwrap();
+        run_test(
+            &p,
+            vec![EditOp::Insert {
+                offset: EOF_SENTINEL,
+                data: "\u{FEFF}X".as_bytes().to_vec(),
+            }],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        let mut expected = vec![0xFF, 0xFE]; // policy BOM
+        expected.extend("\u{FEFF}X\n".encode_utf16().flat_map(u16::to_le_bytes));
+        assert_eq!(read_file_bytes(&p), expected);
+    }
+
+    /// Two line-mode inserts anchored at the same line must both take effect in
+    /// op order (`--insert 2 X --insert 2 Y` → `X` then `Y` before line 2), even
+    /// though both resolve to the same zero-width source position.
+    #[test]
+    fn ed_line_two_inserts_same_line_coalesce_in_order() {
+        let dir = TempDir::new().unwrap();
+        let p = write_tmp(&dir, "f.txt", b"A\nB\n");
+        let n = run_test(
+            &p,
+            vec![
+                EditOp::Insert {
+                    offset: 2,
+                    data: b"X".to_vec(),
+                },
+                EditOp::Insert {
+                    offset: 2,
+                    data: b"Y".to_vec(),
+                },
+            ],
+            false,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(n, 2);
+        assert_eq!(read_file_bytes(&p), b"A\nX\nY\nB\n");
     }
 
     /// Appending at EOF with data that already begins with a newline must not
