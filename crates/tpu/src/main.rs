@@ -452,10 +452,11 @@ enum Commands {
     /// Make targeted in-place edits at known positions (line numbers in text
     /// mode, byte offsets in binary mode) in a file.
     ///
-    /// All RANGE and OFFSET values reference the **original file**.  Multiple
-    /// patches in one invocation are resolved to original coordinates before
-    /// any write and applied in reverse offset order so no patch shifts the
-    /// position of another.
+    /// All RANGE and OFFSET values reference the **original file**.  Binary
+    /// mode applies the patches in reverse byte-offset order so no patch shifts
+    /// another's position.  Text (line) mode resolves each range to a source
+    /// span and batches them together, preserving every untouched line's
+    /// original terminator; only edited lines are re-terminated.
     Edit {
         /// File to edit.
         file: PathBuf,
