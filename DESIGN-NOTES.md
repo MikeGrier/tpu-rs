@@ -133,8 +133,14 @@ The `--line-ending=<lf|crlf|cr>` flag is available on `write`, `replace`, and `e
   supplied) replaces it immediately after detection.
 - In `replace`: the detected `line_ending` from `source.line_ending()` is stored as
   `detected_ending`; the override replaces it before the `denormalize_bytes` calls.
-- In `edit` (text mode): same pattern — detected ending is shadowed by the override
-  before `DenormaliseWriter` is constructed.
+- In `edit` (text mode): line-mode `edit` is **targeted** — it edits in *source* byte
+  space via harrier's `LineEditor` and preserves each untouched line's own terminator.
+  The override (or, absent it, the file's detected convention) is applied only to the
+  terminators of newly written / inserted / appended lines, **not** to the whole file.
+  So `edit --line-ending=crlf` re-ends only the lines it touches; use `write` or
+  `replace` (which re-terminate the entire file) to convert every line. This also means
+  a git `text=auto` binary→text transition triggered by an edit does not retroactively
+  re-end untouched lines — targeted editing never rewrites content it did not touch.
 - In `tpu-mcp`: the `write_file` tool schema exposes `line_ending` as an optional enum
   string (`"lf"`, `"crlf"`, `"cr"`); when present it is passed to the library `run()`
   function as a `LineEnding` value.
@@ -150,12 +156,12 @@ This was possible because harrier already provides everything needed:
 - **`denormalize_bytes(buf, ending)`** — the batch equivalent used by `replace` after
   `redwing::materialize()`.
 
-If a future caller ever needs to write lines with **heterogeneous endings** (e.g. preserving
-the original per-line ending of each line independently), harrier's `Lines` iterator
-already exposes per-line terminator information via the `Line::terminator` field.  The
-current `tpu` design intentionally does not use this: a single uniform ending is applied
-to the entire file on every write operation.  This keeps the output deterministic and
-matches user expectation when `--line-ending` is given.
+`write` and `replace` apply a single uniform ending to the entire file on every write,
+which keeps their output deterministic and matches user expectation when `--line-ending`
+is given.  Line-mode `edit` is the exception: it edits in source byte space via harrier's
+`LineEditor` (which exposes per-line terminator information), preserves each untouched
+line's original terminator, and only synthesises the chosen ending for the lines it
+rewrites.
 
 ---
 
