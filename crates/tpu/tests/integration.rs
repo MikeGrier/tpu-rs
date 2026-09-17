@@ -9086,8 +9086,6 @@ fn rp_replace_ops_file_applies_a_batch_and_prints_the_tally() {
     assert!(stdout.contains("gate-waits           2"), "{stdout}");
 }
 
-/// One mis-anchored op refuses the whole batch; the file must not be left
-/// half-transformed.
 /// `--message-format=json` must yield the report as one structured NDJSON
 /// record. It used to wrap the *human* rendering in a `content` string, so a
 /// caller following the global convention got JSON-looking output it could
@@ -9163,6 +9161,10 @@ fn rp_replace_ops_count_labels_the_total_but_single_op_stays_bare() {
     assert_eq!(String::from_utf8_lossy(&single.stdout).trim_end(), "1");
 }
 
+/// One mis-anchored op refuses the whole batch; the file must not be left
+/// half-transformed. A `--line-ending` override does NOT exempt a batch from
+/// this, unlike the single-op form: converting terminators says nothing about
+/// whether the patterns were right.
 #[test]
 fn rp_replace_ops_file_refuses_the_batch_on_a_zero_match_op() {
     let dir = tempfile::tempdir().unwrap();
