@@ -976,3 +976,46 @@ skipped and the remainder is written verbatim to `out` without any encoding or
 line-ending transformation.  If the file is shorter than `n` bytes, all bytes are
 emitted without error.  `--binary` selects this mode and suppresses any
 encoding-detection step.
+
+## Cross-Process Write Locking — MCP Only, By Choice
+
+`acquire_write_lock` is a best-effort, per-file, cross-process advisory lock
+(`WriteLock` sidecar; `None` means "proceed unlocked"). It is taken by the
+**tpu-mcp server** on every mutating tool call, and deliberately **not** taken
+by any `tpu` CLI subcommand.
+
+This asymmetry is intentional, not an oversight.
+
+**Why the server locks.** `tpu-mcp` is a long-lived process that an agent can
+drive with several tool calls in flight, against the same file, with no
+scheduling guarantees between them. Lost updates there are a realistic,
+observed failure mode — which is also why the mutating tools carry
+`if_match` / `content_version`. The lock is the coarse defence; CAS is the
+precise one.
+
+**Why the CLI does not.** A CLI invocation is one-shot and short-lived, and
+its mutations already go through `atomic_write` (temp file → rename original
+to `.bak` → persist temp), so a concurrent reader never observes a partial
+file. What the lock would add is protection against a *second writer* racing
+the same path, which for the CLI means either the user running two `tpu`
+processes at once or a `tpu` process racing the MCP server.
+
+Both are real but rare, and the cost of covering them properly is not the call
+site — it is one line per command — but the verification:
+
+- it applies to **every** mutating subcommand (`write`, `create`, `append`,
+  `edit`, `replace`, `render`, `copy`, `doctor --fix`), so doing it for one is
+  worse than doing it for none: it looks like coverage and is not;
+- proving it requires a **two-process** regression test, which the CLI test
+  suite has no harness for (tpu-mcp has one, which is why its lock behaviour
+  is pinned);
+- `doctor --fix` walks many files, so lock scope and acquisition order need a
+  deliberate decision rather than a reflexive `let _lock = …` at the top.
+
+**Consequence to be aware of.** A `tpu` CLI write concurrent with a tpu-mcp
+write to the same path is *not* mutually excluded today: only one side takes
+the lock, and a lock only excludes peers that also take it. The exposure is
+bounded by `atomic_write` — the loser's content wins wholesale rather than the
+file being interleaved or truncated — but it is a genuine lost update.
+
+Revisit this as its own change, with the two-process harness built first.
