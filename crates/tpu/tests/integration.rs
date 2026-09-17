@@ -9130,6 +9130,57 @@ fn rp_replace_pattern_containing_crlf_matches_a_crlf_file() {
     assert_eq!(fs::read(&target).unwrap(), b"merged\r\n");
 }
 
+/// A machine client reading NDJSON must be able to tell a byte-identical
+/// result from a line-ending-only rewrite without shelling out for the exit
+/// code.
+#[test]
+fn rp_replace_count_and_dry_run_report_would_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lf.txt");
+    fs::write(&target, b"a\nb\n").unwrap();
+
+    let counted = ok(tpu()
+        .arg("--message-format=json")
+        .arg("replace")
+        .arg(&target)
+        .arg("zzz-no-such-match")
+        .arg("x")
+        .arg("--line-ending")
+        .arg("crlf")
+        .arg("--count"));
+
+    let record = parse_ndjson(&counted.stdout)
+        .into_iter()
+        .find(|m| m["reason"] == "count")
+        .expect("a count record");
+    assert_eq!(record["count"], 0, "nothing matched");
+    assert_eq!(
+        record["would_write"], true,
+        "but the terminators would change: {record}"
+    );
+
+    let dry = tpu()
+        .arg("--message-format=json")
+        .arg("replace")
+        .arg(&target)
+        .arg("a")
+        .arg("a")
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+
+    let record = parse_ndjson(&dry.stdout)
+        .into_iter()
+        .find(|m| m["reason"] == "dry_run")
+        .expect("a dry_run record");
+    assert_eq!(record["count"], 1, "it matched");
+    assert_eq!(
+        record["would_write"], false,
+        "but an identity substitution changes no bytes: {record}"
+    );
+    assert_eq!(dry.status.code(), Some(0), "so the exit code agrees");
+}
+
 /// The census must be machine-readable in JSON mode and must flag that a
 /// replace collapsed a mixed file onto one convention.
 #[test]

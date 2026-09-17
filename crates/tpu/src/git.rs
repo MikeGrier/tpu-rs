@@ -877,9 +877,15 @@ pub fn line_ending_name(le: LineEnding) -> &'static str {
 ///
 /// Prefer [`crate::TextLayout::analyze`] on already-decoded text; this exists
 /// for callers that hold only raw bytes (a post-write check, where decoding
-/// again would mean a second read). UTF-16 content is transcoded first so its
-/// `000D 000A` code-unit pairs are counted as terminators rather than as
-/// stray bytes; this mirrors what [`detect_with_policy`] analyses.
+/// again would mean a second read). UTF-16 is recognised by its BOM and
+/// transcoded first, so its `000D 000A` code-unit pairs are counted as
+/// terminators rather than as stray bytes.
+///
+/// BOM-less UTF-16 declared only through `working-tree-encoding` is **not**
+/// recognised here, because the attribute is not available at this call: its
+/// interleaved NUL bytes would split each `\r\n` and be miscounted as a lone
+/// CR plus a lone LF. Use [`detect_with_policy`], which resolves the
+/// attribute, when the bytes may be BOM-less UTF-16.
 pub fn line_ending_counts(bytes: &[u8]) -> crate::TextLayout {
     let analysis = eol_analysis_bytes(bytes, None);
     crate::TextLayout::analyze(&String::from_utf8_lossy(&analysis))

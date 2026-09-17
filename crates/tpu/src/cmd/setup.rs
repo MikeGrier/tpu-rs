@@ -219,9 +219,11 @@ differences.
     of the real before/after files, so this works for a batch too. Capped by
     `changed_line_details_max` (default 50), with
     `changed_line_details_truncated: true` when the cap is hit. Batch mode
-    turns this on by default because it has no changed-region echo. (Not to
-    be confused with the integer `changed_lines` already in the trailer,
-    which is only the size estimate that gates the echo.)
+    turns this on by default because it has no changed-region echo — except
+    under `count: true`, which performs no substitution and so has nothing to
+    image; asking for details there explicitly is an error, not an empty
+    answer. (Not to be confused with the integer `changed_lines` already in
+    the trailer, which is only the size estimate that gates the echo.)
 - **A match is not a write** — the status trailer carries `"wrote"`. An
   identity substitution matches and reports a non-zero `count`, but produces
   byte-identical output, which the write path skips: no `.bak`, no mtime
