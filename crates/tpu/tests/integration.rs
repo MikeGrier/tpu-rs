@@ -9234,6 +9234,28 @@ fn rp_replace_warns_when_an_override_leaves_a_file_git_will_reject() {
     assert_eq!(fs::read(&target).unwrap(), b"ALPHA\r\nbeta\r\n");
 }
 
+/// The CLI reported "content appended" unconditionally, so a byte-identical
+/// append claimed a mutation that never reached the disk.
+#[test]
+fn rp_append_reports_a_no_op_rather_than_claiming_a_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("a.txt");
+    fs::write(&target, b"alpha\n").unwrap();
+
+    let o = ok(tpu().arg("append").arg(&target).arg("--data").arg(""));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&o.stdout),
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    assert!(
+        combined.contains("no bytes changed"),
+        "a no-op must say so: {combined}"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"alpha\n");
+}
+
 /// A machine client reading NDJSON must be able to tell a byte-identical
 /// result from a line-ending-only rewrite without shelling out for the exit
 /// code.

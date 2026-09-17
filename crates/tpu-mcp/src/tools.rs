@@ -3268,7 +3268,7 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
             return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
         }
 
-        tpu::cmd::append::run(
+        let outcome = tpu::cmd::append::run(
             path,
             &content,
             le_override,
@@ -3276,12 +3276,22 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
             tpu::IoMode::Buffered,
             mojibake_policy_from_args(args)?,
         )?;
-        delete_bak_if_exists(&file);
-        let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
+        // See the replace path: a byte-identical append writes nothing, so
+        // clearing a pre-existing `.bak` or stamping mtime would make the
+        // verification the only mutation of the call.
+        if outcome.wrote {
+            delete_bak_if_exists(&file);
+        }
+        let stamp = if outcome.wrote {
+            stamp_and_verify(path, config.verify_delay_ms)?
+        } else {
+            read_stamp(path)?
+        };
         let content_version = current_version(&file)?;
         let mut status = serde_json::json!({
             "status": "success",
             "file": file,
+            "wrote": outcome.wrote,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
             "content_version": content_version,
@@ -6917,6 +6927,38 @@ mod integration_tests {
         );
         assert_eq!(status["changed"], status["would_write"], "same value");
         assert_eq!(fs::read(&f).unwrap(), b"a\nb\n", "a preview must not write");
+    }
+
+    /// A byte-identical append writes nothing, so clearing a pre-existing
+    /// `.bak` or stamping mtime would make the verification the only mutation
+    /// of the call.
+    #[test]
+    fn a_no_op_append_preserves_the_backup_and_the_mtime() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, b"alpha\n").unwrap();
+        let bak = dir.path().join("a.txt.bak");
+        fs::write(&bak, b"sentinel").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "",
+        });
+        let out = call("tpu_append_file", &args).expect("must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(status["wrote"], false, "nothing to append: {status}");
+        assert_eq!(
+            fs::read(&bak).unwrap(),
+            b"sentinel",
+            "a no-op must not clear an existing backup"
+        );
+        assert_eq!(
+            fs::metadata(&f).unwrap().modified().unwrap(),
+            before,
+            "a no-op must not stamp mtime"
+        );
     }
 
     #[test]

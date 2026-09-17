@@ -376,7 +376,9 @@ pub struct ReplaceOp<'a> {
 /// match count per op, positionally aligned with `ops`.
 ///
 /// The whole batch is one write: one temp-file swap, one `<file>.bak`, one
-/// mtime bump, one mojibake-guard check against the file's original content.
+/// mtime bump, one mojibake-guard check against the file's original content —
+/// and only when the resulting bytes differ, which an identity substitution's
+/// do not (see [`ReplaceOutcome::wrote`]).
 /// A batch that fails partway therefore cannot leave a half-transformed file,
 /// which is the failure mode of running the ops as N separate calls.
 ///
