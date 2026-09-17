@@ -2203,7 +2203,7 @@ fn run(
             // Run validate guards before any file modification.
             cmd::validate::run_all(&validate, &file, false, IoMode::Mmap)?;
 
-            cmd::append::run(
+            let outcome = cmd::append::run(
                 &file,
                 &new_text,
                 le_override,
@@ -2215,7 +2215,12 @@ fn run(
                     mojibake::WritePolicy::default()
                 },
             )?;
-            shell.status("append", format!("{}: content appended", file.display()))?;
+            let summary = if outcome.wrote {
+                "content appended"
+            } else {
+                "no bytes changed; file left untouched"
+            };
+            shell.status("append", format!("{}: {summary}", file.display()))?;
             Ok(())
         }
 
