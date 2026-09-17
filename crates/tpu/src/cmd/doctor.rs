@@ -45,7 +45,14 @@
 //! Files matching the `encoding-check: allow-mojibake` opt-out marker
 //! (see [`crate::mojibake::ALLOW_MARKER`]) are reported as clean.
 //!
-//! ## Repair (`--fix=peel`)
+//! ## Repair (`--fix=peel` | `eol` | `all`)
+//!
+//! `peel` repairs mojibake only, `eol` repairs line endings only, and `all`
+//! does both.  The two are reported separately (`mojibake_repaired` /
+//! `eol_repaired`, plus their union `any_repaired`) so an EOL-only fix is
+//! never misread as a no-op from the mojibake flag.
+//!
+//! ### Mojibake (`peel` / `all`)
 //!
 //! For each mojibake-suspected file [`crate::mojibake::looks_like_one_layer_peel`]
 //! is invoked.  When it returns `Some(repaired)` (i.e. strictly fewer
@@ -60,6 +67,13 @@
 //! [`crate::mojibake::WritePolicy::permissive`] because the *intent* is to write a string
 //! that may still legitimately contain mojibake — we just want
 //! *strictly less* than before.
+//!
+//! ### Line endings (`eol` / `all`)
+//!
+//! Each file whose on-disk endings disagree with git's expected working-tree
+//! convention is rewritten to that convention.  The repair is atomic, retains
+//! a `.bak`, and handles UTF-16.  Only paths git has a definite opinion about
+//! are touched: content git leaves alone (binary, `-text`) is never rewritten.
 //!
 //! ## Output
 //!
