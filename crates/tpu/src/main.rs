@@ -1775,6 +1775,13 @@ fn run(
                         .unwrap_or("none"),
                 ))?;
             }
+            // An explicit --line-ending outranks git policy, so a uniform file
+            // can still be left non-conforming; the MCP path already checks.
+            if let Some(warning) =
+                git::write_warning(&file, "Run 'tpu doctor --fix=eol' to normalize.")
+            {
+                shell.warn(format!("{}: {warning}", file.display()))?;
+            }
             Ok(())
         }
 

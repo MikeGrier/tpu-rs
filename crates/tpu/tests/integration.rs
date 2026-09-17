@@ -9203,6 +9203,37 @@ fn rp_replace_crlf_in_the_replacement_does_not_double_the_cr() {
     );
 }
 
+/// An explicit `--line-ending` outranks git policy, so a *uniform* result can
+/// still be a file git will reject. The mixed-to-uniform notice cannot catch
+/// that, and the MCP replace path already ran this check.
+#[test]
+fn rp_replace_warns_when_an_override_leaves_a_file_git_will_reject() {
+    let dir = tempfile::tempdir().unwrap();
+    gix::init(dir.path()).expect("git init");
+    fs::write(dir.path().join(".gitattributes"), "*.txt text eol=lf\n").unwrap();
+    let target = dir.path().join("a.txt");
+    fs::write(&target, b"alpha\nbeta\n").unwrap();
+
+    let o = ok(tpu()
+        .arg("replace")
+        .arg(&target)
+        .arg("alpha")
+        .arg("ALPHA")
+        .arg("--line-ending")
+        .arg("crlf"));
+
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("differ from git's expected LF"),
+        "an override against an LF policy must warn: {stderr}"
+    );
+    assert!(
+        stderr.contains("tpu doctor --fix=eol"),
+        "and must name the repair route: {stderr}"
+    );
+    assert_eq!(fs::read(&target).unwrap(), b"ALPHA\r\nbeta\r\n");
+}
+
 /// A machine client reading NDJSON must be able to tell a byte-identical
 /// result from a line-ending-only rewrite without shelling out for the exit
 /// code.

@@ -43,7 +43,9 @@
 //! - **Clean**: no issues.
 //!
 //! Files matching the `encoding-check: allow-mojibake` opt-out marker
-//! (see [`crate::mojibake::ALLOW_MARKER`]) are reported as clean.
+//! (see [`crate::mojibake::ALLOW_MARKER`]) have their mojibake and
+//! replacement-character findings suppressed.  A git line-ending mismatch is
+//! a separate concern and is still reported and counted for such a file.
 //!
 //! ## Repair (`--fix=peel` | `eol` | `all`)
 //!
@@ -95,18 +97,21 @@
 //!         "repaired": false,
 //!         "mojibake_repaired": false,
 //!         "eol_repaired": false,
-//!         "any_repaired": false
+//!         "any_repaired": false,
+//!         "unresolved": true
 //!       }
 //!     ],
 //!     "total_files_scanned": 7,
 //!     "total_issues": 2,
+//!     "total_unresolved": 2,
 //!     "total_repaired": 0
 //!   }
 //!   ```
 //!
-//!   `verdict` is `"clean"` or `"issues"`, so a caller that only wants to
-//!   know whether the scanned paths are in a committable state can read one
-//!   field instead of walking `files`.
+//!   `verdict` is `"clean"` or `"issues"` and describes what the scan found;
+//!   `total_unresolved` (and the per-file `unresolved`) is what remains after
+//!   any repairs, which is the committability question and what the exit
+//!   code keys off.
 //!
 //! ## Exit code (chosen by caller)
 //!

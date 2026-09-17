@@ -950,7 +950,7 @@ pub fn write_warning(file: &Path, remedy: &str) -> Option<String> {
         return Some(format!(
             "the file now contains mixed line endings ({breakdown}). No git policy applies \
              to this path, so nothing was normalized; rewrite the whole file with an \
-             explicit line ending if a single convention was intended."
+             explicit line ending if a single convention was intended. {remedy}"
         ));
     }
     None
@@ -1204,6 +1204,10 @@ mod tests {
         let file = write_file(dir.path(), "a.txt", b"1\nT\r\n3\n");
         let warning = write_warning(&file, "REMEDY").expect("no policy must still warn");
         assert!(warning.contains("mixed line endings"), "{warning}");
+        assert!(
+            warning.contains("REMEDY"),
+            "the caller's repair route must survive: {warning}"
+        );
     }
 
     #[test]
