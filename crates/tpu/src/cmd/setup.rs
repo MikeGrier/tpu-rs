@@ -171,8 +171,10 @@ differences.
   The write still succeeded; on a real write, a plain `"status":"success"`
   without this field is what means "committable". Preview modes
   (`count: true`, `dry_run: true`, `tpu_append_file` with `diff: true`)
-  write nothing, so they never carry it — read `line_endings.after`
-  there instead. Repair with `tpu_doctor` and `fix: "eol"`.
+  write nothing, so they never carry it. For a replace preview, read
+  `line_endings.after` instead; `tpu_append_file`'s preview reports only
+  `changed`, so ask `tpu_count_file` or `tpu_doctor` about its line endings.
+  Repair with `tpu_doctor` and `fix: "eol"`.
 - **Several substitutions to one file — use `ops`, never a shell loop.**
   `tpu_replace_in_file` takes an `ops` array instead of a top-level
   `pattern`/`replacement`; each entry accepts the same fields plus an
@@ -326,8 +328,10 @@ between the header and trailer.
   A `tpu_replace_in_file` whose `pattern` matched zero times is instead an
   error trailer naming the count, with the file left untouched — see
   "A replace that matches nothing is an error" above.
-  Any of the four may also carry `"eol_warning":"..."` — the write landed, but
-  the resulting file's line endings do not conform (see the `eol_warning`
+  Any of the six text-writing tools (`tpu_create_file` / `tpu_write_file` /
+  `tpu_replace_in_file` / `tpu_edit_file` / `tpu_append_file` /
+  `tpu_render_file`) may also carry `"eol_warning":"..."` — the write landed,
+  but the resulting file's line endings do not conform (see the `eol_warning`
   bullet above).
   A `tpu_replace_in_file` batch (`ops`) additionally reports
   `"ops":[{"label":…,"count":N},…]` in every mode — real write, `count:true`,

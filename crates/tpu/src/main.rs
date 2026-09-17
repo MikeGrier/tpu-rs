@@ -53,16 +53,18 @@ fn emit_line_ending_census(out: &mut dyn output::Output, outcome: &cmd::replace:
 
 /// Emit the per-line before/after images requested by `--changed-lines`.
 ///
-/// Human rendering is `N - old` / `N + new`, ASCII only: these lines reach a
-/// Windows console under whatever code page is active.
+/// Human rendering is `N - old` / `N + new`, escaped to 7-bit ASCII the same
+/// way `emit_bytes` escapes a byte payload: these lines reach a Windows
+/// console under whatever code page is active, which would mojibake raw
+/// UTF-8. The JSON `old_text`/`new_text` stay verbatim.
 fn emit_changed_lines(out: &mut dyn output::Output, outcome: &cmd::replace::ReplaceOutcome) {
     for line in &outcome.changed_lines {
         let mut rendered = String::new();
         if let (Some(number), Some(text)) = (line.old_line, line.old_text.as_deref()) {
-            rendered.push_str(&format!("{number:>6} - {text}\n"));
+            rendered.push_str(&format!("{number:>6} - {}\n", escape::encode(text)));
         }
         if let (Some(number), Some(text)) = (line.new_line, line.new_text.as_deref()) {
-            rendered.push_str(&format!("{number:>6} + {text}\n"));
+            rendered.push_str(&format!("{number:>6} + {}\n", escape::encode(text)));
         }
         out.emit_json(
             "replace",
