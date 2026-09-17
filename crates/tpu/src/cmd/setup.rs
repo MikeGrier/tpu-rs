@@ -130,7 +130,7 @@ differences.
   no escaping needed) over `tpu_edit_file` when the target text is unique,
   because line numbers can shift between reads. Use `tpu_edit_file` when
   you have just read the file and know exact line offsets. Every text
-  payload — `content`, `text`, `replacement`, an op's `data` — is written
+  payload — `content`, `replacement`, an op's `data` — is written
   **verbatim**: backslashes are never collapsed, so no tpu tool needs
   pre-doubled escapes. (`tpu_replace_in_file` accepts an opt-in
   `expand_escapes: true` for callers that deliberately double-escape.)
@@ -177,8 +177,9 @@ differences.
   without this field is what means "committable". Preview modes
   (`count: true`, `dry_run: true`, `tpu_append_file` with `diff: true`)
   write nothing, so they never carry it. For a replace preview, read
-  `line_endings.after` instead; `tpu_append_file`'s preview reports only
-  `changed`, so ask `tpu_count_file` or `tpu_doctor` about its line endings.
+  `line_endings.after` instead; `tpu_append_file`'s preview answers only
+  `would_write`, so ask `tpu_count_file` or `tpu_doctor` about its line
+  endings.
   Repair with `tpu_doctor` and `fix: "eol"`.
 - **Several substitutions to one file — use `ops`, never a shell loop.**
   `tpu_replace_in_file` takes an `ops` array instead of a top-level
@@ -369,7 +370,10 @@ between the header and trailer.
   — the two are the same value; prefer `would_write`, which is the name every
   preview mode uses.
   `count:true` (replace only): `{"status":"success","count":N,"would_write":true|false}`.
-  `append diff:true`: diff lines when changed, then `{"status":"success","file":"...","changed":true|false}`.
+  `append diff:true`: diff lines when the text differs, then `{"status":"success","file":"...","changed":true|false,"would_write":true|false}`
+  — both are the byte-level answer, so a `line_ending` override that rewrites
+  every terminator reports true even though the diff (taken in LF space) is
+  empty.
   `tpu_replace_in_file` on a real write additionally reports `"changed_lines":N` in the status —
   the sum, over every match, of `(old span line count) + (new text line count)`; this is a
   cheap per-match total, NOT a deduplicated count of unique file lines, so two matches on the
