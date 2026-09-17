@@ -929,19 +929,14 @@ pub fn write_warning(file: &Path, remedy: &str) -> Option<String> {
             line_ending_name(mismatch.expected),
         ));
     }
-    if counts.is_mixed() {
-        // `detect_with_policy` also returns None when a policy exists but
-        // `text=auto` classified the content as binary, so "no policy" would
-        // be a false claim and point at the wrong remedy.
-        let why = if policy.line_ending.is_none() {
-            "No git policy applies to this path"
-        } else {
-            "Git's policy for this path does not apply to content it classifies as binary"
-        };
+    // Only when git has no say: a policy that classifies the content as binary
+    // leaves the file untouched, so mixed endings there are not a defect and
+    // "normalize it" would be the wrong advice.
+    if counts.is_mixed() && policy.line_ending.is_none() {
         return Some(format!(
-            "the file now contains mixed line endings ({breakdown}). {why}, so nothing was \
-             normalized; rewrite the whole file with an explicit line ending if a single \
-             convention was intended."
+            "the file now contains mixed line endings ({breakdown}). No git policy applies \
+             to this path, so nothing was normalized; rewrite the whole file with an \
+             explicit line ending if a single convention was intended."
         ));
     }
     None

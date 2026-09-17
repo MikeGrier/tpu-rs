@@ -20,8 +20,11 @@
 //!
 //! When the pattern matches zero times, no `line_ending_override` is set,
 //! and the caller is not asking for a count-only or dry-run preview,
-//! [`run`] returns `Ok(0)` without touching the file: no `materialize`, no
-//! atomic rewrite, no `<file>.bak`, no mtime bump.  This makes an unmatched
+//! [`run`] returns a [`ReplaceOutcome`] whose `total()` is 0 and whose
+//! `wrote`/`would_write` are false, without rewriting the file: no
+//! `materialize`, no atomic rewrite, no `<file>.bak`, no mtime bump.  (The
+//! file is still read and decoded -- that is how the count is known -- so
+//! this is a write short-circuit, not a read one.)  This makes an unmatched
 //! pattern observably distinct from a real edit at the file-system level,
 //! and avoids one wasted full-file rewrite per call whose result would have
 //! been byte-identical.
@@ -654,6 +657,18 @@ fn apply(
     // have already been applied to the buffer.
     let mut compiled: Vec<(Regex, bool)> = Vec::with_capacity(ops.len());
     for op in ops {
+        // Guarded here rather than in the decoders so every front end is
+        // covered: an empty literal pattern matches at every byte position and
+        // splices the replacement between every character of the file.
+        if op.pattern.is_empty() && !op.regex {
+            return Err(format!(
+                "replace: {}: 'pattern' is empty, which would match at every position \
+                 and rewrite the whole file; pass regex:true if an empty pattern is \
+                 genuinely intended",
+                file.display()
+            )
+            .into());
+        }
         // Matching happens against the file's LF-normalised view, so a literal
         // CR in the pattern could never match anything.
         let pattern = crate::encoding::normalize_to_lf(op.pattern);

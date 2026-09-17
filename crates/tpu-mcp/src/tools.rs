@@ -2247,6 +2247,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
                 // LF-normalised space, where a pure line-ending rewrite is
                 // invisible even though the write would touch every line.
                 "changed": outcome.would_write,
+                "would_write": outcome.would_write,
                 "count": n,
                 "line_endings": line_endings_json(&outcome),
             });
@@ -2387,6 +2388,7 @@ fn decode_replace_ops(
     // the top level would silently apply none of them -- a caller who set
     // regex:true alongside ops would get literal matching and a success.
     for key in [
+        "label",
         "pattern",
         "replacement",
         "pattern_format",
@@ -2606,6 +2608,7 @@ fn call_replace_batch(args: &Value, config: &ServerConfig, header: &str) -> Tool
                 // See the single-op path: an LF-space diff cannot see a pure
                 // line-ending rewrite.
                 "changed": outcome.would_write,
+                "would_write": outcome.would_write,
                 "count": total,
                 "ops": op_counts,
                 "line_endings": line_endings_json(&outcome),
@@ -6820,6 +6823,46 @@ mod integration_tests {
             call("tpu_replace_in_file", &explicit).is_err(),
             "and asking explicitly is still an error"
         );
+    }
+
+    /// `label` is a per-op field like every other; accepting it at the top
+    /// level silently applied it to nothing.
+    #[test]
+    fn ops_rejects_a_top_level_label() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("b.txt");
+        fs::write(&f, b"alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [{ "pattern": "alpha", "replacement": "beta" }],
+            "label": "stray",
+        });
+        assert!(
+            call("tpu_replace_in_file", &args).is_err(),
+            "a top-level per-op field must be refused"
+        );
+    }
+
+    /// Both preview modes should answer the write question under the same
+    /// name; `changed` is retained as the older alias.
+    #[test]
+    fn dry_run_reports_would_write_alongside_changed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("lf.txt");
+        fs::write(&f, b"a\nb\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "a",
+            "replacement": "a",
+            "dry_run": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(status["would_write"], false, "identity substitution");
+        assert_eq!(status["changed"], status["would_write"], "same value");
     }
 
     #[test]
