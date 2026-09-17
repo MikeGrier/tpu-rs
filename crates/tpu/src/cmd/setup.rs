@@ -229,8 +229,9 @@ differences.
     `changed_line_details_max` (default 50), with
     `changed_line_details_truncated: true` when the cap is hit. Asking for it
     and finding nothing gives an empty array, not a missing key. Batch mode
-    turns this on by default because it has no changed-region echo — except
-    under `count: true`, which performs no substitution and so has nothing to
+    turns this on by default because it has no changed-region echo — unless
+    `diff: true` asked for a whole-file diff instead, and never under
+    `count: true`, which performs no substitution and so has nothing to
     image; asking for details there explicitly is an error, not an empty
     answer. (Not to be confused with the integer `changed_lines` already in
     the trailer, which is only the size estimate that gates the echo.)

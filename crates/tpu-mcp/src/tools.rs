@@ -3809,6 +3809,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
                     })),
                     "eol_repaired": issue.eol_repaired,
                     "any_repaired": issue.repaired || issue.eol_repaired,
+                    "unresolved": issue.is_unresolved(),
                     "mojibake_marker_suppressed": issue.mojibake_marker_suppressed,
                     "replacement_char_marker_suppressed": issue.replacement_char_marker_suppressed,
                 })
@@ -3834,6 +3835,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
             "files": files,
             "total_files_scanned": report.total_files_scanned,
             "total_issues": report.total_issues(),
+            "total_unresolved": report.unresolved_issues(),
             "total_repaired": report.total_repaired,
             "total_marker_suppressed": report.total_marker_suppressed(),
             "walk_warnings": walk_warnings,
