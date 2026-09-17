@@ -161,6 +161,10 @@ differences.
     re-emitted in the target convention even when your substitution had
     nothing to do with line endings. This is the single most common source
     of "why did my diff touch every line" — now it says so.
+  - `count: true` also reports `"would_write"` — whether the bytes on disk
+    would actually change. Ask it rather than inferring from `count`: a
+    `line_ending` override rewrites a file with zero substitutions, and an
+    identity substitution changes nothing with a non-zero one.
   - Pass `changed_line_details: true` for `changed_line_details`: one entry
     per differing line with `old_line`/`new_line` (null for a pure
     insertion/deletion) and `old_text`/`new_text`. Positions name real lines
@@ -294,7 +298,7 @@ between the header and trailer.
   Preview modes do not stamp the file and return a reduced trailer:
   `diff:true` adds unified diff lines before the status (full stamp still present for write/replace/edit).
   `dry_run:true` (replace only): optional diff lines, then `{"status":"success","changed":true|false}`.
-  `count:true` (replace only): `{"status":"success","count":N}`.
+  `count:true` (replace only): `{"status":"success","count":N,"would_write":true|false}`.
   `append diff:true`: diff lines when changed, then `{"status":"success","file":"...","changed":true|false}`.
   `tpu_replace_in_file` on a real write additionally reports `"changed_lines":N` in the status —
   the sum, over every match, of `(old span line count) + (new text line count)`; this is a

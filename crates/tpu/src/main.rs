@@ -535,8 +535,9 @@ enum Commands {
         count: bool,
 
         /// Show a unified diff of what would change without modifying the file.
-        /// Exits with code 1 if any substitution would be made, 0 if none.
-        /// Mutually exclusive with --count.
+        /// Exits with code 1 if the file would change -- including a pure
+        /// --line-ending rewrite with no substitutions -- and 0 if the bytes
+        /// would be identical.  Mutually exclusive with --count.
         #[arg(long, conflicts_with = "count")]
         dry_run: bool,
 

@@ -9048,6 +9048,88 @@ fn rp_replace_changed_lines_escapes_non_ascii_in_the_human_rendering() {
     );
 }
 
+/// Stripping every terminator leaves `none`, which is not a convention to
+/// have been normalised onto. `normalized` keyed off `!is_mixed()`, which is
+/// also false for `none`, so it claimed a normalisation that never happened.
+#[test]
+fn rp_replace_stripping_all_terminators_is_not_a_normalization() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("mixed.txt");
+    fs::write(&target, b"a\nb\r\n").unwrap();
+
+    let o = ok(tpu()
+        .arg("--message-format=json")
+        .arg("replace")
+        .arg(&target)
+        .arg("--regex")
+        .arg("\n")
+        .arg(""));
+
+    let census = parse_ndjson(&o.stdout)
+        .into_iter()
+        .find(|m| m["metric"] == "line_endings")
+        .expect("a census record");
+
+    assert_eq!(census["after"]["uniformity"], "none", "no terminators left");
+    assert_eq!(
+        census["normalized"], false,
+        "nothing was normalised onto a convention: {census}"
+    );
+}
+
+/// A `--line-ending` override rewrites a file with zero substitutions, so
+/// `--dry-run` must exit 1 for it: "would the bytes change" is the question,
+/// and an LF-space diff cannot see a pure terminator rewrite.
+#[test]
+fn rp_replace_dry_run_exits_one_for_a_line_ending_only_rewrite() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lf.txt");
+    fs::write(&target, b"a\nb\n").unwrap();
+
+    let o = tpu()
+        .arg("replace")
+        .arg(&target)
+        .arg("zzz-no-such-match")
+        .arg("x")
+        .arg("--line-ending")
+        .arg("crlf")
+        .arg("--dry-run")
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "the bytes would change: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"a\nb\n",
+        "a dry run must not write"
+    );
+}
+
+/// A pattern carrying a literal CRLF is matched against the file's
+/// LF-normalised view, so without normalising the pattern it could never
+/// match -- contradicting the module's "callers never need to account for
+/// CRLF in their patterns" contract.
+#[test]
+fn rp_replace_pattern_containing_crlf_matches_a_crlf_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("crlf.txt");
+    fs::write(&target, b"alpha\r\nbeta\r\n").unwrap();
+
+    let o = ok(tpu()
+        .arg("replace")
+        .arg(&target)
+        .arg("alpha\r\nbeta")
+        .arg("merged"));
+
+    assert!(o.status.success(), "the pattern must match");
+    assert_eq!(fs::read(&target).unwrap(), b"merged\r\n");
+}
+
 /// The census must be machine-readable in JSON mode and must flag that a
 /// replace collapsed a mixed file onto one convention.
 #[test]

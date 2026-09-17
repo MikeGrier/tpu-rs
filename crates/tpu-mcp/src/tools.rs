@@ -2235,6 +2235,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             let line = serde_json::to_string(&serde_json::json!({
                 "status": "success",
                 "count": n,
+                "would_write": outcome.would_write,
                 "line_endings": line_endings_json(&outcome),
             }))?;
             return Ok(ToolResult::ok(format!("{header}\n{line}")));
@@ -2591,6 +2592,7 @@ fn call_replace_batch(args: &Value, config: &ServerConfig, header: &str) -> Tool
                 "status": "success",
                 "count": total,
                 "ops": op_counts,
+                "would_write": outcome.would_write,
                 "line_endings": line_endings_json(&outcome),
             }))?;
             return Ok(ToolResult::ok(format!("{header}\n{line}")));
@@ -6730,6 +6732,55 @@ mod integration_tests {
         assert_eq!(
             status["wrote"], false,
             "but no bytes reached the disk: {status}"
+        );
+    }
+
+    /// A `count` preview must answer "would the bytes change", which the tally
+    /// alone cannot: a `line_ending` override rewrites a file with zero
+    /// substitutions.
+    #[test]
+    fn count_preview_reports_would_write_for_a_line_ending_only_rewrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("lf.txt");
+        fs::write(&f, b"a\nb\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "zzz-no-such-match",
+            "replacement": "x",
+            "line_ending": "crlf",
+            "count": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(status["count"], 0, "nothing matched");
+        assert_eq!(
+            status["would_write"], true,
+            "but the terminators would change: {status}"
+        );
+        assert_eq!(fs::read(&f).unwrap(), b"a\nb\n", "a count must not write");
+    }
+
+    /// The batch count response carries the same write decision.
+    #[test]
+    fn batch_count_preview_reports_would_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("b.txt");
+        fs::write(&f, b"alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [{ "pattern": "alpha", "replacement": "alpha" }],
+            "count": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(status["count"], 1, "it matched");
+        assert_eq!(
+            status["would_write"], false,
+            "but an identity substitution changes no bytes: {status}"
         );
     }
 

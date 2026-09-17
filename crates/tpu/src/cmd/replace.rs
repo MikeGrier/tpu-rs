@@ -270,8 +270,11 @@ impl ReplaceOutcome {
     ///
     /// Not an error — it is what a whole-file rewrite necessarily does — but
     /// it is a change the caller did not ask for and should know about.
+    /// Requires an actually uniform result: a replace that strips every
+    /// terminator leaves `none`, which is not a convention to have normalised
+    /// onto.
     pub fn normalized_line_endings(&self) -> bool {
-        self.before.is_mixed() && !self.after.is_mixed()
+        self.before.is_mixed() && self.after.uniformity() == "uniform"
     }
 }
 
@@ -514,9 +517,9 @@ fn op_from_json(entry: &serde_json::Value) -> Result<OwnedReplaceOp, String> {
     };
     Ok(OwnedReplaceOp {
         label: op_label(entry)?,
-        // The pattern matches against the file's already LF-normalised view,
-        // so it is never normalised here; the replacement is written into that
-        // view and must be.
+        // Both are normalised at the compile/write chokepoints in `apply`, so
+        // neither needs it here; the replacement is normalised early only
+        // because it is also compared for the escape-hazard guard.
         pattern,
         replacement: crate::encoding::normalize_to_lf(&replacement).into_owned(),
         regex,
@@ -651,10 +654,13 @@ fn apply(
     // have already been applied to the buffer.
     let mut compiled: Vec<(Regex, bool)> = Vec::with_capacity(ops.len());
     for op in ops {
+        // Matching happens against the file's LF-normalised view, so a literal
+        // CR in the pattern could never match anything.
+        let pattern = crate::encoding::normalize_to_lf(op.pattern);
         let escaped = if op.regex {
-            op.pattern.to_owned()
+            pattern.into_owned()
         } else {
-            regex::escape(op.pattern)
+            regex::escape(&pattern)
         };
         let effective_pattern = if op.multiline {
             format!("(?m){escaped}")
@@ -774,16 +780,6 @@ fn apply(
         before
     };
 
-    // --count: return match counts without applying any edits.
-    if count_only {
-        return Ok(ReplaceOutcome {
-            counts,
-            before,
-            after,
-            ..Default::default()
-        });
-    }
-
     // Zero-match short-circuit: no replacements means the atomic rewrite would
     // produce byte-identical content, so skip it entirely -- no materialize,
     // no atomic_write, no .bak, no mtime bump. Callers can then distinguish
@@ -818,10 +814,22 @@ fn apply(
         encoded
     };
 
-    // Compared even under --dry-run: "would this write change the file" is the
-    // question a preview exists to answer, and an LF-space diff cannot answer
-    // it for a pure line-ending rewrite (both sides are identical there).
+    // Computed for every preview, not just the real run: "would this write
+    // change the file" is the question a preview exists to answer, and an
+    // LF-space diff cannot answer it for a pure line-ending rewrite (both
+    // sides are identical there).
     let would_write = crate::retry_io(|| std::fs::read(file))? != out_bytes;
+
+    // --count: return match counts without applying any edits.
+    if count_only {
+        return Ok(ReplaceOutcome {
+            counts,
+            before,
+            after,
+            would_write,
+            ..Default::default()
+        });
+    }
 
     // Write atomically: temp file in same dir → rename original to .bak →
     // persist temp to original path.  Skipped for --dry-run.
