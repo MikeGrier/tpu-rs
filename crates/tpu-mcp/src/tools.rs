@@ -505,7 +505,9 @@ pub fn list() -> Value {
                  allow_no_match / *_format fields, plus an optional 'label'. Ops run IN \
                  ORDER against the evolving buffer (a later op sees earlier ops' output), \
                  and the whole batch is ONE atomic write: one .bak, one mtime bump, one \
-                 content_version. If any op matches zero times without its own \
+                 content_version — when the resulting bytes differ, which an identity \
+                 substitution's do not (check 'wrote'). If any op matches zero times \
+                 without its own \
                  allow_no_match:true, the ENTIRE batch is refused and the file is left \
                  untouched — so a batch can never leave a half-transformed file. The \
                  response reports the per-op tally as 'ops':[{label,count},…] alongside \
@@ -1757,10 +1759,14 @@ pub fn list() -> Value {
                  line/column locations, and whether a one-layer 'peel' repair would \
                  strictly improve the file. Safe to call on directories and globs; \
                  binary file extensions and `.git/` subtrees are skipped automatically. \n\n\
-                 REPAIRS only when called with `fix: \"peel\"`. The repair is conservative: \
+                 REPAIRS only when `fix` is set: `\"peel\"` repairs mojibake, `\"eol\"` \
+                 normalises line endings to git's expected convention, and `\"all\"` does \
+                 both. The mojibake repair is conservative: \
                  the file is rewritten only if the peel produces strictly fewer mojibake \
                  matches than the original. The original content is preserved at \
-                 `<file>.bak` (the standard atomic-write backup). To preview without \
+                 `<file>.bak` (the standard atomic-write backup). Each file reports \
+                 `mojibake_repaired` and `eol_repaired` plus their union `any_repaired`, \
+                 so an EOL-only fix is never misread as a no-op. To preview without \
                  writing, leave `fix` unset and inspect `peel_suggested` in the report. \
                  When a flagged file's peel is declined (`peel_suggested: false` despite \
                  having `mojibake_matches`), `peel_declined_reason` explains why -- e.g. \

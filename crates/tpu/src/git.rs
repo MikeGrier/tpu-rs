@@ -101,6 +101,11 @@ pub struct FilePolicy {
     /// from `line_ending` normalisation (see
     /// [`FilePolicy::line_ending_for_text`]).
     pub auto_text: bool,
+    /// `true` when `.gitattributes` explicitly declared the path not-text
+    /// (`-text` / `-crlf`).  Distinct from having no EOL policy: git
+    /// deliberately leaves such a path's bytes alone, so its line endings are
+    /// not a conformance question.
+    pub declared_binary: bool,
 }
 
 impl FilePolicy {
@@ -171,6 +176,7 @@ impl FilePolicy {
 struct ResolvedAttributes {
     digest: AttributesDigest,
     working_tree_encoding: Option<WorktreeEncoding>,
+    declared_binary: bool,
 }
 
 #[derive(Default)]
@@ -267,6 +273,7 @@ impl GitEol {
                 .map(mode_to_line_ending),
             working_tree_encoding: attributes.working_tree_encoding,
             auto_text: attributes.digest.is_auto_text(),
+            declared_binary: attributes.declared_binary,
         }))
     }
 
@@ -322,6 +329,12 @@ impl GitEol {
         Ok(Some(ResolvedAttributes {
             digest: fold_digest(text_attr, crlf_attr, eol_attr, self.config),
             working_tree_encoding: parse_worktree_encoding(encoding_attr)?,
+            // Mirrors `fold_digest`'s text-then-crlf precedence. Distinct from
+            // a Binary digest, which `core.autocrlf=false` also produces.
+            declared_binary: matches!(
+                extract_crlf(text_attr).or_else(|| extract_crlf(crlf_attr)),
+                Some(AttributesDigest::Binary)
+            ),
         }))
     }
 
@@ -929,10 +942,11 @@ pub fn write_warning(file: &Path, remedy: &str) -> Option<String> {
             line_ending_name(mismatch.expected),
         ));
     }
-    // Only when git has no say: a policy that classifies the content as binary
-    // leaves the file untouched, so mixed endings there are not a defect and
-    // "normalize it" would be the wrong advice.
-    if counts.is_mixed() && policy.line_ending.is_none() {
+    // Only when git has no say at all. A path explicitly declared not-text is
+    // left alone by git on purpose, so its endings are not a defect and
+    // "normalize it" would be the wrong remedy; `text=auto` content classified
+    // as binary is already excluded by its `line_ending` being set.
+    if counts.is_mixed() && policy.line_ending.is_none() && !policy.declared_binary {
         return Some(format!(
             "the file now contains mixed line endings ({breakdown}). No git policy applies \
              to this path, so nothing was normalized; rewrite the whole file with an \
@@ -1170,6 +1184,26 @@ mod tests {
         let dir = init_repo(Some("*.txt text eol=lf\n"), "");
         let file = write_file(dir.path(), "a.txt", b"1\n2\n3\n");
         assert_eq!(write_warning(&file, "REMEDY"), None);
+    }
+
+    /// `-text` is git deliberately leaving the path alone, not an absence of
+    /// policy, so mixed endings there are not a conformance defect.
+    #[test]
+    fn write_warning_is_silent_for_an_explicitly_non_text_path() {
+        let dir = init_repo(Some("*.bin -text\n"), "");
+        let file = write_file(dir.path(), "a.bin", b"1\nT\r\n3\n");
+        assert_eq!(write_warning(&file, "REMEDY"), None);
+    }
+
+    /// But a path git simply has no rule for still warns: mixed endings with
+    /// nothing to judge them by is the case the fallback exists for.
+    #[test]
+    fn write_warning_still_reports_mixed_endings_with_no_policy() {
+        // autocrlf off and no attributes is the "git has no opinion" case.
+        let dir = init_repo(None, "\tautocrlf = false\n");
+        let file = write_file(dir.path(), "a.txt", b"1\nT\r\n3\n");
+        let warning = write_warning(&file, "REMEDY").expect("no policy must still warn");
+        assert!(warning.contains("mixed line endings"), "{warning}");
     }
 
     #[test]
@@ -1565,6 +1599,7 @@ mod tests {
             line_ending: Some(LineEnding::CrLf),
             working_tree_encoding: None,
             auto_text: true,
+            ..Default::default()
         };
         assert_eq!(
             policy.line_ending_for_worktree_bytes(b"alpha\nbeta\n"),

@@ -1001,26 +1001,31 @@ enum Commands {
         before: usize,
     },
 
-    /// Diagnose encoding / mojibake corruption across one or more paths.
+    /// Diagnose encoding / mojibake / line-ending problems across paths.
     ///
     /// Walks each path (file, directory, or shell-style glob) and reports
     /// every text file that either contains characteristic mojibake
-    /// digraphs (`Ã©`, `â€"`, `â\"€`, `Â<NBSP>`) or whose bytes are
-    /// invalid in the file's detected encoding (UTF-8, UTF-16, …).
+    /// digraphs (`Ã©`, `â€"`, `â\"€`, `Â<NBSP>`), whose bytes are
+    /// invalid in the file's detected encoding (UTF-8, UTF-16, …), or
+    /// whose on-disk line endings disagree with git's expected
+    /// working-tree convention for that path.
     /// Files containing the `encoding-check: allow-mojibake` opt-out
     /// marker are reported as clean.
     ///
-    /// With `--fix=peel`, each flagged file is reverse-decoded one
-    /// layer; if the result has strictly fewer mojibake matches it is
+    /// With `--fix=peel`, each mojibake-flagged file is reverse-decoded
+    /// one layer; if the result has strictly fewer mojibake matches it is
     /// rewritten in place via the standard atomic-write path
     /// (a `.bak` is kept and the M2 write-time guard applies).
+    /// `--fix=eol` normalises line endings instead, and `--fix=all`
+    /// does both.
     ///
     /// Skips `.git/`, `node_modules/`, `target/`, and known-binary
     /// extensions.  Honours a top-level `.gitignore` if present (basic
     /// non-negation patterns only).
     ///
-    /// Exit code is 0 only when zero issues remain after any requested
-    /// fixes have been applied.
+    /// Exit code reflects what the scan FOUND, not the state afterwards:
+    /// a `--fix` run that repaired everything still exits 1.  Re-run
+    /// without `--fix` to assert the repaired tree is clean.
     Doctor {
         /// File(s), directory(ies), or glob(s) to scan.  Defaults to `.`
         /// (the current directory) when omitted.
