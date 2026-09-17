@@ -134,39 +134,19 @@ pub fn decode_replacement(s: &str, literal: bool) -> Result<Vec<u8>, String> {
     Ok(crate::encoding::normalize_bytes_to_lf(&bytes))
 }
 
-/// Run the `replace` subcommand.
+/// Options for [`run`] and [`run_batch`], bundling the many positional flags
+/// so that call sites name each field and cannot accidentally transpose the
+/// bare booleans (`multiline` / `regex` / `count_only` / `dry_run`).
 ///
-/// Returns the number of substitutions made.
-///
-/// When `multiline` is `true`, `(?m)` is prepended to `pattern` so that `^`
-/// and `$` match at every LF boundary in the normalised view.  `\n` in
-/// patterns always refers to the LF byte used internally; CRLF is
-/// transparent.
-///
-/// When `line_ending_override` is `Some`, the specified ending is used for
-/// denormalisation instead of Git policy or the file's detected dominant
-/// ending. The file's content encoding follows Git policy or is preserved.
-///
-/// When `diff_out` is `Some`, a unified text diff of the changes (computed in
-/// LF-normalised space) is written to the provided writer after the file has
-/// been successfully updated.
-///
-/// When `count_only` is `true`, the file is not modified; the return value is
-/// the number of matches.
-///
-/// When `dry_run` is `true`, the substitution is computed in memory and the
-/// diff (if any) is written to `diff_out`, but the file is not modified.  The
-/// caller is responsible for converting the return value to an exit code (exit
-/// 1 when the count is > 0, exit 0 when it is 0).
-///
-/// `policy` controls the write-time mojibake guard.  By default the post-
-/// substitution content is rejected if it introduces mojibake matches not
-/// present in the file's prior decoded content; pass
-/// [`WritePolicy::permissive`] (or the CLI's `--allow-mojibake`) to skip
-/// the check.
-/// Options for [`run`], bundling the many positional flags so that call
-/// sites name each field and cannot accidentally transpose the bare
-/// booleans (`multiline` / `regex` / `count_only` / `dry_run`).
+/// `multiline` prepends `(?m)` so `^` / `$` match at every LF boundary; `\n`
+/// in a pattern always refers to the LF byte used internally, so CRLF is
+/// transparent. `line_ending_override` replaces Git policy (and the file's
+/// detected dominant ending) as the denormalisation target; content encoding
+/// still follows Git policy or is preserved. `count_only` and `dry_run` write
+/// nothing. `policy` controls the write-time mojibake guard, which rejects
+/// content introducing mojibake not present in the file's prior decoded
+/// content; pass [`WritePolicy::permissive`] (or the CLI's
+/// `--allow-mojibake`) to skip it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReplaceOptions {
     /// Prepend `(?m)` to the pattern so `^` / `$` match at LF boundaries.
@@ -326,6 +306,12 @@ impl ChangedLine {
 
 /// Apply a regex (or fixed-string) replacement to `file` in place.
 ///
+/// Returns a [`ReplaceOutcome`]: `total()` is the substitution count, `wrote`
+/// and `would_write` say whether bytes reached (or would reach) the disk, and
+/// `before`/`after` carry the line-ending census. A non-zero count does NOT
+/// imply a write — an identity substitution matches and produces
+/// byte-identical output, which the write path skips.
+///
 /// All boolean and policy knobs are bundled into [`ReplaceOptions`]; see its
 /// fields for the per-flag behaviour.  `diff_out`, when `Some`, receives a
 /// unified text diff (in normalised/LF space) after a successful write.
@@ -333,7 +319,9 @@ impl ChangedLine {
 /// `regions`, when `Some`, is populated with one [`ChangedRegion`] per
 /// match — cheap to compute regardless of file size, so callers can build a
 /// compact "changed region" echo without needing to opt into the full
-/// whole-file diff (which clones the entire normalised file).
+/// whole-file diff (which clones the entire normalised file). Note these
+/// describe *matches*, not bytes written, so a caller rendering them should
+/// check `wrote` first.
 pub fn run(
     file: &Path,
     pattern: &str,
@@ -731,17 +719,21 @@ fn apply(
     // for the caller to notice it in. Checked before any write, so the file is
     // untouched.
     //
-    // Exemptions match the single-op contract: introspection modes write
-    // nothing, so zero is a legitimate answer there; and a line-ending
-    // override rewrites the file regardless, so the refusal's own claim that
-    // "the file was not modified" would be false.
-    if !count_only && !dry_run && line_ending_override.is_none() {
+    // Only introspection modes are exempt, because they write nothing. A
+    // `line_ending_override` deliberately is NOT: it exempts the single-op
+    // path (where zero matches would otherwise report failure for a call that
+    // still rewrites the file), but a batch promises that a typo cannot
+    // produce a partial rewrite, and whether the terminators are being
+    // converted says nothing about whether the patterns were right. Set
+    // `allow_no_match` on the op that is legitimately idempotent instead.
+    if !count_only && !dry_run {
         for (op, count) in ops.iter().zip(&counts) {
             if *count == 0 && !op.allow_no_match {
                 let label = op.label.map(|l| format!("{l}: ")).unwrap_or_default();
                 return Err(format!(
-                    "replace: {}: {label}pattern {:?} matched 0 times; no substitutions were \
-                     made and the file was not modified",
+                    "replace: {}: {label}pattern {:?} matched 0 times; the whole batch was \
+                     refused and the file was not modified. Set allow_no_match on this op if \
+                     a zero match is the intended outcome.",
                     file.display(),
                     op.pattern,
                 )
@@ -1529,12 +1521,13 @@ mod tests {
     }
 
     /// The single-op path exempts a line-ending override from the zero-match
-    /// refusal; a batch that did not would refuse a legitimate combination of
-    /// a rename with an EOL normalisation.
+    /// refusal. A batch must NOT: its promise is that a typo cannot produce a
+    /// partial rewrite, and converting terminators says nothing about whether
+    /// the patterns were right.
     #[test]
-    fn a_line_ending_override_exempts_a_batch_from_the_zero_match_refusal() {
+    fn a_line_ending_override_does_not_exempt_a_batch_from_the_zero_match_refusal() {
         let f = scratch_bytes(b"a\nb\n");
-        let outcome = run_batch(
+        let err = run_batch(
             f.path(),
             &[batch_op("nowhere", b"X")],
             None,
@@ -1543,7 +1536,36 @@ mod tests {
                 ..Default::default()
             },
         )
-        .expect("the override makes zero substitutions a real write, not a mistake");
+        .expect_err("a typo must still refuse the batch");
+        assert!(err.to_string().contains("matched 0 times"), "{err}");
+        assert!(
+            err.to_string().contains("allow_no_match"),
+            "the message must name the escape hatch: {err}"
+        );
+        assert_eq!(
+            fs::read(f.path()).unwrap(),
+            b"a\nb\n",
+            "the refusal must leave the file untouched, override or not"
+        );
+    }
+
+    /// The escape hatch still works: an op that is legitimately idempotent
+    /// says so, and the override then rewrites the terminators.
+    #[test]
+    fn an_override_with_allow_no_match_still_rewrites_the_terminators() {
+        let f = scratch_bytes(b"a\nb\n");
+        let mut tolerant = batch_op("nowhere", b"X");
+        tolerant.allow_no_match = true;
+        let outcome = run_batch(
+            f.path(),
+            &[tolerant],
+            None,
+            ReplaceOptions {
+                line_ending_override: Some(LineEnding::CrLf),
+                ..Default::default()
+            },
+        )
+        .expect("an explicit allow_no_match is the documented way through");
         assert_eq!(outcome.total(), 0);
         assert!(outcome.wrote);
         assert_eq!(fs::read(f.path()).unwrap(), b"a\r\nb\r\n");

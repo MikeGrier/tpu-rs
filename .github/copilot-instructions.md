@@ -116,9 +116,10 @@ differences.
     standalone pretty document.)
 - **`eol_warning` on a mutating tool means the write left a non-conforming
   file** — `tpu_create_file` / `tpu_write_file` / `tpu_replace_in_file` /
-  `tpu_edit_file` / `tpu_append_file` add an `eol_warning` field to the
-  status trailer when the resulting file's line endings disagree with git's
-  expectation for that path, or are mixed with no policy to judge them by.
+  `tpu_edit_file` / `tpu_append_file` / `tpu_render_file` add an
+  `eol_warning` field to the status trailer when the resulting file's line
+  endings disagree with git's expectation for that path, or are mixed with no
+  policy to judge them by.
   The write still succeeded; on a real write, a plain `"status":"success"`
   without this field is what means "committable". Preview modes
   (`count: true`, `dry_run: true`, `tpu_append_file` with `diff: true`)
@@ -131,10 +132,15 @@ differences.
   refactor, and it is the case that most often tempts an agent into
   PowerShell — don't go there. The ops run **in order against the evolving
   buffer** (a later op sees earlier ops' output) and land as **one** atomic
-  write: one `.bak`, one mtime bump, one `content_version`. If any op matches
+  write: one `.bak`, one mtime bump, one `content_version` — when the
+  resulting bytes differ, which an identity substitution's do not. If any op
+  matches
   zero times without its own `allow_no_match: true`, the **whole batch** is
   refused and the file is left untouched, so a batch can never leave a
-  half-transformed file. The response carries the per-op tally as
+  half-transformed file. That refusal is *unconditional* for a real write:
+  unlike the single-op form, a `line_ending` override does **not** exempt it,
+  because converting terminators says nothing about whether your patterns
+  were right. The response carries the per-op tally as
   `"ops":[{"label":"…","count":N},…]` next to the total `count` — that tally
   *is* the verification, so no follow-up probe is needed. There is no
   changed-region echo in batch mode (a region's line numbers would refer to
@@ -162,6 +168,12 @@ differences.
     turns this on by default because it has no changed-region echo. (Not to
     be confused with the integer `changed_lines` already in the trailer,
     which is only the size estimate that gates the echo.)
+- **A match is not a write** — the status trailer carries `"wrote"`. An
+  identity substitution matches and reports a non-zero `count`, but produces
+  byte-identical output, which the write path skips: no `.bak`, no mtime
+  bump. The changed-region echo still shows the match (it describes what
+  matched, not what changed), so `wrote: false` is what tells you the file is
+  untouched.
 - **A replace that matches nothing is an error** — `tpu_replace_in_file`
   returns `{"status":"error"}` when `pattern` matches zero times, and leaves
   the file completely untouched (mtime preserved, no `.bak`). This is
@@ -171,7 +183,8 @@ differences.
   genuinely idempotent re-run — the response then carries `count: 0` and a
   `warning`. `count: true` and `dry_run: true` are exempt (zero is a
   legitimate answer for an introspection mode), as is a `line_ending`
-  override, which rewrites the file even with zero substitutions. A real
+  override, which rewrites the file even with zero substitutions. (That
+  override exemption is single-op only — see the `ops` bullet above.) A real
   write always reports `count`, so no follow-up `count: true` call is needed
   to confirm how many substitutions landed.
 - **Writes that should be guarded** — pass `validate: [{ "selector":

@@ -2007,10 +2007,7 @@ fn call_read_file(args: &Value) -> ToolResult {
             None => None,
             Some(s) => Some(tpu::cmd::read::parse_lines_arg(s)?),
         };
-        let numbers = args
-            .get("numbers")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let numbers = optional_bool(args, "numbers")?;
 
         let mut buf: Vec<u8> = Vec::new();
         tpu::cmd::read::run(
@@ -2198,7 +2195,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             .unwrap_or(5) as usize;
         let want_changed_lines = changed_line_details_requested(args, false)?;
         reject_details_with_count(args, count)?;
-        let changed_lines_max = changed_line_details_max(args);
+        let changed_lines_max = changed_line_details_max(args)?;
         let mut regions: Vec<tpu::cmd::replace::ChangedRegion> = Vec::new();
         let regions_req = if count {
             None
@@ -2252,7 +2249,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
                 "count": n,
                 "line_endings": line_endings_json(&outcome),
             });
-            attach_changed_lines(&mut status, &outcome);
+            attach_changed_lines(&mut status, &outcome, want_changed_lines);
             let status_line = serde_json::to_string(&status)?;
             if diff_buf.is_empty() {
                 return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
@@ -2320,10 +2317,13 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             "size": stamp.size,
             "count": n,
             "changed_lines": changed_lines,
+            // A match does not imply a write: an identity substitution
+            // produces byte-identical output, which the write path skips.
+            "wrote": outcome.wrote,
             "line_endings": line_endings_json(&outcome),
             "content_version": content_version,
         });
-        attach_changed_lines(&mut status, &outcome);
+        attach_changed_lines(&mut status, &outcome, want_changed_lines);
         // Reaching here with n == 0 means the caller either passed
         // allow_no_match:true or supplied a line_ending_override that rewrote
         // the file anyway; the hard-error case returned above. Keep the
@@ -2352,6 +2352,11 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
         // Prefer the full unified diff when diff:true was requested (it
         // populated diff_buf); otherwise render the cheap changed-region
         // echo built from `regions` -- no full-file clone involved.
+        // `regions` describes matches, not bytes written, so a textually
+        // no-op match still echoes -- deliberately; see
+        // `replace_diff_true_on_textually_noop_match_still_shows_changed_region_echo`.
+        // `wrote` in the status is what tells a consumer the bytes did not
+        // actually change.
         let echo_text = if diff && !diff_buf.is_empty() {
             String::from_utf8_lossy(&diff_buf).into_owned()
         } else {
@@ -2475,15 +2480,31 @@ fn reject_details_with_count(args: &Value, count: bool) -> Result<(), Box<dyn st
     Ok(())
 }
 
-fn changed_line_details_max(args: &Value) -> usize {
-    args.get("changed_line_details_max")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(50) as usize
+fn changed_line_details_max(args: &Value) -> Result<usize, Box<dyn std::error::Error>> {
+    match args.get("changed_line_details_max") {
+        None | Some(Value::Null) => Ok(50),
+        Some(Value::Number(n)) => n.as_u64().map(|n| n as usize).ok_or_else(|| {
+            "argument 'changed_line_details_max' must be a non-negative integer".into()
+        }),
+        Some(other) => Err(format!(
+            "argument 'changed_line_details_max' must be a non-negative integer, got {other}"
+        )
+        .into()),
+    }
 }
 
-/// Attach the per-line before/after images, when the caller asked for them.
-fn attach_changed_lines(status: &mut Value, outcome: &tpu::cmd::replace::ReplaceOutcome) {
-    if outcome.changed_lines.is_empty() && !outcome.changed_lines_truncated {
+/// Attach the per-line before/after images when the caller asked for them.
+///
+/// An empty array is emitted rather than omitting the key: the schema promises
+/// an array whenever details were requested, and batch mode requests them by
+/// default, so a consumer calling `.as_array()` must not fail on the valid
+/// no-op response.
+fn attach_changed_lines(
+    status: &mut Value,
+    outcome: &tpu::cmd::replace::ReplaceOutcome,
+    requested: bool,
+) {
+    if !requested {
         return;
     }
     status["changed_line_details"] = outcome
@@ -2514,6 +2535,10 @@ fn call_replace_batch(args: &Value, config: &ServerConfig, header: &str) -> Tool
         let count = optional_bool(args, "count")?;
         reject_details_with_count(args, count)?;
         let dry_run = optional_bool(args, "dry_run")?;
+        // A batch has no changed-region echo, so the per-line images are its
+        // only content-level check: default them on unless a full diff was
+        // requested instead. An explicit request always wins over that default.
+        let want_changed_lines = changed_line_details_requested(args, !diff)?;
 
         let _write_lock = if !count && !dry_run {
             tpu::acquire_write_lock(path)
@@ -2554,8 +2579,8 @@ fn call_replace_batch(args: &Value, config: &ServerConfig, header: &str) -> Tool
                 // are its only content-level check: default them on, unless a
                 // full diff was requested instead. An explicit request always
                 // wins over that default.
-                changed_lines: changed_line_details_requested(args, !diff)?,
-                changed_lines_max: Some(changed_line_details_max(args)),
+                changed_lines: want_changed_lines,
+                changed_lines_max: Some(changed_line_details_max(args)?),
             },
         )?;
         let total = outcome.total();
@@ -2580,7 +2605,7 @@ fn call_replace_batch(args: &Value, config: &ServerConfig, header: &str) -> Tool
                 "ops": op_counts,
                 "line_endings": line_endings_json(&outcome),
             });
-            attach_changed_lines(&mut status, &outcome);
+            attach_changed_lines(&mut status, &outcome, want_changed_lines);
             let status_line = serde_json::to_string(&status)?;
             if diff_buf.is_empty() {
                 return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
@@ -2613,10 +2638,11 @@ fn call_replace_batch(args: &Value, config: &ServerConfig, header: &str) -> Tool
             "size": stamp.size,
             "count": total,
             "ops": op_counts,
+            "wrote": outcome.wrote,
             "line_endings": line_endings_json(&outcome),
             "content_version": content_version,
         });
-        attach_changed_lines(&mut status, &outcome);
+        attach_changed_lines(&mut status, &outcome, want_changed_lines);
         // See the single-op path: a bare success is documented to mean
         // committable, so this cannot be gated on whether a write happened.
         attach_eol_warning(&mut status, &file);
@@ -2904,10 +2930,7 @@ fn call_read_file_escaped(args: &Value) -> ToolResult {
             None => None,
             Some(s) => Some(tpu::cmd::read::parse_lines_arg(s)?),
         };
-        let numbers = args
-            .get("numbers")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let numbers = optional_bool(args, "numbers")?;
 
         let mut buf: Vec<u8> = Vec::new();
         tpu::cmd::readex::run(
@@ -2941,10 +2964,7 @@ fn call_read_head(args: &Value) -> ToolResult {
             tpu::cmd::head::HeadMode::Bytes { n }
         } else {
             let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            let numbers = args
-                .get("numbers")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let numbers = optional_bool(args, "numbers")?;
             tpu::cmd::head::HeadMode::Lines { n, numbers }
         };
 
@@ -2978,10 +2998,7 @@ fn call_read_tail(args: &Value) -> ToolResult {
             tpu::cmd::tail::TailMode::Bytes { n }
         } else {
             let n = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(10) as usize;
-            let numbers = args
-                .get("numbers")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
+            let numbers = optional_bool(args, "numbers")?;
             tpu::cmd::tail::TailMode::Lines { n, numbers }
         };
 
@@ -3292,26 +3309,11 @@ fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
         }
 
         let regex = optional_bool(args, "regex")?;
-        let multiline = args
-            .get("multiline")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let ignore_case = args
-            .get("ignore_case")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let all_match = args
-            .get("all_match")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let invert = args
-            .get("invert")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let numbers = args
-            .get("numbers")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let multiline = optional_bool(args, "multiline")?;
+        let ignore_case = optional_bool(args, "ignore_case")?;
+        let all_match = optional_bool(args, "all_match")?;
+        let invert = optional_bool(args, "invert")?;
+        let numbers = optional_bool(args, "numbers")?;
         let count = optional_bool(args, "count")?;
         let after = args.get("after").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let before = args.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -3414,14 +3416,8 @@ fn call_copy_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         let source = normalize_file_path(require_str(args, "source")?);
         let dest = normalize_file_path(require_str(args, "dest")?);
-        let recursive = args
-            .get("recursive")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let overwrite = args
-            .get("overwrite")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let recursive = optional_bool(args, "recursive")?;
+        let overwrite = optional_bool(args, "overwrite")?;
         let on_error = match args.get("on_error") {
             None => config.default_on_error,
             Some(v) => match v.as_str() {
@@ -3585,6 +3581,11 @@ fn call_render_file(args: &Value, config: &ServerConfig) -> ToolResult {
         )?;
         delete_bak_if_exists(&output);
         let stamp = stamp_and_verify(std::path::Path::new(&output), config.verify_delay_ms)?;
+        let mut status = serde_json::json!({"status": "success"});
+        // Render writes, so it owes the same conformance answer as every other
+        // mutating tool; a template or an explicit ending can leave the output
+        // non-conforming.
+        attach_eol_warning(&mut status, &output);
         let result_obj = serde_json::json!({
             "reason": "x-tpu-mcp-result",
             "output": output,
@@ -3594,7 +3595,7 @@ fn call_render_file(args: &Value, config: &ServerConfig) -> ToolResult {
             "size": stamp.size,
         });
         let result_line = serde_json::to_string(&result_obj)?;
-        let status_line = serde_json::to_string(&serde_json::json!({"status":"success"}))?;
+        let status_line = serde_json::to_string(&status)?;
         Ok(ToolResult::ok(format!(
             "{header}\n{result_line}\n{status_line}"
         )))
@@ -6680,6 +6681,89 @@ mod integration_tests {
             !dir.path().join("a.txt.bak").exists(),
             "a preview writes nothing, so there is no backup to leave behind"
         );
+    }
+
+    /// The schema promises an array whenever details were requested, and
+    /// batch mode requests them by default. Omitting the key on a no-op left
+    /// consumers unable to tell "empty" from "not asked for", and `.as_array()`
+    /// failing on a valid response.
+    #[test]
+    fn changed_line_details_is_an_empty_array_not_an_omitted_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "replacement": "alpha",
+            "changed_line_details": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(
+            status["changed_line_details"].as_array().map(Vec::len),
+            Some(0),
+            "requested but empty must still be an array: {status}"
+        );
+    }
+
+    /// `regions` describes matches, not bytes written, so a textually no-op
+    /// match still echoes (pinned separately as an intentional contract).
+    /// `wrote` is what tells a consumer the file did not actually change.
+    #[test]
+    fn an_identity_substitution_reports_wrote_false_alongside_its_echo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "replacement": "alpha",
+        });
+        let out = call("tpu_replace_in_file", &args).expect("must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(status["count"], 1, "it matched");
+        assert_eq!(
+            status["wrote"], false,
+            "but no bytes reached the disk: {status}"
+        );
+    }
+
+    #[test]
+    fn replace_rejects_a_malformed_changed_line_details_max() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "replacement": "beta",
+            "changed_line_details": true,
+            "changed_line_details_max": "50",
+        });
+        assert!(call("tpu_replace_in_file", &args).is_err());
+        assert_eq!(fs::read_to_string(&f).unwrap(), "alpha\n");
+    }
+
+    /// `tpu_find` is read-only, but the PR's contract is that every declared
+    /// boolean is rejected when sent as another JSON type.
+    #[test]
+    fn find_rejects_a_stringly_typed_boolean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "path": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "ignore_case": "true",
+        });
+        assert!(call("tpu_find", &args).is_err());
     }
 
     /// A mistyped `dry_run` must never be read as "do it for real": that
