@@ -9180,6 +9180,29 @@ fn rp_replace_allows_an_empty_pattern_under_regex() {
     assert_eq!(fs::read(&target).unwrap(), b"-a-b-\n-");
 }
 
+/// A CR in the replacement reaching the substitution is re-expanded by the
+/// CRLF denormaliser into `\r\r\n`. The front ends normalise, but `run` and
+/// `run_batch` take raw bytes, so the precondition has to hold in `apply`.
+#[test]
+fn rp_replace_crlf_in_the_replacement_does_not_double_the_cr() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("crlf.txt");
+    fs::write(&target, b"X\r\n").unwrap();
+
+    ok(tpu()
+        .arg("replace")
+        .arg(&target)
+        .arg("--literal-replacement")
+        .arg("X")
+        .arg("P\r\nQ"));
+
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"P\r\nQ\r\n",
+        "each terminator must be exactly one CRLF"
+    );
+}
+
 /// A machine client reading NDJSON must be able to tell a byte-identical
 /// result from a line-ending-only rewrite without shelling out for the exit
 /// code.

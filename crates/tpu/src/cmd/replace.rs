@@ -396,6 +396,17 @@ pub fn run_batch(
     diff_out: Option<&mut dyn Write>,
     opts: ReplaceOptions,
 ) -> Result<ReplaceOutcome, Box<dyn std::error::Error>> {
+    // Both are per-op in batch mode. Honouring the struct field would apply it
+    // to every op; ignoring it silently gives literal, non-multiline matching
+    // to a caller who asked for the opposite.
+    if opts.regex || opts.multiline {
+        return Err(format!(
+            "replace: {}: 'regex' and 'multiline' are per-op in batch mode; set them on \
+             each ops entry rather than on ReplaceOptions",
+            file.display()
+        )
+        .into());
+    }
     apply(file, ops, diff_out, None, opts)
 }
 
@@ -655,7 +666,7 @@ fn apply(
     // Compile and validate every op before touching the file, so a bad pattern
     // or a non-UTF-8 replacement in op 5 cannot be discovered after ops 1..4
     // have already been applied to the buffer.
-    let mut compiled: Vec<(Regex, bool)> = Vec::with_capacity(ops.len());
+    let mut compiled: Vec<(Regex, bool, Vec<u8>)> = Vec::with_capacity(ops.len());
     for op in ops {
         // Guarded here rather than in the decoders so every front end is
         // covered: an empty literal pattern matches at every byte position and
@@ -686,13 +697,19 @@ fn apply(
         // `captures_len()` counts the implicit whole-match group 0, so `> 1`
         // means at least one explicit group exists.
         let has_capture_groups = re.captures_len() > 1;
-        std::str::from_utf8(op.replacement).map_err(|error| {
+        let replacement = std::str::from_utf8(op.replacement).map_err(|error| {
             format!(
                 "replace: {}: replacement is not valid UTF-8: {error}",
                 file.display()
             )
         })?;
-        compiled.push((re, has_capture_groups));
+        // The front ends normalise too, but `denormalize_lf_to_*` assumes an
+        // LF-only buffer: a CR reaching the substitution is re-expanded into
+        // `\r\r\n` for a CRLF target.
+        let replacement = crate::encoding::normalize_to_lf(replacement)
+            .into_owned()
+            .into_bytes();
+        compiled.push((re, has_capture_groups, replacement));
     }
 
     let decoded = crate::read_text_file(file, io_mode)?;
@@ -708,8 +725,8 @@ fn apply(
 
     let mut counts: Vec<usize> = Vec::with_capacity(ops.len());
     let mut buf: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(old_norm);
-    for (index, (op, (re, has_capture_groups))) in ops.iter().zip(&compiled).enumerate() {
-        let replacement = op.replacement;
+    for (index, (re, has_capture_groups, replacement)) in compiled.iter().enumerate() {
+        let replacement = replacement.as_slice();
         let has_capture_groups = *has_capture_groups;
         let count = if index == 0 && regions.is_some() {
             collect_regions(re, replacement, has_capture_groups, &buf, &mut regions)
@@ -1153,6 +1170,28 @@ mod tests {
         );
         let bak = PathBuf::from(format!("{}.bak", f.path().display()));
         assert!(!bak.exists(), "a refused batch must not leave a .bak");
+    }
+
+    /// `regex`/`multiline` are per-op in a batch. Silently dropping them gave
+    /// a caller literal, non-multiline matching after asking for the opposite.
+    #[test]
+    fn run_batch_refuses_options_that_are_per_op() {
+        let f = scratch("alpha\n");
+        for opts in [
+            ReplaceOptions {
+                regex: true,
+                ..Default::default()
+            },
+            ReplaceOptions {
+                multiline: true,
+                ..Default::default()
+            },
+        ] {
+            let err = run_batch(f.path(), &[batch_op("alpha", b"beta")], None, opts)
+                .expect_err("a per-op option set on the batch must be refused");
+            assert!(err.to_string().contains("per-op in batch mode"), "{err}");
+        }
+        assert_eq!(fs::read_to_string(f.path()).unwrap(), "alpha\n");
     }
 
     #[test]

@@ -96,9 +96,10 @@
 //!
 //! ## Exit code (chosen by caller)
 //!
-//! Caller should treat a non-zero `total_issues` *after fixes have been
-//! applied* as a failure (exit 1).  This module returns the report; the
-//! exit decision lives in `main.rs`.
+//! `main.rs` exits 1 when `total_issues` is non-zero.  Note that this counts
+//! what the scan *found*, not what remains: a `--fix` run that repaired
+//! everything still exits 1, matching [`DoctorReport::verdict`].  Re-run
+//! without `--fix` to assert the repaired state is clean.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
