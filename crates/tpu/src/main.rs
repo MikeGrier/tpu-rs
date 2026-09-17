@@ -1677,6 +1677,7 @@ fn run(
                         "reason": "count",
                         "subcommand": "replace",
                         "count": n,
+                        "would_write": outcome.would_write,
                         "rendered": rendered,
                     }),
                 );
@@ -1697,6 +1698,20 @@ fn run(
                         }),
                     );
                 }
+                // The exit code carries this too, but a machine client reading
+                // NDJSON should not have to shell out to learn it.
+                out.emit_json(
+                    "replace",
+                    None,
+                    None,
+                    &serde_json::json!({
+                        "reason": "dry_run",
+                        "subcommand": "replace",
+                        "count": n,
+                        "would_write": outcome.would_write,
+                        "rendered": "",
+                    }),
+                );
                 if outcome.would_write {
                     std::process::exit(1);
                 }

@@ -2539,7 +2539,10 @@ fn call_replace_batch(args: &Value, config: &ServerConfig, header: &str) -> Tool
         // A batch has no changed-region echo, so the per-line images are its
         // only content-level check: default them on unless a full diff was
         // requested instead. An explicit request always wins over that default.
-        let want_changed_lines = changed_line_details_requested(args, !diff)?;
+        // Count mode is excluded: it performs no substitution, so there is
+        // nothing to image -- which is why an explicit request there is an
+        // error rather than an empty answer.
+        let want_changed_lines = changed_line_details_requested(args, !diff && !count)?;
 
         let _write_lock = if !count && !dry_run {
             tpu::acquire_write_lock(path)
@@ -6781,6 +6784,41 @@ mod integration_tests {
         assert_eq!(
             status["would_write"], false,
             "but an identity substitution changes no bytes: {status}"
+        );
+    }
+
+    /// Batch mode defaults the per-line images on, but count mode performs no
+    /// substitution. Defaulting them on there produced an empty result while
+    /// an explicit request was a hard error -- two answers to one question.
+    #[test]
+    fn batch_count_does_not_default_changed_line_details_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("b.txt");
+        fs::write(&f, b"alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [{ "pattern": "alpha", "replacement": "beta" }],
+            "count": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(status["count"], 1);
+        assert!(
+            status.get("changed_line_details").is_none(),
+            "count mode never images changed lines: {status}"
+        );
+
+        let explicit = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [{ "pattern": "alpha", "replacement": "beta" }],
+            "count": true,
+            "changed_line_details": true,
+        });
+        assert!(
+            call("tpu_replace_in_file", &explicit).is_err(),
+            "and asking explicitly is still an error"
         );
     }
 
