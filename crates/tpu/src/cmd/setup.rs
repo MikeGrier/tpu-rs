@@ -156,12 +156,17 @@ differences.
   - *"Is this file committable?"* → `tpu_doctor`. It judges the file against
     the repository's own policy (`.gitattributes` / `core.autocrlf` /
     `core.eol`) and answers with a top-level `verdict` of `"clean"` or
-    `"issues"`. Add `quiet: true` for just the verdict and the offending
+    `"issues"`. `verdict` and `total_issues` describe what the scan *found*,
+    so a `fix` run that repaired everything still reports `"issues"`; what is
+    left afterwards is `total_unresolved`, plus a per-file `unresolved`. Add
+    `quiet: true` for just the verdict and the offending
     paths. This is the conformance check — reach for it before falling back
     to PowerShell `ReadAllBytes` and counting `0x0D`. (From a shell, the
     same report comes from `tpu doctor <path> --message-format=json` as one
     structured NDJSON record; the older `--format=json` still prints a
-    standalone pretty document.)
+    standalone pretty document. `tpu doctor` exits 1 when anything is
+    unresolved and 0 when nothing is, so a `--fix` run that repairs
+    everything it finds succeeds and the command works as a commit gate.)
 - **`eol_warning` on a mutating tool means the write left a non-conforming
   file** — `tpu_create_file` / `tpu_write_file` / `tpu_replace_in_file` /
   `tpu_edit_file` / `tpu_append_file` / `tpu_render_file` add an
