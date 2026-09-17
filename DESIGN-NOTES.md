@@ -981,10 +981,23 @@ encoding-detection step.
 
 `acquire_write_lock` is a best-effort, per-file, cross-process advisory lock
 (`WriteLock` sidecar; `None` means "proceed unlocked"). It is taken by the
-**tpu-mcp server** on every mutating tool call, and deliberately **not** taken
-by any `tpu` CLI subcommand.
+**tpu-mcp server** on every *single-file* mutating tool — `tpu_write_file`,
+`tpu_create_file`, `tpu_render_file`, `tpu_replace_in_file` (single and batch),
+`tpu_edit_file`, `tpu_append_file` — and deliberately **not** taken by any
+`tpu` CLI subcommand.
 
-This asymmetry is intentional, not an oversight.
+Two gaps remain on the server side, both for the same reason. `tpu_copy_file`
+and `tpu_doctor` with a `fix` walk many paths, so locking them is not one
+acquisition but a decision about scope and acquisition order — hold every
+file's lock for the duration of the walk (and risk a deadlock against a peer
+walking the same tree in a different order), or hold each file's lock only
+across its own rewrite (and accept that the walk as a whole is not atomic,
+which it already is not). The second is almost certainly right, but it is a
+deliberate design choice rather than a reflex, so it is recorded here instead
+of being made silently. `tpu setup` is unlocked because its target is a
+repository's own instructions file, written once at setup time.
+
+The CLI asymmetry below is intentional, not an oversight.
 
 **Why the server locks.** `tpu-mcp` is a long-lived process that an agent can
 drive with several tool calls in flight, against the same file, with no

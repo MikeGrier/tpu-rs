@@ -2130,6 +2130,7 @@ fn call_create_file(args: &Value, config: &ServerConfig) -> ToolResult {
         let le_override = eol_write_override(args, &file, config)?;
         let policy = mojibake_policy_from_args(args)?;
 
+        let _write_lock = tpu::acquire_write_lock(path);
         tpu::cmd::create::run(
             path,
             &content,
@@ -3613,6 +3614,7 @@ fn call_render_file(args: &Value, config: &ServerConfig) -> ToolResult {
             },
         };
         let policy = mojibake_policy_from_args(args)?;
+        let _write_lock = tpu::acquire_write_lock(std::path::Path::new(&output));
         let report = tpu::cmd::render::run(
             std::path::Path::new(&output),
             template_inline,
