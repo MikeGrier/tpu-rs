@@ -1190,6 +1190,41 @@ pub fn run_with_policy(
 
 // ── Output rendering ────────────────────────────────────────────────────────
 
+/// Render the line-ending diagnostic, if any.
+///
+/// Reached from both the encoding-invalid and the normal path: an invalid
+/// encoding suppresses the mojibake scan, but says nothing about terminators.
+fn render_eol_mismatch(
+    out: &mut dyn Write,
+    issue: &DoctorIssue,
+    report: &DoctorReport,
+) -> std::io::Result<()> {
+    let Some(m) = issue.eol_mismatch else {
+        return Ok(());
+    };
+    // Three distinct states, so a normalising run that left a file untouched is
+    // never mistaken for a silent success or a bare report:
+    //   * repaired              -> [NORMALIZED]
+    //   * fix asked, not done   -> [NOT NORMALIZED]  (paired with a
+    //                              "doctor: eol-fix failed" line)
+    //   * report only (no fix)  -> no tag
+    let tag = if issue.eol_repaired {
+        " [NORMALIZED]"
+    } else if report.eol_fix_requested {
+        " [NOT NORMALIZED]"
+    } else {
+        ""
+    };
+    writeln!(
+        out,
+        "{}: line endings ({}) differ from git's expected {} (per .gitattributes / core.autocrlf / core.eol){}",
+        issue.path.display(),
+        git::line_ending_name(m.actual),
+        git::line_ending_name(m.expected),
+        tag,
+    )
+}
+
 fn emit_human(out: &mut dyn Write, report: &DoctorReport, quiet: bool) -> std::io::Result<()> {
     if !quiet {
         for issue in &report.issues {
@@ -1200,6 +1235,9 @@ fn emit_human(out: &mut dyn Write, report: &DoctorReport, quiet: bool) -> std::i
                     issue.path.display(),
                     issue.encoding_detected
                 )?;
+                // The mojibake scan is skipped for invalid encodings, but a
+                // line-ending mismatch is an independent finding.
+                render_eol_mismatch(out, issue, report)?;
                 continue;
             }
             // Per-pattern counts for a one-line summary.
@@ -1259,30 +1297,7 @@ fn emit_human(out: &mut dyn Write, report: &DoctorReport, quiet: bool) -> std::i
                     )?;
                 }
             }
-            if let Some(m) = issue.eol_mismatch {
-                // Three distinct states, so a normalising run that left a file
-                // untouched is never mistaken for a silent success or a bare
-                // report:
-                //   * repaired              -> [NORMALIZED]
-                //   * fix asked, not done   -> [NOT NORMALIZED]  (paired with a
-                //                              "doctor: eol-fix failed" line)
-                //   * report only (no fix)  -> no tag
-                let tag = if issue.eol_repaired {
-                    " [NORMALIZED]"
-                } else if report.eol_fix_requested {
-                    " [NOT NORMALIZED]"
-                } else {
-                    ""
-                };
-                writeln!(
-                    out,
-                    "{}: line endings ({}) differ from git's expected {} (per .gitattributes / core.autocrlf / core.eol){}",
-                    issue.path.display(),
-                    git::line_ending_name(m.actual),
-                    git::line_ending_name(m.expected),
-                    tag,
-                )?;
-            }
+            render_eol_mismatch(out, issue, report)?;
             if let Some(n) = issue.mojibake_marker_suppressed {
                 writeln!(
                     out,
@@ -2107,6 +2122,45 @@ mod tests {
         assert_eq!(o.format, DoctorFormat::Human);
         assert_eq!(o.fix, DoctorFix::None);
         assert!(!o.quiet);
+    }
+
+    /// An invalid encoding suppresses the mojibake scan but says nothing about
+    /// terminators, so the human renderer must not skip the EOL diagnostic the
+    /// JSON report carries.
+    #[test]
+    fn human_output_reports_eol_mismatch_for_an_encoding_invalid_file() {
+        let mut report = DoctorReport::default();
+        report.total_files_scanned = 1;
+        report.issues.push(DoctorIssue {
+            path: PathBuf::from("a.txt"),
+            encoding_detected: "UTF-8",
+            valid_in_detected_encoding: false,
+            mojibake_matches: Vec::new(),
+            replacement_char_matches: Vec::new(),
+            peel_suggested: None,
+            peel_declined_reason: None,
+            repaired: false,
+            eol_mismatch: Some(git::EolMismatch {
+                actual: harrier::encoding::LineEnding::CrLf,
+                expected: harrier::encoding::LineEnding::Lf,
+            }),
+            eol_repaired: false,
+            mojibake_marker_suppressed: None,
+            replacement_char_marker_suppressed: None,
+        });
+
+        let mut out: Vec<u8> = Vec::new();
+        emit_human(&mut out, &report, false).unwrap();
+        let text = String::from_utf8(out).unwrap();
+
+        assert!(
+            text.contains("invalid bytes in detected encoding"),
+            "{text}"
+        );
+        assert!(
+            text.contains("line endings (CRLF) differ from git's expected LF"),
+            "the EOL finding must not be swallowed: {text}"
+        );
     }
 
     #[test]

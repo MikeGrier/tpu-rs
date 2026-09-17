@@ -1010,7 +1010,9 @@ enum Commands {
     /// whose on-disk line endings disagree with git's expected
     /// working-tree convention for that path.
     /// Files containing the `encoding-check: allow-mojibake` opt-out
-    /// marker are reported as clean.
+    /// marker are not flagged for mojibake or replacement characters;
+    /// a line-ending mismatch is a separate concern and is still
+    /// reported.
     ///
     /// With `--fix=peel`, each mojibake-flagged file is reverse-decoded
     /// one layer; if the result has strictly fewer mojibake matches it is
