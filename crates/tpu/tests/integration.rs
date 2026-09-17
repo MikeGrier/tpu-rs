@@ -9130,6 +9130,56 @@ fn rp_replace_pattern_containing_crlf_matches_a_crlf_file() {
     assert_eq!(fs::read(&target).unwrap(), b"merged\r\n");
 }
 
+/// An empty literal pattern matches at every byte position, splicing the
+/// replacement between every character of the file. The guard lived only in
+/// the `ops` decoder, so the single-op front ends walked straight into it.
+#[test]
+fn rp_replace_refuses_an_empty_literal_pattern() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("intact.txt");
+    fs::write(&target, "hello\n").unwrap();
+
+    let o = tpu()
+        .arg("replace")
+        .arg(&target)
+        .arg("")
+        .arg("X")
+        .output()
+        .unwrap();
+
+    assert!(
+        !o.status.success(),
+        "an empty literal pattern must be refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("regex:true"),
+        "and must name the escape hatch: {}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+    assert_eq!(
+        fs::read(&target).unwrap(),
+        b"hello\n",
+        "the file must be untouched"
+    );
+}
+
+/// The escape hatch still works: an empty pattern is legitimate under regex.
+#[test]
+fn rp_replace_allows_an_empty_pattern_under_regex() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("re.txt");
+    fs::write(&target, "ab\n").unwrap();
+
+    ok(tpu()
+        .arg("replace")
+        .arg(&target)
+        .arg("--regex")
+        .arg("")
+        .arg("-"));
+
+    assert_eq!(fs::read(&target).unwrap(), b"-a-b-\n-");
+}
+
 /// A machine client reading NDJSON must be able to tell a byte-identical
 /// result from a line-ending-only rewrite without shelling out for the exit
 /// code.

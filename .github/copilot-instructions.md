@@ -149,7 +149,11 @@ differences.
   an intermediate buffer); pass `diff: true` for a whole-file old/new diff.
   The CLI takes the identical array: `tpu replace FILE --ops ops.json`
   (or `--ops -` for stdin) parses the same objects with the same code, so a
-  batch moves between the two unchanged.
+  batch moves between the two unchanged. Every per-op field (`label`,
+  `pattern`, `replacement`, `regex`, `multiline`, `allow_no_match`, the
+  `*_format` channels) is **rejected** at the top level alongside `ops`,
+  because applying none of them silently is how a batch quietly does the
+  wrong thing.
 - **Verifying a replace — read the response, don't re-read the file.**
   Every `tpu_replace_in_file` reply (including `count: true` and
   `dry_run: true`) carries `"line_endings"` with a **before and after**
@@ -299,7 +303,9 @@ between the header and trailer.
   asked for — see "Verifying a replace" above.
   Preview modes do not stamp the file and return a reduced trailer:
   `diff:true` adds unified diff lines before the status (full stamp still present for write/replace/edit).
-  `dry_run:true` (replace only): optional diff lines, then `{"status":"success","changed":true|false}`.
+  `dry_run:true` (replace only): optional diff lines, then `{"status":"success","changed":true|false,"would_write":true|false}`
+  — the two are the same value; prefer `would_write`, which is the name every
+  preview mode uses.
   `count:true` (replace only): `{"status":"success","count":N,"would_write":true|false}`.
   `append diff:true`: diff lines when changed, then `{"status":"success","file":"...","changed":true|false}`.
   `tpu_replace_in_file` on a real write additionally reports `"changed_lines":N` in the status —
