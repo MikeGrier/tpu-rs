@@ -117,14 +117,21 @@ use crate::{
 /// UTF-8 bytes; no escape decoding is performed and `\n` remains the
 /// two-character sequence backslash + `n`.
 ///
+/// Either way the result is LF-normalised. Substitution happens in LF-only
+/// space and the target convention is applied once at write time, so a CR
+/// arriving here — from a `\r` escape or a literal one — would survive into
+/// [`crate::encoding::denormalize_lf_to_crlf`], whose precondition it breaks,
+/// and land on disk as `\r\r\n`.
+///
 /// Errors are returned as `String` so the CLI can surface them directly with
 /// a `replace:` prefix.
 pub fn decode_replacement(s: &str, literal: bool) -> Result<Vec<u8>, String> {
-    if literal {
-        Ok(s.as_bytes().to_vec())
+    let bytes = if literal {
+        s.as_bytes().to_vec()
     } else {
-        crate::escape::decode_bytes(s).map_err(|e| format!("invalid escape in replacement: {e}"))
-    }
+        crate::escape::decode_bytes(s).map_err(|e| format!("invalid escape in replacement: {e}"))?
+    };
+    Ok(crate::encoding::normalize_bytes_to_lf(&bytes))
 }
 
 /// Run the `replace` subcommand.
@@ -178,6 +185,14 @@ pub struct ReplaceOptions {
     pub io_mode: IoMode,
     /// Write-time mojibake guard policy.
     pub policy: WritePolicy,
+    /// Collect a before/after image of every changed line.
+    ///
+    /// Off by default because it costs a whole-file line diff, which the
+    /// cheap [`ChangedRegion`] echo exists to avoid.
+    pub changed_lines: bool,
+    /// Stop collecting after this many changed lines, setting
+    /// [`ReplaceOutcome::changed_lines_truncated`]. `None` means no bound.
+    pub changed_lines_max: Option<usize>,
 }
 
 /// A single contiguous region changed by one match/replacement, used to
@@ -224,6 +239,91 @@ pub struct RegionsRequest<'a> {
     pub text_budget_lines: Option<usize>,
 }
 
+/// Everything a caller needs to verify that a replace did what it expected.
+///
+/// A bare substitution count answers "did anything happen" but not "did the
+/// right thing happen, and is the file still committable". The line-ending
+/// census answers the second question directly: a whole-file replace always
+/// rewrites every terminator to one convention, so a mixed file is silently
+/// homogenised by an edit that had nothing to do with line endings. Reporting
+/// `before` and `after` makes that visible instead of leaving it to be
+/// discovered at `git commit`.
+#[derive(Debug, Clone, Default)]
+pub struct ReplaceOutcome {
+    /// One match count per op, positionally aligned with the request.
+    pub counts: Vec<usize>,
+    /// Terminator census of the file as it was read.
+    pub before: crate::TextLayout,
+    /// Terminator census of the file as written — or as it *would* be written
+    /// under `dry_run` / `count_only`. Equal to `before` when no write
+    /// happened.
+    pub after: crate::TextLayout,
+    /// Per-line before/after images, when [`ReplaceOptions::changed_lines`]
+    /// asked for them.
+    pub changed_lines: Vec<ChangedLine>,
+    /// Whether `changed_lines` was truncated by
+    /// [`ReplaceOptions::changed_lines_max`].
+    pub changed_lines_truncated: bool,
+    /// Whether bytes actually reached the disk.
+    ///
+    /// Distinct from a non-zero count: an identity substitution matches but
+    /// produces byte-identical output, which the write path skips. Callers
+    /// that stamp mtime or clear a `.bak` on "something happened" must key off
+    /// this, not the count, or a no-op mutates the file's metadata.
+    pub wrote: bool,
+    /// Whether the resulting bytes differ from what is on disk.
+    ///
+    /// Equal to [`Self::wrote`] for a real run; under `dry_run` it is the
+    /// answer `wrote` cannot give. Callers deriving "would anything change"
+    /// must use this rather than an empty diff: the diff is computed in
+    /// LF-normalised space, where a pure line-ending rewrite looks identical.
+    pub would_write: bool,
+}
+
+impl ReplaceOutcome {
+    /// Total substitutions across every op.
+    pub fn total(&self) -> usize {
+        self.counts.iter().sum()
+    }
+
+    /// True when the write collapsed a mixed file onto one convention.
+    ///
+    /// Not an error — it is what a whole-file rewrite necessarily does — but
+    /// it is a change the caller did not ask for and should know about.
+    pub fn normalized_line_endings(&self) -> bool {
+        self.before.is_mixed() && !self.after.is_mixed()
+    }
+}
+
+/// One line that differs between the file as read and the file as written.
+///
+/// Derived from a line-level diff of the final before/after text, so the
+/// positions are meaningful for a batch too: they name real lines of the real
+/// files, not of some intermediate buffer a single op happened to see.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedLine {
+    /// 1-based line number in the file as read; `None` for an inserted line.
+    pub old_line: Option<usize>,
+    /// 1-based line number in the file as written; `None` for a deleted line.
+    pub new_line: Option<usize>,
+    /// The line's content before, without its terminator.
+    pub old_text: Option<String>,
+    /// The line's content after, without its terminator.
+    pub new_text: Option<String>,
+}
+
+impl ChangedLine {
+    #[allow(dead_code)] // Used by tpu-mcp (library consumer), not by the tpu binary.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "old_line": self.old_line,
+            "new_line": self.new_line,
+            "old_text": self.old_text,
+            "new_text": self.new_text,
+        })
+    }
+}
+
 /// Apply a regex (or fixed-string) replacement to `file` in place.
 ///
 /// All boolean and policy knobs are bundled into [`ReplaceOptions`]; see its
@@ -239,66 +339,623 @@ pub fn run(
     pattern: &str,
     replacement: &[u8],
     diff_out: Option<&mut dyn Write>,
+    regions: Option<RegionsRequest<'_>>,
+    opts: ReplaceOptions,
+) -> Result<ReplaceOutcome, Box<dyn std::error::Error>> {
+    let op = ReplaceOp {
+        label: None,
+        pattern,
+        replacement,
+        regex: opts.regex,
+        multiline: opts.multiline,
+        // The single-op path has always returned `Ok(0)` for a pattern that
+        // matched nothing and left the refusal to its callers; only a batch
+        // needs the all-or-nothing guarantee baked in here.
+        allow_no_match: true,
+    };
+    apply(file, std::slice::from_ref(&op), diff_out, regions, opts)
+}
+
+/// One substitution within a batch.
+///
+/// `regex` and `multiline` are per-op rather than per-call so a single batch
+/// can mix a literal rename with an anchored regex rewrite.
+pub struct ReplaceOp<'a> {
+    /// Caller-supplied name for this op, echoed back beside its count so a
+    /// batch's result reads as a tally rather than an anonymous list.
+    pub label: Option<&'a str>,
+    pub pattern: &'a str,
+    pub replacement: &'a [u8],
+    /// Interpret `pattern` as a `regex::bytes` pattern instead of a literal.
+    pub regex: bool,
+    /// Prepend `(?m)` so `^` / `$` match at LF boundaries.
+    pub multiline: bool,
+    /// When `false`, this op matching nothing refuses the **whole** batch.
+    pub allow_no_match: bool,
+}
+
+/// Apply several substitutions to `file` in one atomic write.
+///
+/// Ops run **in order against the evolving buffer**, so a later op sees the
+/// output of every earlier one — the same semantics as a chain of
+/// `String::replace` calls, which is what this exists to replace. Returns one
+/// match count per op, positionally aligned with `ops`.
+///
+/// The whole batch is one write: one temp-file swap, one `<file>.bak`, one
+/// mtime bump, one mojibake-guard check against the file's original content.
+/// A batch that fails partway therefore cannot leave a half-transformed file,
+/// which is the failure mode of running the ops as N separate calls.
+///
+/// Any op whose count is zero and whose `allow_no_match` is `false` refuses
+/// the entire batch and leaves the file untouched — a mis-anchored pattern in
+/// the middle of a rename is exactly the mistake a silent no-op hides, and
+/// unlike the single-op path there is no caller left to notice it per-op.
+///
+/// [`ChangedRegion`] echoes are deliberately not offered here: a region's line
+/// numbers refer to the buffer as that op saw it, and once an earlier op has
+/// added or removed lines those numbers describe neither the original file nor
+/// the final one. Pass `diff_out` for an unambiguous whole-file old/new diff,
+/// or read the per-op counts.
+pub fn run_batch(
+    file: &Path,
+    ops: &[ReplaceOp<'_>],
+    diff_out: Option<&mut dyn Write>,
+    opts: ReplaceOptions,
+) -> Result<ReplaceOutcome, Box<dyn std::error::Error>> {
+    apply(file, ops, diff_out, None, opts)
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// The shared `ops` schema
+// ──────────────────────────────────────────────────────────────────────────────
+//
+// `tpu_replace_in_file`'s `ops` argument and `tpu replace --ops FILE` are the
+// same JSON array of the same objects, parsed here by the same code. Keeping
+// one decoder is the point: a batch written for one front end is copy-pasteable
+// into the other, and neither can grow a field the other silently ignores.
+
+/// An owned [`ReplaceOp`], as decoded from the shared JSON object form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedReplaceOp {
+    pub label: Option<String>,
+    pub pattern: String,
+    pub replacement: String,
+    pub regex: bool,
+    pub multiline: bool,
+    pub allow_no_match: bool,
+}
+
+impl OwnedReplaceOp {
+    pub fn as_op(&self) -> ReplaceOp<'_> {
+        ReplaceOp {
+            label: self.label.as_deref(),
+            pattern: &self.pattern,
+            replacement: self.replacement.as_bytes(),
+            regex: self.regex,
+            multiline: self.multiline,
+            allow_no_match: self.allow_no_match,
+        }
+    }
+}
+
+/// Borrow a whole slice of owned ops for [`run_batch`].
+pub fn as_ops(owned: &[OwnedReplaceOp]) -> Vec<ReplaceOp<'_>> {
+    owned.iter().map(OwnedReplaceOp::as_op).collect()
+}
+
+/// Decode an `ops` array: a JSON array of substitution objects.
+pub fn ops_from_json(value: &serde_json::Value) -> Result<Vec<OwnedReplaceOp>, String> {
+    let entries = value
+        .as_array()
+        .ok_or("'ops' must be a JSON array of substitution objects")?;
+    if entries.is_empty() {
+        return Err("'ops' must contain at least one substitution".into());
+    }
+    entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| op_from_json(entry).map_err(|e| format!("ops[{i}]: {e}")))
+        .collect()
+}
+
+/// Read the `ops` array from a file (or stdin when `path` is `-`).
+pub fn ops_from_file(path: &Path) -> Result<Vec<OwnedReplaceOp>, String> {
+    let text = if path == Path::new("-") {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .map_err(|e| format!("--ops: reading stdin: {e}"))?;
+        buf
+    } else {
+        std::fs::read_to_string(path).map_err(|e| format!("--ops {}: {e}", path.display()))?
+    };
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| format!("--ops {}: not valid JSON: {e}", path.display()))?;
+    ops_from_json(&value).map_err(|e| format!("--ops {}: {e}", path.display()))
+}
+
+/// Decode one substitution object.
+///
+/// `replacement` is taken **verbatim** unless the object sets
+/// `expand_escapes: true` — the same rule as every other tpu text payload, and
+/// deliberately *not* the CLI positional `REPLACEMENT`'s escape-decoding
+/// default, which exists only to match `sed`/`perl` habits at a shell prompt.
+fn op_from_json(entry: &serde_json::Value) -> Result<OwnedReplaceOp, String> {
+    if !entry.is_object() {
+        return Err(format!("must be a JSON object, got {entry}"));
+    }
+    for key in entry.as_object().into_iter().flat_map(|o| o.keys()) {
+        if !OP_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "unknown field {key:?}; expected one of {}",
+                OP_KEYS.join(", ")
+            ));
+        }
+    }
+    let expand_escapes = op_bool(entry, "expand_escapes")?;
+    let replacement_format = op_format(entry, "replacement_format")?;
+    if expand_escapes && replacement_format.is_some() {
+        return Err(
+            "'expand_escapes' cannot be combined with 'replacement_format': the \
+                    encoded payload already specifies the exact bytes to write"
+                .into(),
+        );
+    }
+    let pattern = match op_format(entry, "pattern_format")? {
+        Some(fmt) => decode_utf8_payload(&fmt, op_str(entry, "pattern")?, "pattern_format")?,
+        None => op_str(entry, "pattern")?.to_owned(),
+    };
+    let regex = op_bool(entry, "regex")?;
+    // An empty literal pattern matches at every byte position, so it splices
+    // the replacement between every character of the file -- with a large,
+    // plausible-looking count that the all-or-nothing guard never questions.
+    // Almost always a template variable that resolved to nothing.
+    if pattern.is_empty() && !regex {
+        return Err(
+            "'pattern' is empty, which would match at every position and rewrite \
+                    the whole file; pass regex:true if an empty pattern is genuinely \
+                    intended"
+                .into(),
+        );
+    }
+    let replacement = match replacement_format {
+        Some(fmt) => {
+            decode_utf8_payload(&fmt, op_str(entry, "replacement")?, "replacement_format")?
+        }
+        None if expand_escapes => unescape_replacement(op_str(entry, "replacement")?),
+        None => op_str(entry, "replacement")?.to_owned(),
+    };
+    Ok(OwnedReplaceOp {
+        label: op_label(entry)?,
+        // The pattern matches against the file's already LF-normalised view,
+        // so it is never normalised here; the replacement is written into that
+        // view and must be.
+        pattern,
+        replacement: crate::encoding::normalize_to_lf(&replacement).into_owned(),
+        regex,
+        multiline: op_bool(entry, "multiline")?,
+        allow_no_match: op_bool(entry, "allow_no_match")?,
+    })
+}
+
+/// A mistyped `label` is an error, not a silent `None`: the per-op tally is
+/// what a caller is told to verify against, and an anonymous row defeats that.
+fn op_label(entry: &serde_json::Value) -> Result<Option<String>, String> {
+    match entry.get("label") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => Ok(Some(s.clone())),
+        Some(other) => Err(format!("'label' must be a JSON string, got {other}")),
+    }
+}
+
+const OP_KEYS: &[&str] = &[
+    "label",
+    "pattern",
+    "pattern_format",
+    "replacement",
+    "replacement_format",
+    "expand_escapes",
+    "regex",
+    "multiline",
+    "allow_no_match",
+];
+
+fn decode_utf8_payload(
+    format: &crate::data_format::DataFormat,
+    raw: &str,
+    what: &str,
+) -> Result<String, String> {
+    let bytes = crate::data_format::decode(format, raw).map_err(|e| format!("{what}: {e}"))?;
+    String::from_utf8(bytes).map_err(|e| format!("{what}: decoded bytes are not valid UTF-8: {e}"))
+}
+
+fn op_str<'a>(entry: &'a serde_json::Value, key: &str) -> Result<&'a str, String> {
+    entry
+        .get(key)
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| format!("missing required string field '{key}'"))
+}
+
+/// A present-but-non-boolean value is an error, never a silent `false`: a
+/// caller who sent `"true"` deserves to be told the flag did not take effect.
+fn op_bool(entry: &serde_json::Value, key: &str) -> Result<bool, String> {
+    match entry.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(false),
+        Some(serde_json::Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!("'{key}' must be a JSON boolean, got {other}")),
+    }
+}
+
+fn op_format(
+    entry: &serde_json::Value,
+    key: &str,
+) -> Result<Option<crate::data_format::DataFormat>, String> {
+    match entry.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(s)) => {
+            crate::data_format::DataFormat::from_name(s).map(Some)
+        }
+        Some(other) => Err(format!(
+            "'{key}' must be a JSON string naming a data format, got {other}"
+        )),
+    }
+}
+
+/// Expand `\n`, `\r`, `\t`, and `\\` in a replacement template.
+///
+/// **Opt-in only** (`expand_escapes: true`); the default is verbatim. All
+/// other `\X` sequences pass through with the backslash intact so that `$1`,
+/// `$name`, and `$$` reach the regex engine unaltered.
+#[allow(dead_code)] // Also used by tpu-mcp (library consumer).
+pub fn unescape_replacement(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_owned();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('\\') => out.push('\\'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Shared implementation of [`run`] and [`run_batch`].
+///
+/// `regions`, when requested, describes the first op only — it is reachable
+/// solely from the single-op [`run`] path.
+fn apply(
+    file: &Path,
+    ops: &[ReplaceOp<'_>],
+    diff_out: Option<&mut dyn Write>,
     mut regions: Option<RegionsRequest<'_>>,
     opts: ReplaceOptions,
-) -> Result<usize, Box<dyn std::error::Error>> {
+) -> Result<ReplaceOutcome, Box<dyn std::error::Error>> {
     let ReplaceOptions {
-        multiline,
-        regex,
+        multiline: _,
+        regex: _,
         line_ending_override,
         count_only,
         dry_run,
         io_mode,
         policy,
+        changed_lines: want_changed_lines,
+        changed_lines_max,
     } = opts;
-    let escaped = if regex {
-        pattern.to_owned()
-    } else {
-        regex::escape(pattern)
-    };
-    let effective_pattern = if multiline {
-        format!("(?m){escaped}")
-    } else {
-        escaped
-    };
+    if ops.is_empty() {
+        return Err(format!("replace: {}: no operations supplied", file.display()).into());
+    }
+
+    // Compile and validate every op before touching the file, so a bad pattern
+    // or a non-UTF-8 replacement in op 5 cannot be discovered after ops 1..4
+    // have already been applied to the buffer.
+    let mut compiled: Vec<(Regex, bool)> = Vec::with_capacity(ops.len());
+    for op in ops {
+        let escaped = if op.regex {
+            op.pattern.to_owned()
+        } else {
+            regex::escape(op.pattern)
+        };
+        let effective_pattern = if op.multiline {
+            format!("(?m){escaped}")
+        } else {
+            escaped
+        };
+        let re = Regex::new(&effective_pattern)?;
+        // `captures_len()` counts the implicit whole-match group 0, so `> 1`
+        // means at least one explicit group exists.
+        let has_capture_groups = re.captures_len() > 1;
+        std::str::from_utf8(op.replacement).map_err(|error| {
+            format!(
+                "replace: {}: replacement is not valid UTF-8: {error}",
+                file.display()
+            )
+        })?;
+        compiled.push((re, has_capture_groups));
+    }
 
     let decoded = crate::read_text_file(file, io_mode)?;
     let file_encoding = decoded.encoding;
     let detected_line_ending = decoded.line_ending;
     let had_bom = decoded.bom_len > 0;
+    // The terminator census taken during the decode above — free, and taken
+    // in Unicode space so UTF-16's interleaved CR/LF code units are counted
+    // correctly rather than as stray bytes.
+    let before = decoded.layout;
     let old_text = decoded.text;
     let old_norm = old_text.as_bytes();
 
-    let re = Regex::new(&effective_pattern)?;
+    let mut counts: Vec<usize> = Vec::with_capacity(ops.len());
+    let mut buf: std::borrow::Cow<'_, [u8]> = std::borrow::Cow::Borrowed(old_norm);
+    for (index, (op, (re, has_capture_groups))) in ops.iter().zip(&compiled).enumerate() {
+        let replacement = op.replacement;
+        let has_capture_groups = *has_capture_groups;
+        let count = if index == 0 && regions.is_some() {
+            collect_regions(re, replacement, has_capture_groups, &buf, &mut regions)
+        } else {
+            re.find_iter(&buf).count()
+        };
+        counts.push(count);
+        if count > 0 {
+            let next = if has_capture_groups {
+                re.replace_all(&buf, replacement).into_owned()
+            } else {
+                re.replace_all(&buf, regex::bytes::NoExpand(replacement))
+                    .into_owned()
+            };
+            buf = std::borrow::Cow::Owned(next);
+        }
+    }
 
-    // When the pattern has no explicit capture groups, `$` in the replacement
-    // cannot reference anything useful, so we treat the replacement bytes as a
-    // literal string rather than a capture-group template.  This keeps `$`
-    // (e.g. prices like `$5.00`, shell variables, template placeholders)
-    // intact instead of silently consuming it as a group reference.  Non-
-    // regex (literal) patterns always land here, so a literal search implies
-    // a literal replacement.  `captures_len()` counts the implicit
-    // whole-match group 0, so `> 1` means at least one explicit group exists.
-    let has_capture_groups = re.captures_len() > 1;
+    // Resolved once, before the preview branch, so `count`/`dry_run` predict
+    // the write exactly -- including failing on a policy the write would fail
+    // on, rather than silently reporting a census derived from a different
+    // target.
+    let git_policy = crate::git::policy_for_path(file)?;
+    let replacement_count: usize = counts.iter().sum();
 
-    std::str::from_utf8(replacement).map_err(|error| {
-        format!(
-            "replace: {}: replacement is not valid UTF-8: {error}",
-            file.display()
-        )
-    })?;
+    // A batch is all-or-nothing: an op that matched nothing is a mis-anchored
+    // pattern, and unlike the single-op path there is no per-call result left
+    // for the caller to notice it in. Checked before any write, so the file is
+    // untouched.
+    //
+    // Exemptions match the single-op contract: introspection modes write
+    // nothing, so zero is a legitimate answer there; and a line-ending
+    // override rewrites the file regardless, so the refusal's own claim that
+    // "the file was not modified" would be false.
+    if !count_only && !dry_run && line_ending_override.is_none() {
+        for (op, count) in ops.iter().zip(&counts) {
+            if *count == 0 && !op.allow_no_match {
+                let label = op.label.map(|l| format!("{l}: ")).unwrap_or_default();
+                return Err(format!(
+                    "replace: {}: {label}pattern {:?} matched 0 times; no substitutions were \
+                     made and the file was not modified",
+                    file.display(),
+                    op.pattern,
+                )
+                .into());
+            }
+        }
+    }
 
-    // Collect match metadata. Matches are visited in left-to-right order,
-    // so `line_no`/`scanned_to` track cumulative line position incrementally:
-    // each match only counts newlines in the *unscanned* gap since the last
-    // match, never rescanning from the start of the file. Total newline-
-    // counting work across all matches is therefore a single linear pass
-    // over the file, the same order as reading it once for matching.
+    // Everything below is a pure function of the substituted text, so every
+    // mode runs it: a preview that skipped these would report success for a
+    // write that is going to fail, which is the opposite of what a preview is
+    // for. None of it touches the disk.
+    let new_norm = buf.into_owned();
+    let new_text = std::str::from_utf8(&new_norm)
+        .map_err(|error| format!("replace: generated invalid UTF-8: {error}"))?;
+    let encoded = crate::encoding::encode_text_strict(new_text, file_encoding)
+        .map_err(|error| format!("replace: {}: {error}", file.display()))?;
+    if policy.reject_introduced_mojibake {
+        check_write_does_not_introduce_mojibake(&old_text, new_text)
+            .map_err(|e| format!("replace: {}: {e}", file.display()))?;
+    }
+
+    // A whole-file write denormalises every terminator to one convention, so
+    // the resulting census is the substituted text's line structure projected
+    // onto that target — no re-scan of the encoded output needed. This is also
+    // why a replace silently homogenises a mixed file.
+    //
+    // A run that substitutes nothing and has no override rewrites nothing, so
+    // its census is still `before`; claiming a projected one would predict a
+    // write that never happens.
+    let rewrites = replacement_count > 0 || line_ending_override.is_some();
+    let target_line_ending = line_ending_override
+        .or_else(|| git_policy.line_ending_for_text(new_text))
+        .unwrap_or(detected_line_ending);
+    let after = if rewrites {
+        crate::TextLayout::analyze(new_text).projected_onto(target_line_ending)
+    } else {
+        before
+    };
+
+    // --count: return match counts without applying any edits.
+    if count_only {
+        return Ok(ReplaceOutcome {
+            counts,
+            before,
+            after,
+            ..Default::default()
+        });
+    }
+
+    // Zero-match short-circuit: no replacements means the atomic rewrite would
+    // produce byte-identical content, so skip it entirely -- no materialize,
+    // no atomic_write, no .bak, no mtime bump. Callers can then distinguish
+    // "matched nothing" from "replaced N" at the file-system level, not just
+    // via the returned count.
+    //
+    // Preserved side effect: a caller-supplied `line_ending_override` is
+    // itself a real change to the file even with zero substitutions
+    // (CRLF -> LF etc.), so skip the short-circuit in that case and fall
+    // through to the normal write path.
+    if !rewrites {
+        return Ok(ReplaceOutcome {
+            counts,
+            before,
+            after: before,
+            ..Default::default()
+        });
+    }
+
+    let encoded = match target_line_ending {
+        LineEnding::Lf => encoded,
+        LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, file_encoding),
+        LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, file_encoding),
+    };
+    let out_bytes = if git_policy.write_bom(had_bom) {
+        let bom = crate::encoding::bom_bytes_for(file_encoding);
+        let mut bytes = Vec::with_capacity(bom.len() + encoded.len());
+        bytes.extend_from_slice(bom);
+        bytes.extend_from_slice(&encoded);
+        bytes
+    } else {
+        encoded
+    };
+
+    // Compared even under --dry-run: "would this write change the file" is the
+    // question a preview exists to answer, and an LF-space diff cannot answer
+    // it for a pure line-ending rewrite (both sides are identical there).
+    let would_write = crate::retry_io(|| std::fs::read(file))? != out_bytes;
+
+    // Write atomically: temp file in same dir → rename original to .bak →
+    // persist temp to original path.  Skipped for --dry-run.
+    let mut wrote = false;
+    if !dry_run && would_write {
+        crate::atomic_write(file, &out_bytes)?;
+        wrote = true;
+    }
+
+    let (changed_lines, changed_lines_truncated) = if want_changed_lines {
+        collect_changed_lines(&old_text, new_text, changed_lines_max)
+    } else {
+        (Vec::new(), false)
+    };
+
+    // Emit the diff (for both --diff after a successful write and --dry-run).
+    if let Some(out) = diff_out {
+        emit_unified_diff(file, old_norm, &new_norm, out)?;
+    }
+
+    Ok(ReplaceOutcome {
+        counts,
+        before,
+        after,
+        changed_lines,
+        changed_lines_truncated,
+        wrote,
+        would_write,
+    })
+}
+
+/// Pair up deleted and inserted lines from a line-level diff.
+///
+/// `similar` reports a replacement as a Delete run followed by an Insert run,
+/// so the two runs are zipped positionally: the common case (one line edited
+/// in place) then reads as a single entry with both sides populated, and a
+/// genuine insertion or deletion keeps the unmatched side `None`.
+///
+/// Buffering is bounded by what `max` could still emit. A whole-file rewrite
+/// is one enormous Delete run followed by one enormous Insert run with no
+/// `Equal` between them, so an unbounded buffer would hold a copy of both
+/// files just to discard all but the first `max` entries at the flush.
+fn collect_changed_lines(
+    old_text: &str,
+    new_text: &str,
+    max: Option<usize>,
+) -> (Vec<ChangedLine>, bool) {
+    use similar::ChangeTag;
+
+    let diff = similar::TextDiff::from_lines(old_text, new_text);
+    let mut out: Vec<ChangedLine> = Vec::new();
+    let mut deletes: Vec<(usize, String)> = Vec::new();
+    let mut inserts: Vec<(usize, String)> = Vec::new();
+    let mut truncated = false;
+
+    // `flush` is called at every boundary between changed and unchanged
+    // content, which is what makes a Delete-then-Insert run one hunk.
+    let flush = |deletes: &mut Vec<(usize, String)>,
+                 inserts: &mut Vec<(usize, String)>,
+                 out: &mut Vec<ChangedLine>,
+                 truncated: &mut bool| {
+        for index in 0..deletes.len().max(inserts.len()) {
+            if max.is_some_and(|m| out.len() >= m) {
+                *truncated = true;
+                break;
+            }
+            let old = deletes.get(index);
+            let new = inserts.get(index);
+            out.push(ChangedLine {
+                old_line: old.map(|(n, _)| n + 1),
+                new_line: new.map(|(n, _)| n + 1),
+                old_text: old.map(|(_, t)| t.clone()),
+                new_text: new.map(|(_, t)| t.clone()),
+            });
+        }
+        deletes.clear();
+        inserts.clear();
+    };
+
+    for change in diff.iter_all_changes() {
+        if matches!(change.tag(), ChangeTag::Equal) {
+            flush(&mut deletes, &mut inserts, &mut out, &mut truncated);
+            continue;
+        }
+        // `out.len()` is stable across a run (nothing is emitted until the
+        // flush), so this is the most either side could still contribute.
+        let budget = max.map(|m| m.saturating_sub(out.len()));
+        let side = match change.tag() {
+            ChangeTag::Delete => &mut deletes,
+            _ => &mut inserts,
+        };
+        if budget.is_some_and(|b| side.len() >= b) {
+            truncated = true;
+            continue;
+        }
+        let value = change.value().trim_end_matches(['\n', '\r']).to_owned();
+        let index = match change.tag() {
+            ChangeTag::Delete => change.old_index(),
+            _ => change.new_index(),
+        };
+        side.push((index.unwrap_or(0), value));
+    }
+    flush(&mut deletes, &mut inserts, &mut out, &mut truncated);
+    (out, truncated)
+}
+
+/// Count matches of `re` in `haystack`, populating `regions` as it goes.
+///
+/// Matches are visited in left-to-right order, so `line_no`/`scanned_to` track
+/// cumulative line position incrementally: each match only counts newlines in
+/// the *unscanned* gap since the last match, never rescanning from the start
+/// of the file. Total newline-counting work across all matches is therefore a
+/// single linear pass over the file, the same order as reading it once for
+/// matching.
+fn collect_regions(
+    re: &Regex,
+    replacement: &[u8],
+    has_capture_groups: bool,
+    haystack: &[u8],
+    regions: &mut Option<RegionsRequest<'_>>,
+) -> usize {
     let mut line_no: usize = 1;
     let mut scanned_to: usize = 0;
     let mut text_materialized: usize = 0;
     let mut replacement_count = 0;
-    for caps in re.captures_iter(old_norm) {
+    for caps in re.captures_iter(haystack) {
         let m = caps.get(0).unwrap();
 
         if let Some(req) = regions.as_mut() {
@@ -317,7 +974,7 @@ pub fn run(
                 norm_repl.extend_from_slice(replacement);
             }
 
-            line_no += old_norm[scanned_to..m.start()]
+            line_no += haystack[scanned_to..m.start()]
                 .iter()
                 .filter(|&&b| b == b'\n')
                 .count();
@@ -325,7 +982,7 @@ pub fn run(
             // A newline that is the LAST byte of the match only terminates
             // the match's own last line -- it doesn't pull in any content
             // from the following line, so it must not extend end_line.
-            let match_span = &old_norm[m.start()..m.end()];
+            let match_span = &haystack[m.start()..m.end()];
             let counted_span = match match_span.last() {
                 Some(b'\n') => &match_span[..match_span.len() - 1],
                 _ => match_span,
@@ -386,76 +1043,7 @@ pub fn run(
 
         replacement_count += 1;
     }
-
-    // --count: return match count without applying any edits.
-    if count_only {
-        return Ok(replacement_count);
-    }
-
-    let git_policy = crate::git::policy_for_path(file)?;
-
-    // Zero-match short-circuit: no replacements means the atomic rewrite would
-    // produce byte-identical content, so skip it entirely -- no mojibake
-    // guard work, no materialize, no atomic_write, no .bak, no mtime bump.
-    // Callers can then distinguish "matched nothing" from "replaced N" at
-    // the file-system level, not just via the returned count.
-    //
-    // Preserved side effect: a caller-supplied `line_ending_override` is
-    // itself a real change to the file even with zero substitutions
-    // (CRLF -> LF etc.), so skip the short-circuit in that case and fall
-    // through to the normal write path.
-    if replacement_count == 0 && line_ending_override.is_none() {
-        return Ok(0);
-    }
-
-    let new_norm = if has_capture_groups {
-        re.replace_all(old_norm, replacement).into_owned()
-    } else {
-        re.replace_all(old_norm, regex::bytes::NoExpand(replacement))
-            .into_owned()
-    };
-    let new_text = std::str::from_utf8(&new_norm)
-        .map_err(|error| format!("replace: generated invalid UTF-8: {error}"))?;
-    let encoded = crate::encoding::encode_text_strict(new_text, file_encoding)
-        .map_err(|error| format!("replace: {}: {error}", file.display()))?;
-    let target_line_ending = line_ending_override
-        .or_else(|| git_policy.line_ending_for_text(new_text))
-        .unwrap_or(detected_line_ending);
-    let encoded = match target_line_ending {
-        LineEnding::Lf => encoded,
-        LineEnding::CrLf => crate::encoding::denormalize_lf_to_crlf(&encoded, file_encoding),
-        LineEnding::Cr => crate::encoding::denormalize_lf_to_cr(&encoded, file_encoding),
-    };
-    let out_bytes = if git_policy.write_bom(had_bom) {
-        let bom = crate::encoding::bom_bytes_for(file_encoding);
-        let mut bytes = Vec::with_capacity(bom.len() + encoded.len());
-        bytes.extend_from_slice(bom);
-        bytes.extend_from_slice(&encoded);
-        bytes
-    } else {
-        encoded
-    };
-
-    // Write atomically: temp file in same dir → rename original to .bak →
-    // persist temp to original path.  Skipped for --dry-run.
-    if !dry_run {
-        if policy.reject_introduced_mojibake {
-            check_write_does_not_introduce_mojibake(&old_text, new_text)
-                .map_err(|e| format!("replace: {}: {e}", file.display()))?;
-        }
-
-        let old_bytes = crate::retry_io(|| std::fs::read(file))?;
-        if old_bytes != out_bytes {
-            crate::atomic_write(file, &out_bytes)?;
-        }
-    }
-
-    // Emit the diff (for both --diff after a successful write and --dry-run).
-    if let Some(out) = diff_out {
-        emit_unified_diff(file, old_norm, &new_norm, out)?;
-    }
-
-    Ok(replacement_count)
+    replacement_count
 }
 
 /// Write a unified text diff of `old_norm` → `new_norm` (both LF-normalised)
@@ -485,11 +1073,653 @@ fn emit_unified_diff(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write as IoWrite};
+    use std::{fs, io::Write as IoWrite, path::PathBuf};
 
     use tempfile::NamedTempFile;
 
     use super::*;
+
+    // ── run_batch ───────────────────────────────────────────────────────────
+
+    fn batch_op<'a>(pattern: &'a str, replacement: &'a [u8]) -> ReplaceOp<'a> {
+        ReplaceOp {
+            label: None,
+            pattern,
+            replacement,
+            regex: false,
+            multiline: false,
+            allow_no_match: false,
+        }
+    }
+
+    fn scratch(contents: &str) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(contents.as_bytes()).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    #[test]
+    fn run_batch_applies_ops_in_order_against_the_evolving_buffer() {
+        // The second op only matches text the first op produced, so a batch
+        // that ran every op against the original buffer would report 0 for it.
+        let f = scratch("alpha\n");
+        let counts = run_batch(
+            f.path(),
+            &[batch_op("alpha", b"beta"), batch_op("beta", b"gamma")],
+            None,
+            ReplaceOptions::default(),
+        )
+        .unwrap()
+        .counts;
+        assert_eq!(counts, vec![1, 1]);
+        assert_eq!(fs::read_to_string(f.path()).unwrap(), "gamma\n");
+    }
+
+    #[test]
+    fn run_batch_refuses_everything_when_one_op_matches_nothing() {
+        let f = scratch("alpha\nbeta\n");
+        let err = run_batch(
+            f.path(),
+            &[
+                batch_op("alpha", b"ALPHA"),
+                batch_op("nowhere", b"X"),
+                batch_op("beta", b"BETA"),
+            ],
+            None,
+            ReplaceOptions::default(),
+        )
+        .expect_err("a zero-match op must refuse the batch");
+        assert!(err.to_string().contains("matched 0 times"), "{err}");
+        assert_eq!(
+            fs::read_to_string(f.path()).unwrap(),
+            "alpha\nbeta\n",
+            "the file must be left untouched, not half-transformed"
+        );
+        let bak = PathBuf::from(format!("{}.bak", f.path().display()));
+        assert!(!bak.exists(), "a refused batch must not leave a .bak");
+    }
+
+    #[test]
+    fn run_batch_allow_no_match_exempts_only_its_own_op() {
+        let f = scratch("alpha\n");
+        let mut tolerant = batch_op("nowhere", b"X");
+        tolerant.allow_no_match = true;
+        let counts = run_batch(
+            f.path(),
+            &[batch_op("alpha", b"beta"), tolerant],
+            None,
+            ReplaceOptions::default(),
+        )
+        .unwrap()
+        .counts;
+        assert_eq!(counts, vec![1, 0]);
+        assert_eq!(fs::read_to_string(f.path()).unwrap(), "beta\n");
+    }
+
+    #[test]
+    fn run_batch_count_only_leaves_the_file_alone() {
+        let f = scratch("alpha alpha beta\n");
+        let counts = run_batch(
+            f.path(),
+            &[batch_op("alpha", b"x"), batch_op("beta", b"y")],
+            None,
+            ReplaceOptions {
+                count_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .counts;
+        assert_eq!(counts, vec![2, 1]);
+        assert_eq!(fs::read_to_string(f.path()).unwrap(), "alpha alpha beta\n");
+    }
+
+    #[test]
+    fn run_batch_rejects_an_empty_op_list() {
+        let f = scratch("alpha\n");
+        let err = run_batch(f.path(), &[], None, ReplaceOptions::default())
+            .expect_err("an empty batch is a caller bug, not a no-op");
+        assert!(err.to_string().contains("no operations supplied"), "{err}");
+    }
+
+    // ── line-ending census ──────────────────────────────────────────────────
+
+    fn scratch_bytes(bytes: &[u8]) -> NamedTempFile {
+        let mut f = NamedTempFile::new().unwrap();
+        f.write_all(bytes).unwrap();
+        f.flush().unwrap();
+        f
+    }
+
+    /// A replace rewrites the whole file, so a mixed file is silently
+    /// collapsed onto one convention. The outcome has to say so — this is the
+    /// case that otherwise only surfaces at `git commit`.
+    #[test]
+    fn outcome_reports_that_a_mixed_file_was_homogenised() {
+        let f = scratch_bytes(b"alpha\nbeta\r\ngamma\n");
+        let outcome = run_batch(
+            f.path(),
+            &[batch_op("alpha", b"ALPHA")],
+            None,
+            ReplaceOptions::default(),
+        )
+        .unwrap();
+
+        assert_eq!((outcome.before.lf, outcome.before.crlf), (2, 1));
+        assert!(outcome.before.is_mixed());
+        assert_eq!(outcome.before.uniformity(), "mixed");
+
+        assert!(!outcome.after.is_mixed());
+        assert_eq!(outcome.after.uniformity(), "uniform");
+        assert_eq!(outcome.after.terminators(), 3);
+        assert!(
+            outcome.normalized_line_endings(),
+            "a mixed -> uniform rewrite must be flagged"
+        );
+    }
+
+    #[test]
+    fn outcome_does_not_claim_normalisation_for_an_already_uniform_file() {
+        let f = scratch_bytes(b"alpha\nbeta\n");
+        let outcome = run_batch(
+            f.path(),
+            &[batch_op("alpha", b"ALPHA")],
+            None,
+            ReplaceOptions::default(),
+        )
+        .unwrap();
+        assert!(!outcome.normalized_line_endings());
+        assert_eq!(outcome.before.uniformity(), "uniform");
+        assert_eq!(outcome.after.uniformity(), "uniform");
+        assert_eq!(
+            (outcome.after.lf, outcome.after.crlf, outcome.after.cr),
+            (2, 0, 0)
+        );
+    }
+
+    /// `count: true` writes nothing but must still describe what a write
+    /// would do, or a caller cannot use it to decide whether to write.
+    #[test]
+    fn count_only_reports_the_census_it_would_produce() {
+        let f = scratch_bytes(b"alpha\nbeta\r\n");
+        let outcome = run_batch(
+            f.path(),
+            &[batch_op("alpha", b"ALPHA")],
+            None,
+            ReplaceOptions {
+                count_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(outcome.before.is_mixed());
+        assert!(!outcome.after.is_mixed());
+        assert_eq!(fs::read(f.path()).unwrap(), b"alpha\nbeta\r\n");
+    }
+
+    /// A run that matched nothing wrote nothing, so `after` must equal
+    /// `before` rather than describing a hypothetical rewrite.
+    #[test]
+    fn a_no_op_run_leaves_the_census_unchanged() {
+        let f = scratch_bytes(b"alpha\nbeta\r\n");
+        let mut tolerant = batch_op("nowhere", b"X");
+        tolerant.allow_no_match = true;
+        let outcome = run_batch(f.path(), &[tolerant], None, ReplaceOptions::default()).unwrap();
+        assert_eq!(outcome.before, outcome.after);
+        assert!(!outcome.normalized_line_endings());
+    }
+
+    // ── changed-line images ─────────────────────────────────────────────────
+
+    #[test]
+    fn changed_lines_carry_both_images_and_both_positions() {
+        let f = scratch("one\ntwo\nthree\n");
+        let outcome = run_batch(
+            f.path(),
+            &[batch_op("two", b"TWO")],
+            None,
+            ReplaceOptions {
+                changed_lines: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(outcome.changed_lines.len(), 1);
+        let line = &outcome.changed_lines[0];
+        assert_eq!(line.old_line, Some(2));
+        assert_eq!(line.new_line, Some(2));
+        assert_eq!(line.old_text.as_deref(), Some("two"));
+        assert_eq!(line.new_text.as_deref(), Some("TWO"));
+        assert!(!outcome.changed_lines_truncated);
+    }
+
+    /// Positions must describe the FINAL file, not an intermediate buffer, so
+    /// a batch whose earlier op changed the line count still reports usable
+    /// `new_line` values.
+    #[test]
+    fn changed_lines_positions_survive_a_line_count_change_mid_batch() {
+        let f = scratch("one\ntwo\nthree\n");
+        let outcome = run_batch(
+            f.path(),
+            &[
+                batch_op("one\n", b"one\nEXTRA\n"),
+                batch_op("three", b"THREE"),
+            ],
+            None,
+            ReplaceOptions {
+                changed_lines: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let three = outcome
+            .changed_lines
+            .iter()
+            .find(|l| l.new_text.as_deref() == Some("THREE"))
+            .expect("the renamed line must be reported");
+        assert_eq!(three.old_line, Some(3), "position in the file as read");
+        assert_eq!(three.new_line, Some(4), "position in the file as written");
+    }
+
+    #[test]
+    fn changed_lines_respects_its_cap_and_says_when_it_truncated() {
+        let f = scratch("a\na\na\na\na\n");
+        let outcome = run_batch(
+            f.path(),
+            &[batch_op("a", b"b")],
+            None,
+            ReplaceOptions {
+                changed_lines: true,
+                changed_lines_max: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.changed_lines.len(), 2);
+        assert!(outcome.changed_lines_truncated);
+    }
+
+    #[test]
+    fn changed_lines_are_not_collected_unless_asked_for() {
+        let f = scratch("one\ntwo\n");
+        let outcome = run_batch(
+            f.path(),
+            &[batch_op("two", b"TWO")],
+            None,
+            ReplaceOptions::default(),
+        )
+        .unwrap();
+        assert!(outcome.changed_lines.is_empty());
+    }
+
+    /// A whole-file rewrite is one Delete run then one Insert run with no
+    /// `Equal` between them, so an unbounded buffer would hold both copies of
+    /// the file just to discard all but `max` entries at the flush.
+    #[test]
+    fn changed_lines_does_not_buffer_a_whole_rewrite_to_emit_a_few() {
+        let old: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let new: String = (0..500).map(|i| format!("LINE {i}\n")).collect();
+        let (lines, truncated) = collect_changed_lines(&old, &new, Some(3));
+        assert_eq!(lines.len(), 3);
+        assert!(truncated);
+        assert_eq!(lines[0].old_text.as_deref(), Some("line 0"));
+        assert_eq!(lines[0].new_text.as_deref(), Some("LINE 0"));
+    }
+
+    #[test]
+    fn changed_lines_reports_a_pure_insertion_with_no_old_side() {
+        let (lines, _) = collect_changed_lines("a\nb\n", "a\nNEW\nb\n", None);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].old_line, None);
+        assert_eq!(lines[0].old_text, None);
+        assert_eq!(lines[0].new_line, Some(2));
+        assert_eq!(lines[0].new_text.as_deref(), Some("NEW"));
+    }
+
+    #[test]
+    fn changed_lines_reports_a_pure_deletion_with_no_new_side() {
+        let (lines, _) = collect_changed_lines("a\ngone\nb\n", "a\nb\n", None);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].old_line, Some(2));
+        assert_eq!(lines[0].old_text.as_deref(), Some("gone"));
+        assert_eq!(lines[0].new_line, None);
+    }
+
+    // ── preview modes never refuse, and never over-promise ──────────────────
+
+    /// `count`/`dry_run` are introspection modes: a zero result is a
+    /// legitimate answer, so they must not inherit the batch's all-or-nothing
+    /// refusal. The single-op path has always behaved this way.
+    #[test]
+    fn preview_modes_do_not_refuse_a_zero_match_op() {
+        let f = scratch("alpha\n");
+        for opts in [
+            ReplaceOptions {
+                count_only: true,
+                ..Default::default()
+            },
+            ReplaceOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        ] {
+            let outcome = run_batch(
+                f.path(),
+                &[batch_op("alpha", b"ALPHA"), batch_op("nowhere", b"X")],
+                None,
+                opts,
+            )
+            .expect("a preview must not refuse");
+            assert_eq!(outcome.counts, vec![1, 0]);
+        }
+        assert_eq!(fs::read_to_string(f.path()).unwrap(), "alpha\n");
+    }
+
+    /// A preview that matched nothing must not claim the write would
+    /// normalise the file: a real run short-circuits and never rewrites.
+    #[test]
+    fn count_only_with_no_matches_does_not_promise_a_rewrite() {
+        let f = scratch_bytes(b"a\nb\r\n");
+        let mut tolerant = batch_op("nowhere", b"X");
+        tolerant.allow_no_match = true;
+        let outcome = run_batch(
+            f.path(),
+            &[tolerant],
+            None,
+            ReplaceOptions {
+                count_only: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.before, outcome.after);
+        assert!(!outcome.normalized_line_endings());
+    }
+
+    /// An identity substitution matches but produces byte-identical output,
+    /// which the write path skips; callers that stamp mtime on "something
+    /// happened" must be able to tell.
+    #[test]
+    fn an_identity_substitution_reports_that_nothing_was_written() {
+        let f = scratch("alpha\n");
+        let outcome = run_batch(
+            f.path(),
+            &[batch_op("alpha", b"alpha")],
+            None,
+            ReplaceOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(outcome.total(), 1, "it matched");
+        assert!(!outcome.wrote, "but no bytes reached the disk");
+    }
+
+    #[test]
+    fn a_real_substitution_reports_that_it_wrote() {
+        let f = scratch("alpha\n");
+        let outcome = run_batch(
+            f.path(),
+            &[batch_op("alpha", b"beta")],
+            None,
+            ReplaceOptions::default(),
+        )
+        .unwrap();
+        assert!(outcome.wrote);
+    }
+
+    // ── previews must predict the write, including its failures ─────────────
+
+    /// The write refuses content that introduces mojibake. A preview that
+    /// skipped that guard would hand back an all-clear for exactly the
+    /// corruption class this crate exists to prevent.
+    #[test]
+    fn previews_run_the_mojibake_guard_the_write_would_run() {
+        for opts in [
+            ReplaceOptions {
+                count_only: true,
+                ..Default::default()
+            },
+            ReplaceOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+            ReplaceOptions::default(),
+        ] {
+            let f = scratch("cafe\n");
+            let err = run_batch(
+                f.path(),
+                // Latin-1 mojibake digraph: valid UTF-8, and a fingerprint the
+                // write-time guard rejects.
+                &[batch_op("cafe", "caf\u{c3}\u{a9}".as_bytes())],
+                None,
+                opts,
+            );
+            assert!(err.is_err(), "every mode must refuse introduced mojibake");
+            assert_eq!(fs::read_to_string(f.path()).unwrap(), "cafe\n");
+        }
+    }
+
+    /// A pure line-ending rewrite is invisible to an LF-space diff, so
+    /// `would_write` is the only honest answer to "will this change the file".
+    #[test]
+    fn a_line_ending_override_alone_reports_that_it_would_write() {
+        let f = scratch_bytes(b"a\nb\n");
+        let mut tolerant = batch_op("nowhere", b"X");
+        tolerant.allow_no_match = true;
+        let outcome = run_batch(
+            f.path(),
+            &[tolerant],
+            None,
+            ReplaceOptions {
+                dry_run: true,
+                line_ending_override: Some(LineEnding::CrLf),
+                ..Default::default()
+            },
+        )
+        .expect("an override exempts the zero-match refusal");
+        assert_eq!(outcome.total(), 0);
+        assert!(
+            outcome.would_write,
+            "converting every terminator is a change"
+        );
+        assert!(!outcome.wrote, "dry_run writes nothing");
+        assert_eq!(fs::read(f.path()).unwrap(), b"a\nb\n");
+    }
+
+    /// The single-op path exempts a line-ending override from the zero-match
+    /// refusal; a batch that did not would refuse a legitimate combination of
+    /// a rename with an EOL normalisation.
+    #[test]
+    fn a_line_ending_override_exempts_a_batch_from_the_zero_match_refusal() {
+        let f = scratch_bytes(b"a\nb\n");
+        let outcome = run_batch(
+            f.path(),
+            &[batch_op("nowhere", b"X")],
+            None,
+            ReplaceOptions {
+                line_ending_override: Some(LineEnding::CrLf),
+                ..Default::default()
+            },
+        )
+        .expect("the override makes zero substitutions a real write, not a mistake");
+        assert_eq!(outcome.total(), 0);
+        assert!(outcome.wrote);
+        assert_eq!(fs::read(f.path()).unwrap(), b"a\r\nb\r\n");
+    }
+
+    /// A CR reaching the substitution buffer survives into the denormaliser,
+    /// whose precondition is LF-only input, and lands as `\r\r\n`.
+    #[test]
+    fn decode_replacement_strips_cr_so_a_crlf_target_cannot_double_it() {
+        assert_eq!(decode_replacement("a\\r\\nb", false).unwrap(), b"a\nb");
+        assert_eq!(decode_replacement("a\r\nb", true).unwrap(), b"a\nb");
+        assert_eq!(decode_replacement("a\rb", true).unwrap(), b"a\nb");
+    }
+
+    #[test]
+    fn ops_from_json_rejects_an_empty_literal_pattern() {
+        let err = ops_from_json(&serde_json::json!([{ "pattern": "", "replacement": "x" }]))
+            .expect_err("an empty literal pattern would rewrite the whole file");
+        assert!(err.contains("every position"), "{err}");
+    }
+
+    #[test]
+    fn ops_from_json_rejects_a_mistyped_label() {
+        let err =
+            ops_from_json(&serde_json::json!([{ "label": 3, "pattern": "a", "replacement": "b" }]))
+                .expect_err("a mistyped label must not silently vanish from the tally");
+        assert!(err.contains("'label'"), "{err}");
+    }
+
+    /// Under a `.gitattributes` regime the target convention is gitoxide's,
+    /// not the file's own — and `count: true` must predict the same target the
+    /// write uses, or a preview is worthless for deciding whether to write.
+    #[test]
+    fn the_reported_target_is_the_gitattributes_one_in_both_preview_and_write() {
+        let repo = tempfile::TempDir::new().unwrap();
+        gix::init(repo.path()).expect("git init");
+        fs::write(repo.path().join(".gitattributes"), "*.txt text eol=crlf\n").unwrap();
+        let cfg_path = repo.path().join(".git").join("config");
+        let mut cfg = fs::read_to_string(&cfg_path).unwrap_or_default();
+        cfg.push_str("\n[core]\n\tautocrlf = false\n");
+        fs::write(&cfg_path, cfg).unwrap();
+
+        // An LF file in a repo whose attributes demand CRLF.
+        let target = repo.path().join("note.txt");
+        fs::write(&target, b"alpha\nbeta\n").unwrap();
+
+        let preview = run_batch(
+            &target,
+            &[batch_op("alpha", b"ALPHA")],
+            None,
+            ReplaceOptions {
+                count_only: true,
+                io_mode: IoMode::Buffered,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            preview.after.dominant(),
+            Some(LineEnding::CrLf),
+            "the preview must report git's target, not the file's own LF"
+        );
+
+        let written = run_batch(
+            &target,
+            &[batch_op("alpha", b"ALPHA")],
+            None,
+            ReplaceOptions {
+                io_mode: IoMode::Buffered,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            written.after, preview.after,
+            "preview must predict the write"
+        );
+        assert_eq!(fs::read(&target).unwrap(), b"ALPHA\r\nbeta\r\n");
+    }
+
+    // ── the shared `ops` schema ─────────────────────────────────────────────
+
+    #[test]
+    fn ops_from_json_accepts_the_mcp_ops_array_verbatim() {
+        let ops = ops_from_json(&serde_json::json!([
+            { "label": "rename", "pattern": "a(", "replacement": "b(" },
+            { "pattern": "^x", "replacement": "y", "regex": true, "multiline": true },
+        ]))
+        .unwrap();
+        assert_eq!(ops.len(), 2);
+        assert_eq!(ops[0].label.as_deref(), Some("rename"));
+        assert_eq!(ops[0].pattern, "a(");
+        assert!(!ops[0].regex, "regex must stay opt-in per op");
+        assert!(ops[1].regex && ops[1].multiline);
+        assert_eq!(ops[1].label, None);
+    }
+
+    #[test]
+    fn ops_from_json_takes_the_replacement_verbatim_by_default() {
+        let ops = ops_from_json(&serde_json::json!([
+            { "pattern": "x", "replacement": "a\\nb" },
+            { "pattern": "y", "replacement": "a\\nb", "expand_escapes": true },
+        ]))
+        .unwrap();
+        assert_eq!(ops[0].replacement, "a\\nb");
+        assert_eq!(ops[1].replacement, "a\nb");
+    }
+
+    #[test]
+    fn ops_from_json_decodes_a_base64_payload() {
+        let ops = ops_from_json(&serde_json::json!([{
+            "pattern": "eA==",
+            "pattern_format": "base64",
+            "replacement": "eQ==",
+            "replacement_format": "base64",
+        }]))
+        .unwrap();
+        assert_eq!(ops[0].pattern, "x");
+        assert_eq!(ops[0].replacement, "y");
+    }
+
+    #[test]
+    fn ops_from_json_rejects_an_unknown_field() {
+        // A typo'd or MCP-only field must not be silently ignored, or a batch
+        // that looks configured one way would run another.
+        let err = ops_from_json(&serde_json::json!([
+            { "pattern": "x", "replacement": "y", "regexp": true },
+        ]))
+        .expect_err("unknown fields must be rejected");
+        assert!(err.contains("ops[0]"), "{err}");
+        assert!(err.contains("regexp"), "{err}");
+    }
+
+    #[test]
+    fn ops_from_json_rejects_a_stringly_typed_boolean() {
+        let err = ops_from_json(&serde_json::json!([
+            { "pattern": "x", "replacement": "y", "regex": "true" },
+        ]))
+        .expect_err("a JSON string is not a boolean");
+        assert!(err.contains("'regex'"), "{err}");
+    }
+
+    #[test]
+    fn ops_from_json_rejects_expand_escapes_with_a_format() {
+        let err = ops_from_json(&serde_json::json!([{
+            "pattern": "x",
+            "replacement": "eQ==",
+            "replacement_format": "base64",
+            "expand_escapes": true,
+        }]))
+        .expect_err("the two escape channels are contradictory");
+        assert!(err.contains("expand_escapes"), "{err}");
+    }
+
+    #[test]
+    fn ops_from_json_rejects_an_empty_array() {
+        assert!(ops_from_json(&serde_json::json!([])).is_err());
+    }
+
+    #[test]
+    fn run_batch_validates_every_op_before_touching_the_file() {
+        // The bad pattern is last, so a batch that compiled lazily would have
+        // already rewritten the file by the time it failed.
+        let f = scratch("alpha\n");
+        let mut bad = batch_op("(unclosed", b"x");
+        bad.regex = true;
+        let err = run_batch(
+            f.path(),
+            &[batch_op("alpha", b"beta"), bad],
+            None,
+            ReplaceOptions::default(),
+        )
+        .expect_err("an invalid regex must fail the batch");
+        let _ = err;
+        assert_eq!(fs::read_to_string(f.path()).unwrap(), "alpha\n");
+    }
 
     // ── decode_replacement ──────────────────────────────────────────────────
 
@@ -587,7 +1817,7 @@ mod tests {
         count: bool,
         dry_run: bool,
     ) -> Result<usize, Box<dyn std::error::Error>> {
-        run(
+        Ok(run(
             file,
             pattern,
             replacement,
@@ -601,8 +1831,11 @@ mod tests {
                 dry_run,
                 io_mode: IoMode::Mmap,
                 policy: crate::mojibake::WritePolicy::permissive(),
+                changed_lines: false,
+                changed_lines_max: None,
             },
-        )
+        )?
+        .total())
     }
 
     /// `run` takes `replacement` as `&[u8]` for signature convenience, but

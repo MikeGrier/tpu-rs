@@ -28,6 +28,24 @@ pub enum DataFormat {
     Encoded,
 }
 
+impl DataFormat {
+    /// Parse the wire name used by the `*_format` arguments.
+    ///
+    /// Shared by the MCP tools and the CLI's `--ops` parser so both accept
+    /// exactly the same set of names.
+    #[allow(dead_code)] // Also used by tpu-mcp (library consumer).
+    pub fn from_name(name: &str) -> Result<Self, String> {
+        match name {
+            "hex" => Ok(Self::Hex),
+            "base64" => Ok(Self::Base64),
+            "encoded" => Ok(Self::Encoded),
+            other => Err(format!(
+                "unrecognised data_format value {other:?}; expected hex, base64, or encoded"
+            )),
+        }
+    }
+}
+
 /// Decode `data` according to `format`.
 ///
 /// Returns an explanatory error string (not an `std::error::Error` object)

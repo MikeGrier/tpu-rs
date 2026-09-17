@@ -218,6 +218,11 @@ fn json_format_produces_documented_schema() {
     assert!(v["total_files_scanned"].is_u64());
     assert!(v["total_issues"].is_u64());
     assert!(v["total_repaired"].is_u64());
+    assert_eq!(
+        v["verdict"].as_str(),
+        Some("issues"),
+        "a scan that flagged something must answer 'issues': {v}"
+    );
 
     let files = v["files"].as_array().unwrap();
     assert!(!files.is_empty(), "expected at least one flagged file");
@@ -243,6 +248,14 @@ fn json_format_produces_documented_schema() {
         assert!(
             entry["repaired"].is_boolean(),
             "missing 'repaired': {entry}"
+        );
+        assert!(
+            entry["mojibake_repaired"].is_boolean(),
+            "missing 'mojibake_repaired': {entry}"
+        );
+        assert!(
+            entry["any_repaired"].is_boolean(),
+            "missing 'any_repaired': {entry}"
         );
 
         for m in entry["mojibake_matches"].as_array().unwrap() {

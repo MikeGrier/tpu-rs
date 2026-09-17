@@ -116,6 +116,22 @@ pub fn parse_line_ending(
     }
 }
 
+/// Replace CRLF (`\r\n`) and bare CR (`\r`) with LF; pure-LF input is
+/// returned without allocating.
+///
+/// This is the boundary normalisation gate for text arriving from outside the
+/// crate — MCP JSON string values, `--ops` file payloads — all of which reach
+/// `tpu::cmd::*` expecting LF-only input. Without it, stray CRLF in a JSON
+/// string produces `\r\r\n` on a CRLF-target file.
+#[allow(dead_code)] // Also used by tpu-mcp (library consumer).
+pub fn normalize_to_lf(s: &str) -> std::borrow::Cow<'_, str> {
+    if s.contains('\r') {
+        std::borrow::Cow::Owned(s.replace("\r\n", "\n").replace('\r', "\n"))
+    } else {
+        std::borrow::Cow::Borrowed(s)
+    }
+}
+
 // ── Line-ending denormalisation / normalisation (native byte space) ───────────
 //
 // These helpers operate directly on a file's *native* encoded bytes — they
@@ -272,7 +288,8 @@ pub(crate) fn denormalize_lf_to_cr(
 /// `0x0D` / `0x0A` are unambiguous line-ending bytes in every non-UTF-16
 /// encoding harrier detects (UTF-8 continuation bytes and Shift-JIS trailing
 /// bytes never take those values), so a byte-level scan is safe.
-pub(crate) fn normalize_bytes_to_lf(bytes: &[u8]) -> Vec<u8> {
+#[allow(dead_code)] // Also used by tpu-mcp (library consumer).
+pub fn normalize_bytes_to_lf(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len());
     // Iterator-driven walk (no manual index counter): position advances
     // solely via `iter.next()`, so there is no `i += 1`-style step to

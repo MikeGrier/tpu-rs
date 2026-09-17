@@ -111,7 +111,7 @@ fn replace_with_allow_mojibake_flag_succeeds() {
     )
     .expect("replace must succeed when guard is permissive");
 
-    assert_eq!(n, 1, "exactly one substitution expected");
+    assert_eq!(n.total(), 1, "exactly one substitution expected");
 
     // File should now contain "hello " + the cafe mojibake bytes + "\n".
     let new_bytes = read(&path);

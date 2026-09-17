@@ -126,16 +126,105 @@ pub struct DecodedTextFile {
 }
 
 /// Logical line and terminator metadata captured before LF normalisation.
+///
+/// Counts, not flags: "this file is LF" is the answer that hides a stray CRLF
+/// git will reject at commit, so every terminator kind carries its own tally
+/// and [`Self::uniformity`] reports `mixed` rather than a winner.
+///
+/// Produced by [`TextLayout::analyze`] during the decode every text command
+/// already performs, so a census costs nothing extra.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TextLayout {
     pub line_count: u64,
-    pub has_lf: bool,
-    pub has_crlf: bool,
-    pub has_cr: bool,
+    /// Line feeds not preceded by a carriage return.
+    pub lf: u64,
+    /// Carriage-return/line-feed pairs.
+    pub crlf: u64,
+    /// Carriage returns not followed by a line feed (classic Mac).
+    pub cr: u64,
 }
 
 impl TextLayout {
-    fn analyze(text: &str) -> Self {
+    pub fn has_lf(&self) -> bool {
+        self.lf > 0
+    }
+
+    pub fn has_crlf(&self) -> bool {
+        self.crlf > 0
+    }
+
+    pub fn has_cr(&self) -> bool {
+        self.cr > 0
+    }
+
+    /// Total terminators, across all conventions.
+    pub fn terminators(&self) -> u64 {
+        self.lf + self.crlf + self.cr
+    }
+
+    /// True when more than one convention is present.
+    pub fn is_mixed(&self) -> bool {
+        [self.lf, self.crlf, self.cr]
+            .iter()
+            .filter(|n| **n > 0)
+            .count()
+            > 1
+    }
+
+    /// The convention with the most terminators, or `None` when the text has
+    /// no line terminators at all.
+    pub fn dominant(&self) -> Option<harrier::encoding::LineEnding> {
+        use harrier::encoding::LineEnding;
+        [
+            (LineEnding::Lf, self.lf),
+            (LineEnding::CrLf, self.crlf),
+            (LineEnding::Cr, self.cr),
+        ]
+        .into_iter()
+        .filter(|(_, n)| *n > 0)
+        .max_by_key(|(_, n)| *n)
+        .map(|(kind, _)| kind)
+    }
+
+    /// `"uniform"`, `"mixed"`, or `"none"` when there are no terminators.
+    pub fn uniformity(&self) -> &'static str {
+        match (self.terminators(), self.is_mixed()) {
+            (0, _) => "none",
+            (_, true) => "mixed",
+            (_, false) => "uniform",
+        }
+    }
+
+    /// The census this text would have if every terminator were rewritten to
+    /// `kind` — which is exactly what a whole-file denormalising write does.
+    pub fn projected_onto(&self, kind: harrier::encoding::LineEnding) -> Self {
+        use harrier::encoding::LineEnding;
+        let total = self.terminators();
+        let mut out = Self {
+            line_count: self.line_count,
+            ..Self::default()
+        };
+        match kind {
+            LineEnding::Lf => out.lf = total,
+            LineEnding::CrLf => out.crlf = total,
+            LineEnding::Cr => out.cr = total,
+        }
+        out
+    }
+
+    /// Terminator census as reported to JSON consumers.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "uniformity": self.uniformity(),
+            "dominant": self.dominant().map(crate::git::line_ending_name),
+            "line_count": self.line_count,
+            "lf": self.lf,
+            "crlf": self.crlf,
+            "cr": self.cr,
+        })
+    }
+
+    pub fn analyze(text: &str) -> Self {
         let bytes = text.as_bytes();
         let mut layout = Self::default();
         // Iterator-driven walk (no manual index counter): the position is
@@ -147,16 +236,16 @@ impl TextLayout {
         while let Some((idx, &b)) = iter.next() {
             match b {
                 b'\r' if bytes.get(idx + 1) == Some(&b'\n') => {
-                    layout.has_crlf = true;
+                    layout.crlf += 1;
                     layout.line_count += 1;
                     iter.next();
                 }
                 b'\r' => {
-                    layout.has_cr = true;
+                    layout.cr += 1;
                     layout.line_count += 1;
                 }
                 b'\n' => {
-                    layout.has_lf = true;
+                    layout.lf += 1;
                     layout.line_count += 1;
                 }
                 _ => {}
@@ -182,27 +271,27 @@ mod text_layout_tests {
     #[test]
     fn analyze_lone_lf() {
         let layout = TextLayout::analyze("\n");
-        assert!(layout.has_lf);
-        assert!(!layout.has_cr);
-        assert!(!layout.has_crlf);
+        assert!(layout.has_lf());
+        assert!(!layout.has_cr());
+        assert!(!layout.has_crlf());
         assert_eq!(layout.line_count, 1);
     }
 
     #[test]
     fn analyze_lone_cr() {
         let layout = TextLayout::analyze("\r");
-        assert!(!layout.has_lf);
-        assert!(layout.has_cr);
-        assert!(!layout.has_crlf);
+        assert!(!layout.has_lf());
+        assert!(layout.has_cr());
+        assert!(!layout.has_crlf());
         assert_eq!(layout.line_count, 1);
     }
 
     #[test]
     fn analyze_crlf_pair() {
         let layout = TextLayout::analyze("\r\n");
-        assert!(!layout.has_lf);
-        assert!(!layout.has_cr);
-        assert!(layout.has_crlf);
+        assert!(!layout.has_lf());
+        assert!(!layout.has_cr());
+        assert!(layout.has_crlf());
         assert_eq!(layout.line_count, 1);
     }
 
@@ -214,8 +303,8 @@ mod text_layout_tests {
     #[test]
     fn analyze_cr_not_followed_by_lf_is_lone_cr_not_crlf() {
         let layout = TextLayout::analyze("\ra");
-        assert!(layout.has_cr);
-        assert!(!layout.has_crlf);
+        assert!(layout.has_cr());
+        assert!(!layout.has_crlf());
         // "\r" (line 1) + trailing unterminated "a" (line 2).
         assert_eq!(layout.line_count, 2);
     }
@@ -244,10 +333,45 @@ mod text_layout_tests {
     #[test]
     fn analyze_mixed_line_endings_counts_each_line_and_sets_every_flag() {
         let layout = TextLayout::analyze("a\nb\r\nc\rd");
-        assert!(layout.has_lf);
-        assert!(layout.has_crlf);
-        assert!(layout.has_cr);
+        assert!(layout.has_lf());
+        assert!(layout.has_crlf());
+        assert!(layout.has_cr());
         assert_eq!(layout.line_count, 4);
+        assert_eq!((layout.lf, layout.crlf, layout.cr), (1, 1, 1));
+        assert!(layout.is_mixed());
+        assert_eq!(layout.uniformity(), "mixed");
+    }
+
+    /// A single stray CRLF in an otherwise-LF file must not be summarised
+    /// away: that is precisely the file git refuses in an LF-only repo.
+    #[test]
+    fn analyze_reports_a_stray_terminator_rather_than_the_winner() {
+        let layout = TextLayout::analyze("a\nb\r\nc\n");
+        assert_eq!((layout.lf, layout.crlf, layout.cr), (2, 1, 0));
+        assert!(layout.is_mixed());
+        assert_eq!(layout.uniformity(), "mixed");
+        assert_eq!(layout.dominant(), Some(harrier::encoding::LineEnding::Lf));
+    }
+
+    #[test]
+    fn uniformity_of_a_file_with_no_terminators_is_none() {
+        let layout = TextLayout::analyze("no terminators");
+        assert_eq!(layout.uniformity(), "none");
+        assert_eq!(layout.dominant(), None);
+        assert!(!layout.is_mixed());
+    }
+
+    /// A denormalising whole-file write moves every terminator into one
+    /// bucket; the projection is how the "after" census is derived without
+    /// re-scanning the encoded output.
+    #[test]
+    fn projected_onto_moves_every_terminator_into_one_bucket() {
+        let mixed = TextLayout::analyze("a\nb\r\nc\rd");
+        let projected = mixed.projected_onto(harrier::encoding::LineEnding::CrLf);
+        assert_eq!((projected.lf, projected.crlf, projected.cr), (0, 3, 0));
+        assert_eq!(projected.line_count, mixed.line_count);
+        assert!(!projected.is_mixed());
+        assert_eq!(projected.uniformity(), "uniform");
     }
 }
 
@@ -1175,8 +1299,8 @@ mod git_text_policy_tests {
         assert_eq!(decoded.line_ending, harrier::encoding::LineEnding::CrLf);
         assert_eq!(decoded.bom_len, 2);
         assert_eq!(decoded.layout.line_count, 2);
-        assert!(decoded.layout.has_crlf);
-        assert!(!decoded.layout.has_lf);
+        assert!(decoded.layout.has_crlf());
+        assert!(!decoded.layout.has_lf());
     }
 
     #[test]
