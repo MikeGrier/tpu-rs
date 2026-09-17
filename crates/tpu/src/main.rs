@@ -1025,9 +1025,10 @@ enum Commands {
     /// extensions.  Honours a top-level `.gitignore` if present (basic
     /// non-negation patterns only).
     ///
-    /// Exit code reflects what the scan FOUND, not the state afterwards:
-    /// a `--fix` run that repaired everything still exits 1.  Re-run
-    /// without `--fix` to assert the repaired tree is clean.
+    /// Exit code is 0 when nothing remains unresolved: a `--fix` run
+    /// that repaired everything it found exits 0, while anything left
+    /// (an invalid encoding, U+FFFD residue, a declined peel, a peel
+    /// that left matches behind) exits 1.
     Doctor {
         /// File(s), directory(ies), or glob(s) to scan.  Defaults to `.`
         /// (the current directory) when omitted.
@@ -2384,7 +2385,7 @@ fn run(
             } else {
                 out.emit("doctor", None, None, format_args!("{content}"));
             }
-            if report.total_issues() > 0 {
+            if report.unresolved_issues() > 0 {
                 std::process::exit(1);
             }
             Ok(())

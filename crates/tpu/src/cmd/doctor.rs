@@ -110,10 +110,10 @@
 //!
 //! ## Exit code (chosen by caller)
 //!
-//! `main.rs` exits 1 when `total_issues` is non-zero.  Note that this counts
-//! what the scan *found*, not what remains: a `--fix` run that repaired
-//! everything still exits 1, matching [`DoctorReport::verdict`].  Re-run
-//! without `--fix` to assert the repaired state is clean.
+//! `main.rs` exits 1 when `unresolved_issues` is non-zero -- what remains
+//! *after* any requested fixes, so a `--fix` run that repaired everything
+//! exits 0.  That is deliberately not `total_issues`, which counts what the
+//! scan found and is what [`DoctorReport::verdict`] reports.
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -238,6 +238,12 @@ pub struct DoctorIssue {
     /// `true` once the file's line endings have been normalised to git's
     /// expectation under `--fix=eol` / `--fix=all`.
     pub eol_repaired: bool,
+    /// `true` when a peel ran but the result still contains mojibake.
+    ///
+    /// A peel is offered whenever it produces *strictly fewer* matches, which
+    /// is not the same as none, so [`Self::repaired`] alone cannot answer
+    /// "is this file clean now".
+    pub mojibake_residue: bool,
     /// `Some(n)` when this file's `encoding-check: allow-mojibake` marker
     /// suppressed `n` mojibake pattern match(es) that would otherwise have
     /// been reported here. `None` when no such marker is present, or one is
@@ -281,6 +287,24 @@ impl DoctorIssue {
             && (self.mojibake_marker_suppressed.is_some()
                 || self.replacement_char_marker_suppressed.is_some())
     }
+
+    /// True when this entry is still a problem *after* any repairs ran.
+    ///
+    /// Distinct from [`Self::is_problem`], which describes what the scan
+    /// found.  This is what an exit status should key off: a `--fix` run that
+    /// resolved everything leaves nothing unresolved.
+    pub fn is_unresolved(&self) -> bool {
+        if !self.is_problem() {
+            return false;
+        }
+        // An invalid encoding is never auto-repaired, and U+FFFD residue is
+        // manual-only, so both always remain.
+        let mojibake_outstanding = !self.valid_in_detected_encoding
+            || !self.replacement_char_matches.is_empty()
+            || (!self.mojibake_matches.is_empty() && !(self.repaired && !self.mojibake_residue));
+        let eol_outstanding = self.eol_mismatch.is_some() && !self.eol_repaired;
+        mojibake_outstanding || eol_outstanding
+    }
 }
 
 /// Aggregate result of [`run`].
@@ -305,6 +329,14 @@ impl DoctorReport {
         self.issues.iter().filter(|i| i.is_problem()).count()
     }
 
+    /// Number of flagged files that are still problems after any repairs.
+    ///
+    /// This is the exit-status question; [`Self::total_issues`] is the
+    /// "what did the scan find" question.
+    pub fn unresolved_issues(&self) -> usize {
+        self.issues.iter().filter(|i| i.is_unresolved()).count()
+    }
+
     /// Number of files where an allow-marker suppressed at least one
     /// mojibake or replacement-char match that would otherwise have been
     /// reported.  Not counted in [`Self::total_issues`]; purely informational.
@@ -327,8 +359,8 @@ impl DoctorReport {
     ///
     /// It describes what was **found**, not the file's state afterwards: a run
     /// that repaired everything still reports `"issues"`, with
-    /// `total_repaired` saying what was done about it. Re-run without `--fix`
-    /// to assert the repaired state is clean.
+    /// `total_repaired` saying what was done about it and `unresolved_issues`
+    /// saying what is left (which is what the exit status keys off).
     pub fn verdict(&self) -> &'static str {
         if self.total_issues() == 0 {
             "clean"
@@ -597,6 +629,7 @@ fn diagnose_file(
             repaired: false,
             eol_mismatch,
             eol_repaired: false,
+            mojibake_residue: false,
             mojibake_marker_suppressed: None,
             replacement_char_marker_suppressed: None,
         }));
@@ -705,6 +738,7 @@ fn diagnose_file(
         repaired: false,
         eol_mismatch,
         eol_repaired: false,
+        mojibake_residue: false,
         mojibake_marker_suppressed: None,
         replacement_char_marker_suppressed,
     }))
@@ -736,6 +770,7 @@ fn marker_suppressed_issue(
         repaired: false,
         eol_mismatch,
         eol_repaired: false,
+        mojibake_residue: false,
         mojibake_marker_suppressed: (would_be_mojibake > 0).then_some(would_be_mojibake),
         replacement_char_marker_suppressed: (would_be_rc > 0).then_some(would_be_rc),
     })
@@ -759,6 +794,7 @@ fn eol_only_issue(
         repaired: false,
         eol_mismatch: Some(m),
         eol_repaired: false,
+        mojibake_residue: false,
         mojibake_marker_suppressed: None,
         replacement_char_marker_suppressed: None,
     })
@@ -934,6 +970,8 @@ fn apply_peel(
         mojibake::WritePolicy::permissive(),
     )?;
     issue.repaired = true;
+    // A peel only promises strictly fewer matches, so ask whether any remain.
+    issue.mojibake_residue = !mojibake::scan(&peeled).matches.is_empty();
     if issue.eol_mismatch.is_some() {
         let repaired = crate::read_raw_bytes(&issue.path, io_mode)?;
         issue.eol_repaired = git::detect_with_policy(git_policy, &repaired).is_none();
@@ -1411,6 +1449,7 @@ pub fn report_to_json(report: &DoctorReport) -> serde_json::Value {
                 })),
                 "eol_repaired": issue.eol_repaired,
                 "any_repaired": issue.repaired || issue.eol_repaired,
+                "unresolved": issue.is_unresolved(),
                 "mojibake_marker_suppressed": issue.mojibake_marker_suppressed,
                 "replacement_char_marker_suppressed": issue.replacement_char_marker_suppressed,
             })
@@ -1422,6 +1461,7 @@ pub fn report_to_json(report: &DoctorReport) -> serde_json::Value {
         "files": files,
         "total_files_scanned": report.total_files_scanned,
         "total_issues": report.total_issues(),
+        "total_unresolved": report.unresolved_issues(),
         "total_repaired": report.total_repaired,
         "total_marker_suppressed": report.total_marker_suppressed(),
     })
@@ -2075,6 +2115,7 @@ mod tests {
             repaired: false,
             eol_mismatch: None,
             eol_repaired: false,
+            mojibake_residue: false,
             mojibake_marker_suppressed: None,
             replacement_char_marker_suppressed: None,
         };
@@ -2110,10 +2151,76 @@ mod tests {
             repaired: false,
             eol_mismatch: None,
             eol_repaired: false,
+            mojibake_residue: false,
             mojibake_marker_suppressed: None,
             replacement_char_marker_suppressed: None,
         });
         assert_eq!(r.total_issues(), 1);
+    }
+
+    /// The exit status asks what is left, not what was found: a `--fix` run
+    /// that resolved everything must not still fail.
+    #[test]
+    fn unresolved_issues_excludes_what_was_repaired() {
+        let repaired_eol = DoctorIssue {
+            path: PathBuf::from("eol.txt"),
+            encoding_detected: "UTF-8",
+            valid_in_detected_encoding: true,
+            mojibake_matches: Vec::new(),
+            replacement_char_matches: Vec::new(),
+            peel_suggested: None,
+            peel_declined_reason: None,
+            repaired: false,
+            eol_mismatch: Some(git::EolMismatch {
+                actual: harrier::encoding::LineEnding::CrLf,
+                expected: harrier::encoding::LineEnding::Lf,
+            }),
+            eol_repaired: true,
+            mojibake_residue: false,
+            mojibake_marker_suppressed: None,
+            replacement_char_marker_suppressed: None,
+        };
+        assert!(repaired_eol.is_problem(), "the scan still found it");
+        assert!(!repaired_eol.is_unresolved(), "but it was fixed");
+
+        let mut unrepaired = repaired_eol.clone();
+        unrepaired.eol_repaired = false;
+        assert!(unrepaired.is_unresolved());
+
+        let mut report = DoctorReport::default();
+        report.issues.push(repaired_eol);
+        report.issues.push(unrepaired);
+        assert_eq!(report.total_issues(), 2, "both were found");
+        assert_eq!(report.unresolved_issues(), 1, "one remains");
+    }
+
+    /// A peel is offered when it produces *strictly fewer* matches, which is
+    /// not the same as none, so `repaired` alone cannot clear the exit status.
+    #[test]
+    fn a_peel_that_left_matches_behind_is_still_unresolved() {
+        let mut issue = DoctorIssue {
+            path: PathBuf::from("a.txt"),
+            encoding_detected: "UTF-8",
+            valid_in_detected_encoding: true,
+            mojibake_matches: vec![DoctorMatch {
+                byte_offset: 0,
+                line: 1,
+                col: 1,
+                pattern: Pattern::Latin1,
+            }],
+            replacement_char_matches: Vec::new(),
+            peel_suggested: None,
+            peel_declined_reason: None,
+            repaired: true,
+            eol_mismatch: None,
+            eol_repaired: false,
+            mojibake_residue: false,
+            mojibake_marker_suppressed: None,
+            replacement_char_marker_suppressed: None,
+        };
+        assert!(!issue.is_unresolved(), "a clean peel resolves it");
+        issue.mojibake_residue = true;
+        assert!(issue.is_unresolved(), "residue does not");
     }
 
     #[test]
@@ -2145,6 +2252,7 @@ mod tests {
                 expected: harrier::encoding::LineEnding::Lf,
             }),
             eol_repaired: false,
+            mojibake_residue: false,
             mojibake_marker_suppressed: None,
             replacement_char_marker_suppressed: None,
         });

@@ -437,6 +437,10 @@ pub fn list() -> Value {
                  literal dollar sign — see the 'replacement' ESCAPING note below for when \
                  this applies. \
                  The original file is backed up to <file>.bak before writing. \
+                 An EMPTY literal pattern is refused: it would match at every byte \
+                 position and splice the replacement between every character of the file, \
+                 with a large, plausible-looking count. Pass regex:true if an empty \
+                 pattern is genuinely intended. \
                  A zero-match run is an ERROR by default: the pattern did not appear \
                  in the file, so nothing was substituted. The file is left untouched \
                  (mtime preserved, no .bak written) and the response is \
@@ -506,7 +510,11 @@ pub fn list() -> Value {
                  ORDER against the evolving buffer (a later op sees earlier ops' output), \
                  and the whole batch is ONE atomic write: one .bak, one mtime bump, one \
                  content_version — when the resulting bytes differ, which an identity \
-                 substitution's do not (check 'wrote'). If any op matches zero times \
+                 substitution's do not (check 'wrote'). Every per-op field (label, \
+                 pattern, replacement, regex, multiline, allow_no_match, the *_format \
+                 channels) is REJECTED at the top level alongside 'ops', because applying \
+                 none of them silently is how a batch quietly does the wrong thing. If \
+                 any op matches zero times \
                  without its own \
                  allow_no_match:true, the ENTIRE batch is refused and the file is left \
                  untouched — so a batch can never leave a half-transformed file. The \
@@ -525,7 +533,15 @@ pub fn list() -> Value {
                  Set changed_line_details:true for a 'changed_line_details' array giving \
                  each differing line's old_line / new_line positions and old_text / \
                  new_text images (capped by changed_line_details_max, default 50); batch \
-                 mode enables this by default since it has no changed-region echo.",
+                 mode enables this by default since it has no changed-region echo, except \
+                 under count:true, which substitutes nothing -- asking for details there \
+                 is an error, and when you ask and nothing changed you get an empty array \
+                 rather than a missing key. A MATCH IS NOT A WRITE: the trailer carries \
+                 'wrote' (real runs) and 'would_write' (count/dry_run, where 'changed' is \
+                 the older alias for the same value), because an identity substitution \
+                 matches with a non-zero count yet produces byte-identical output that \
+                 the write path skips -- no .bak, no mtime bump. Ask those fields rather \
+                 than inferring from 'count'.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -1781,7 +1797,9 @@ pub fn list() -> Value {
                  would otherwise have been flagged still appears in `files` with \
                  `mojibake_marker_suppressed` (and/or `replacement_char_marker_suppressed`) \
                  set to the count that was hidden, and `total_marker_suppressed` reports \
-                 how many files that applied to. A file with the marker but genuinely \
+                 how many files that applied to. The marker covers mojibake and \
+                 replacement-character diagnostics only -- a git line-ending mismatch is \
+                 a separate concern and is still reported for a marked file. A file with the marker but genuinely \
                  nothing to suppress is omitted entirely, same as any other clean file. \n\n\
                  LINE ENDINGS: repository discovery is automatic. Files whose on-disk line \
                  endings differ from git's expected convention for their path (per \

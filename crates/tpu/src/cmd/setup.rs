@@ -222,7 +222,8 @@ differences.
     insertion/deletion) and `old_text`/`new_text`. Positions name real lines
     of the real before/after files, so this works for a batch too. Capped by
     `changed_line_details_max` (default 50), with
-    `changed_line_details_truncated: true` when the cap is hit. Batch mode
+    `changed_line_details_truncated: true` when the cap is hit. Asking for it
+    and finding nothing gives an empty array, not a missing key. Batch mode
     turns this on by default because it has no changed-region echo — except
     under `count: true`, which performs no substitution and so has nothing to
     image; asking for details there explicitly is an error, not an empty
@@ -234,6 +235,13 @@ differences.
   bump. The changed-region echo still shows the match (it describes what
   matched, not what changed), so `wrote: false` is what tells you the file is
   untouched.
+- **An empty literal pattern is refused** — it would match at every byte
+  position and splice the replacement between every character of the file,
+  reporting a large and entirely plausible count. Pass `regex: true` if an
+  empty pattern is genuinely what you want. Patterns are matched against an
+  LF-normalised view and are themselves normalised, so a pattern containing a
+  literal CRLF matches a CRLF file — you never need to account for line
+  endings in a pattern.
 - **A replace that matches nothing is an error** — `tpu_replace_in_file`
   returns `{"status":"error"}` when `pattern` matches zero times, and leaves
   the file completely untouched (mtime preserved, no `.bak`). This is
@@ -419,7 +427,10 @@ Workflow:
    `mojibake_marker_suppressed` (and/or `replacement_char_marker_suppressed`)
    set to the count that was hidden, and the top-level
    `total_marker_suppressed` reports how many files that applied to across
-   the whole scan. A file with the marker but genuinely nothing to suppress
+   the whole scan. The marker covers mojibake and replacement-character
+   diagnostics only — a git line-ending mismatch is a separate concern and
+   is still reported for a marked file. A file with the marker but genuinely
+   nothing to suppress
    is omitted entirely, same as any other clean file. If you see a nonzero
    `total_marker_suppressed`, don't assume the marker was placed
    correctly — a file that merely *discusses* the marker string in prose
