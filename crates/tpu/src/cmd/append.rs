@@ -29,6 +29,18 @@ use crate::{
     mojibake::{WritePolicy, check_write_does_not_introduce_mojibake},
 };
 
+/// What an [`run`] call did, or would have done.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AppendOutcome {
+    /// Whether the resulting bytes differ from what is on disk.
+    ///
+    /// Computed against the encoded, denormalised output, so it sees a pure
+    /// line-ending rewrite -- which a diff taken in LF space cannot.
+    pub would_write: bool,
+    /// Whether bytes actually reached the disk.  Always false under `diff_out`.
+    pub wrote: bool,
+}
+
 /// Run the `append` subcommand.
 ///
 /// # Arguments
@@ -48,7 +60,7 @@ pub fn run(
     diff_out: Option<&mut dyn Write>,
     io_mode: IoMode,
     policy: WritePolicy,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<AppendOutcome, Box<dyn std::error::Error>> {
     let _ = crate::recover_stranded_backup(file);
     if !file.exists() {
         return Err(format!(
@@ -97,13 +109,9 @@ pub fn run(
     }
 
     // ── Diff-only (preview) mode ──────────────────────────────────────────────
-    // Emit a unified diff to `diff_out` and return without touching the file.
-    if let Some(out) = diff_out {
-        let existing_bytes = crate::retry_io(|| fs::read(file))?;
-        crate::cmd::write::emit_text_diff(file, &existing_bytes, encoding, &combined, out)?;
-        return Ok(());
-    }
-
+    // Everything below is a pure function of the combined text, so every mode
+    // runs it: a preview has to answer "would the bytes change", which a diff
+    // taken in LF space cannot for a pure line-ending rewrite.
     let encoded = crate::encoding::encode_text_strict(&combined, encoding)
         .map_err(|error| format!("append: {}: {error}", file.display()))?;
 
@@ -125,8 +133,25 @@ pub fn run(
         encoded_bytes
     };
 
-    // ── Atomic write via the shared temp→.bak→persist→restore helper ─────────
-    crate::atomic_write(file, &output_bytes)?;
+    let existing_bytes = crate::retry_io(|| fs::read(file))?;
+    let would_write = existing_bytes != output_bytes;
 
-    Ok(())
+    // Emit a unified diff to `diff_out` and return without touching the file.
+    if let Some(out) = diff_out {
+        crate::cmd::write::emit_text_diff(file, &existing_bytes, encoding, &combined, out)?;
+        return Ok(AppendOutcome {
+            would_write,
+            wrote: false,
+        });
+    }
+
+    // ── Atomic write via the shared temp→.bak→persist→restore helper ─────────
+    if would_write {
+        crate::atomic_write(file, &output_bytes)?;
+    }
+
+    Ok(AppendOutcome {
+        would_write,
+        wrote: would_write,
+    })
 }

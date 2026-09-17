@@ -3235,7 +3235,7 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
 
         if diff {
             let mut diff_buf: Vec<u8> = Vec::new();
-            tpu::cmd::append::run(
+            let outcome = tpu::cmd::append::run(
                 path,
                 &content,
                 le_override,
@@ -3248,15 +3248,17 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
             // `eol_warning` here would describe the current file while reading
             // as though the preview had done something.
             let content_version = current_version(&file)?;
-            let changed = !diff_buf.is_empty();
+            // From the encoded bytes, not the diff: an LF-space diff is empty
+            // for a pure line-ending rewrite.
             let status = serde_json::json!({
                 "status": "success",
                 "file": file,
-                "changed": changed,
+                "changed": outcome.would_write,
+                "would_write": outcome.would_write,
                 "content_version": content_version,
             });
             let status_line = serde_json::to_string(&status)?;
-            if changed {
+            if !diff_buf.is_empty() {
                 let diff_text = String::from_utf8_lossy(&diff_buf);
                 let sep = diff_separator(&diff_text);
                 return Ok(ToolResult::ok(format!(
@@ -4272,7 +4274,7 @@ fn decode_pattern_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::er
 ///
 /// The replacement is taken **verbatim** by default, exactly like every other
 /// text payload in this server (`tpu_write_file`'s `content`,
-/// `tpu_append_file`'s `text`, an edit op's `data`): the bytes the caller sent
+/// `tpu_append_file`'s `content`, an edit op's `data`): the bytes the caller sent
 /// are the bytes written. This matters because the previous default — an
 /// unconditional [`unescape_replacement`] pass — silently collapsed `\\` to
 /// `\` in replacements that legitimately contain backslashes (Rust/JSON string
@@ -6889,6 +6891,32 @@ mod integration_tests {
 
         assert_eq!(status["would_write"], false, "identity substitution");
         assert_eq!(status["changed"], status["would_write"], "same value");
+    }
+
+    /// `changed` on an append preview is a byte-level answer, so a
+    /// `line_ending` override that rewrites every terminator reports true even
+    /// though the diff, taken in LF space, is empty.
+    #[test]
+    fn append_diff_preview_sees_a_line_ending_only_rewrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("lf.txt");
+        fs::write(&f, b"a\nb\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "",
+            "line_ending": "crlf",
+            "diff": true,
+        });
+        let out = call("tpu_append_file", &args).expect("must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(
+            status["would_write"], true,
+            "every terminator would change: {status}"
+        );
+        assert_eq!(status["changed"], status["would_write"], "same value");
+        assert_eq!(fs::read(&f).unwrap(), b"a\nb\n", "a preview must not write");
     }
 
     #[test]
