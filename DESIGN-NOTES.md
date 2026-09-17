@@ -482,7 +482,7 @@ tool) rather than an implicit side effect.
 
 ### Future: mixed line ending detection and user-prompted normalization
 
-The `describe` command already performs a full scan and reports `"Mixed"` when a file
+The `count` command already performs a full scan and reports `"MIXED"` when a file
 contains two or more line ending styles (LF, CRLF, CR).  A natural extension would be
 to surface this to the user after write operations and offer to normalize.
 
