@@ -480,31 +480,31 @@ If whole-file normalization is ever needed as a first-class action, the right fo
 a separate explicit tool (e.g. `tpu normalize` or a `tpu_normalize_line_endings` MCP
 tool) rather than an implicit side effect.
 
-### Future: mixed line ending detection and user-prompted normalization
-
-The `count` command already performs a full scan and reports `"MIXED"` when a file
-contains two or more line ending styles (LF, CRLF, CR).  A natural extension would be
-to surface this to the user after write operations and offer to normalize.
+### Mixed line ending detection and normalization
 
 MCP is strictly request-response JSON-RPC — the server cannot pause mid-operation to
-present a choice UI to the client.  This rules out an interactive "normalize now?"
-prompt from within a tool call.
+present a choice UI to the client.  That rules out an interactive "normalize now?"
+prompt from within a tool call, so the design is *advise, then offer a separate
+explicit repair*.  Both halves are implemented:
 
-The viable path, if we pursue this later, is:
+1. **Advisory warnings in tool results.**  Every mutating text tool
+   (`tpu_create_file`, `tpu_write_file`, `tpu_replace_in_file`, `tpu_edit_file`,
+   `tpu_append_file`, `tpu_render_file`) runs a post-write conformance check and adds
+   an `eol_warning` field to its status trailer when the result does not conform.  The
+   CLI equivalents warn on stderr.  A plain `"status":"success"` with no `eol_warning`
+   is what means "committable".
 
-1. **Advisory warnings in tool results.**  After a write/replace/edit/append completes,
-   run the mixed-endings check.  If mixed, include a warning in the JSON result
-   (e.g. `"warning": "File has mixed line endings. Call tpu_normalize_line_endings to
-   fix."`).  Copilot would see this and could relay it or act on it autonomously.
+2. **Explicit repair.**  `tpu doctor --fix=eol` (`fix: "eol"` over MCP) normalizes a
+   file's endings to git's expected convention; `--fix=all` also peels mojibake.  A
+   `tpu_normalize_line_endings` tool was considered and rejected: doctor already owns
+   the walk, the skip-lists, and the `.gitattributes` resolution, so a second tool
+   would duplicate the policy logic that decides what "normalized" even means here.
 
-2. **Dedicated `tpu_normalize_line_endings` tool.**  Takes a file path and optional
-   target line ending (defaulting to the file's dominant style via majority vote).
-   Normalizes the entire file and reports what changed.
-
-These two together give a clean experience: tools surface the problem, a dedicated tool
-fixes it, and no implicit side effects occur.  Not implementing now — the boundary
-normalization already prevents *creating* new mixed endings; this would only address
-pre-existing ones.
+The repair is scoped to what git has an opinion about.  A file with **no** applicable
+EOL policy is reported by the post-write advisory but is *not* something
+`doctor --fix=eol` will rewrite, because `detect_with_policy` needs a definite policy
+to produce a mismatch.  The advisory therefore names an explicit line-ending override
+for that case rather than pointing at doctor — see `git::write_warning`.
 
 ---
 

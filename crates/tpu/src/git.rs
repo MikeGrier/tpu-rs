@@ -928,11 +928,17 @@ pub fn write_warning(file: &Path, remedy: &str) -> Option<String> {
     // left alone by git on purpose, so its endings are not a defect and
     // "normalize it" would be the wrong remedy; `text=auto` content classified
     // as binary is already excluded by its `line_ending` being set.
+    //
+    // The caller's `remedy` is deliberately NOT appended: every front end
+    // names a `tpu_doctor` fix, and doctor models this file as clean because
+    // `detect_with_policy` needs a policy to produce a mismatch. Pointing at a
+    // repair that cannot run is worse than naming the one that can.
     if counts.is_mixed() && policy.line_ending.is_none() && !policy.declared_binary {
         return Some(format!(
             "the file now contains mixed line endings ({breakdown}). No git policy applies \
-             to this path, so nothing was normalized; rewrite the whole file with an \
-             explicit line ending if a single convention was intended. {remedy}"
+             to this path, so nothing was normalized and `tpu doctor` will not flag it; \
+             rewrite the whole file with an explicit line ending (`--line-ending` on the \
+             CLI, `line_ending` on an MCP write) if a single convention was intended."
         ));
     }
     None
@@ -1169,7 +1175,9 @@ mod tests {
     }
 
     /// But a path git simply has no rule for still warns: mixed endings with
-    /// nothing to judge them by is the case the fallback exists for.
+    /// nothing to judge them by is the case the fallback exists for. It must
+    /// NOT cite the caller's doctor-based remedy, which cannot repair a file
+    /// doctor does not flag.
     #[test]
     fn write_warning_still_reports_mixed_endings_with_no_policy() {
         // autocrlf off and no attributes is the "git has no opinion" case.
@@ -1178,8 +1186,12 @@ mod tests {
         let warning = write_warning(&file, "REMEDY").expect("no policy must still warn");
         assert!(warning.contains("mixed line endings"), "{warning}");
         assert!(
-            warning.contains("REMEDY"),
-            "the caller's repair route must survive: {warning}"
+            warning.contains("explicit line ending"),
+            "it must name a repair that works: {warning}"
+        );
+        assert!(
+            !warning.contains("REMEDY"),
+            "and must not point at doctor, which will not flag this file: {warning}"
         );
     }
 
