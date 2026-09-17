@@ -7,7 +7,9 @@
 //! emitted after the standard metrics in declaration order.
 //!
 //! When `stats` is true (from `--stats` or JSON mode), encoding metadata is
-//! emitted first: the WHATWG encoding name, BOM presence, and line-ending style.
+//! emitted first: the WHATWG encoding name, BOM presence, the line-ending style
+//! (`LF`/`CRLF`/`CR`, or `MIXED` when more than one convention is present), and
+//! the per-convention terminator counts `lf_count` / `crlf_count` / `cr_count`.
 
 use std::{fs, path::Path};
 
@@ -28,8 +30,9 @@ use crate::{IoMode, output::Output};
 /// * `labels`   — human-readable label for each pattern (positionally aligned;
 ///   missing labels default to the pattern string; surplus labels
 ///   are an error)
-/// * `stats`    — emit encoding name, BOM presence, and line-ending style
-///   before the metric counts; always true in JSON mode
+/// * `stats`    — emit encoding name, BOM presence, line-ending style and the
+///   per-convention terminator counts before the metric counts;
+///   always true in JSON mode
 /// * `out`      — output sink (human or JSON, driven by `--message-format`)
 #[allow(clippy::too_many_arguments)]
 pub fn run(
@@ -69,16 +72,31 @@ pub fn run(
     let byte_count = fs::metadata(file)?.len();
 
     // ── Open and decode the file, capturing file metadata ────────────────────
-    let (text, enc_name, has_bom, line_ending_label): (String, &'static str, bool, &'static str) = {
+    // `decoded.line_ending` is only the *dominant* convention, so it cannot be
+    // used as-is: it reports "LF" for a file that also contains CRLF, which is
+    // precisely the file git rejects at commit time in an LF-only repository.
+    // `decoded.layout` is the per-terminator census taken during that same
+    // decode, so reporting MIXED costs nothing extra.
+    let (text, enc_name, has_bom, layout, line_ending_label): (
+        String,
+        &'static str,
+        bool,
+        crate::TextLayout,
+        &'static str,
+    ) = {
         let decoded = crate::read_text_file(file, io_mode)?;
         let enc_name: &'static str = decoded.encoding.name();
         let has_bom = decoded.bom_len > 0;
-        let le_label: &'static str = match decoded.line_ending {
-            LineEnding::Lf => "LF",
-            LineEnding::CrLf => "CRLF",
-            LineEnding::Cr => "CR",
+        let le_label: &'static str = if decoded.layout.is_mixed() {
+            "MIXED"
+        } else {
+            match decoded.line_ending {
+                LineEnding::Lf => "LF",
+                LineEnding::CrLf => "CRLF",
+                LineEnding::Cr => "CR",
+            }
         };
-        (decoded.text, enc_name, has_bom, le_label)
+        (decoded.text, enc_name, has_bom, decoded.layout, le_label)
     };
 
     // ── Emit stats ────────────────────────────────────────────────────────────
@@ -122,6 +140,24 @@ pub fn run(
                 "rendered": format!("line_ending: {line_ending_label}\n"),
             }),
         );
+        for (metric, count) in [
+            ("lf_count", layout.lf),
+            ("crlf_count", layout.crlf),
+            ("cr_count", layout.cr),
+        ] {
+            out.emit_json(
+                "count",
+                None,
+                None,
+                &serde_json::json!({
+                    "reason": "data",
+                    "subcommand": "count",
+                    "metric": metric,
+                    "count": count,
+                    "rendered": format!("{metric}: {count}\n"),
+                }),
+            );
+        }
     }
 
     // ── Standard metrics ─────────────────────────────────────────────────────

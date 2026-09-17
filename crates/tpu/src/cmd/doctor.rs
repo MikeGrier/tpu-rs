@@ -1,11 +1,18 @@
 // Copyright (c) 2026, Michael Grier
 
-//! `tpu doctor` — encoding-aware diagnostic for one or more paths.
+//! `tpu doctor` — encoding- and line-ending-aware conformance check for one or
+//! more paths.
 //!
 //! Walks each given path (file, directory, or shell-style glob), classifies
 //! every reachable text file as either *clean*, *mojibake-suspected*, or
-//! *invalid in its detected encoding*, and (optionally) attempts a one-layer
-//! peel repair using [`crate::mojibake::looks_like_one_layer_peel`].
+//! *invalid in its detected encoding*, flags any file whose on-disk line
+//! endings disagree with git's expected working-tree convention, and
+//! (optionally) repairs either class.
+//!
+//! Despite the name this is not only a corruption-triage tool: a line-ending
+//! policy mismatch is not damage, and `doctor` is the intended answer to
+//! "is this file in a committable state?" as well as to "is this file
+//! corrupted?".
 //!
 //! ## Detection model
 //!
@@ -61,6 +68,7 @@
 //! - **JSON**: a single JSON document with the following schema:
 //!   ```json
 //!   {
+//!     "verdict": "issues",
 //!     "files": [
 //!       {
 //!         "path": "...",
@@ -70,7 +78,10 @@
 //!           { "byte_offset": 12, "line": 1, "col": 13, "pattern": "latin1" }
 //!         ],
 //!         "peel_suggested": null,
-//!         "repaired": false
+//!         "repaired": false,
+//!         "mojibake_repaired": false,
+//!         "eol_repaired": false,
+//!         "any_repaired": false
 //!       }
 //!     ],
 //!     "total_files_scanned": 7,
@@ -78,6 +89,10 @@
 //!     "total_repaired": 0
 //!   }
 //!   ```
+//!
+//!   `verdict` is `"clean"` or `"issues"`, so a caller that only wants to
+//!   know whether the scanned paths are in a committable state can read one
+//!   field instead of walking `files`.
 //!
 //! ## Exit code (chosen by caller)
 //!
@@ -195,6 +210,12 @@ pub struct DoctorIssue {
     /// offered.
     pub peel_declined_reason: Option<String>,
     /// `true` once the file has been rewritten with `peel_suggested`.
+    ///
+    /// This covers the **mojibake** repair only; a line-ending normalisation
+    /// is reported by [`Self::eol_repaired`].  The JSON report exposes both
+    /// under the clearer names `mojibake_repaired` / `eol_repaired` plus their
+    /// union as `any_repaired`, so a successful `--fix=eol` run is never
+    /// misread as a no-op from `repaired: false` alone.
     pub repaired: bool,
     /// `Some(_)` when the file's on-disk line endings disagree with git's
     /// expected working-tree convention for that path.
@@ -280,6 +301,25 @@ impl DoctorReport {
                     || i.replacement_char_marker_suppressed.is_some()
             })
             .count()
+    }
+
+    /// One-word answer to "did this scan find anything?" — `"clean"` when
+    /// nothing was flagged, otherwise `"issues"`.
+    ///
+    /// This exists so `doctor` can be used as a cheap pre-commit assertion
+    /// without parsing per-file detail: a scan that is only *verifying* needs
+    /// a verdict, not a repair report.
+    ///
+    /// It describes what was **found**, not the file's state afterwards: a run
+    /// that repaired everything still reports `"issues"`, with
+    /// `total_repaired` saying what was done about it. Re-run without `--fix`
+    /// to assert the repaired state is clean.
+    pub fn verdict(&self) -> &'static str {
+        if self.total_issues() == 0 {
+            "clean"
+        } else {
+            "issues"
+        }
     }
 }
 
@@ -1257,25 +1297,38 @@ fn emit_human(out: &mut dyn Write, report: &DoctorReport, quiet: bool) -> std::i
     if suppressed > 0 {
         writeln!(
             out,
-            "doctor: scanned {} file(s), {} flagged, {} repaired, {} suppressed-by-marker",
+            "doctor: scanned {} file(s), {} flagged, {} repaired, {} suppressed-by-marker [{}]",
             report.total_files_scanned,
             report.total_issues(),
             report.total_repaired,
             suppressed,
+            report.verdict(),
         )?;
     } else {
         writeln!(
             out,
-            "doctor: scanned {} file(s), {} flagged, {} repaired",
+            "doctor: scanned {} file(s), {} flagged, {} repaired [{}]",
             report.total_files_scanned,
             report.total_issues(),
-            report.total_repaired
+            report.total_repaired,
+            report.verdict(),
         )?;
     }
     Ok(())
 }
 
 fn emit_json(out: &mut dyn Write, report: &DoctorReport) -> std::io::Result<()> {
+    let s = serde_json::to_string_pretty(&report_to_json(report)).expect("serialise doctor report");
+    writeln!(out, "{s}")?;
+    Ok(())
+}
+
+/// The report as a JSON value.
+///
+/// Exposed so a caller emitting NDJSON can embed the report *structurally*
+/// rather than as a pretty-printed string inside a text field, which would
+/// force consumers to parse JSON twice.
+pub fn report_to_json(report: &DoctorReport) -> serde_json::Value {
     let files: Vec<_> = report
         .issues
         .iter()
@@ -1321,27 +1374,27 @@ fn emit_json(out: &mut dyn Write, report: &DoctorReport) -> std::io::Result<()> 
                 "peel_suggested": issue.peel_suggested.is_some(),
                 "peel_declined_reason": issue.peel_declined_reason,
                 "repaired": issue.repaired,
+                "mojibake_repaired": issue.repaired,
                 "eol_mismatch": issue.eol_mismatch.map(|m| json!({
                     "expected": git::line_ending_name(m.expected),
                     "actual": git::line_ending_name(m.actual),
                 })),
                 "eol_repaired": issue.eol_repaired,
+                "any_repaired": issue.repaired || issue.eol_repaired,
                 "mojibake_marker_suppressed": issue.mojibake_marker_suppressed,
                 "replacement_char_marker_suppressed": issue.replacement_char_marker_suppressed,
             })
         })
         .collect();
 
-    let doc = json!({
+    json!({
+        "verdict": report.verdict(),
         "files": files,
         "total_files_scanned": report.total_files_scanned,
         "total_issues": report.total_issues(),
         "total_repaired": report.total_repaired,
         "total_marker_suppressed": report.total_marker_suppressed(),
-    });
-    let s = serde_json::to_string_pretty(&doc).expect("serialise doctor report");
-    writeln!(out, "{s}")?;
-    Ok(())
+    })
 }
 
 #[cfg(test)]

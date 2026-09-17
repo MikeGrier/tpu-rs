@@ -497,13 +497,101 @@ pub fn list() -> Value {
                  confident is JSON-escaped correctly, set pattern_format:\"base64\" and/or \
                  replacement_format:\"base64\" and send the exact bytes base64-encoded — \
                  this removes the escaping decision entirely. See 'pattern_format' and \
-                 'replacement_format' below.",
+                 'replacement_format' below.\n\n\
+                 BATCH MODE ('ops'): to make SEVERAL substitutions to one file, send an \
+                 'ops' array instead of a top-level pattern/replacement — do NOT write a \
+                 shell loop, and do not issue N separate calls when they belong together. \
+                 Each entry takes the same pattern / replacement / regex / multiline / \
+                 allow_no_match / *_format fields, plus an optional 'label'. Ops run IN \
+                 ORDER against the evolving buffer (a later op sees earlier ops' output), \
+                 and the whole batch is ONE atomic write: one .bak, one mtime bump, one \
+                 content_version. If any op matches zero times without its own \
+                 allow_no_match:true, the ENTIRE batch is refused and the file is left \
+                 untouched — so a batch can never leave a half-transformed file. The \
+                 response reports the per-op tally as 'ops':[{label,count},…] alongside \
+                 the total 'count'. Batch mode has no changed-region echo (a region's \
+                 line numbers would refer to an intermediate buffer); pass diff:true for \
+                 an unambiguous whole-file old/new diff, or read the per-op counts.\n\n\
+                 VERIFYING THE RESULT: every response (including count:true and \
+                 dry_run:true) carries a 'line_endings' object with a BEFORE and AFTER \
+                 terminator census -- {uniformity: \"uniform\"|\"mixed\"|\"none\", dominant, \
+                 line_count, lf, crlf, cr} -- plus 'normalized':true when the write \
+                 collapsed a mixed file onto one convention. That last case matters: a \
+                 replace rewrites the WHOLE file, so every terminator is re-emitted in \
+                 one convention even when your substitution had nothing to do with line \
+                 endings. Check 'line_endings.after.uniformity' rather than assuming. \
+                 Set changed_line_details:true for a 'changed_line_details' array giving \
+                 each differing line's old_line / new_line positions and old_text / \
+                 new_text images (capped by changed_line_details_max, default 50); batch \
+                 mode enables this by default since it has no changed-region echo.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "file": {
                         "type": "string",
                         "description": "Absolute path of the file to modify."
+                    },
+                    "changed_line_details": {
+                        "type": "boolean",
+                        "description":
+                            "If true, include a 'changed_line_details' array in the \
+                             response: one entry per differing line with its old_line / \
+                             new_line numbers (null for a pure insertion / deletion) and \
+                             its old_text / new_text images. Derived from a line diff of \
+                             the final before/after content, so the positions name real \
+                             lines of the real files -- unlike the default changed-region \
+                             echo, this is meaningful for a batch too. Note this is a \
+                             different thing from the integer 'changed_lines' the status \
+                             trailer already reports, which is a size estimate used to \
+                             decide whether to echo. Costs a whole-file line diff. \
+                             Default: false for a single substitution (the cheap echo \
+                             already previews it), true in batch mode (which has no echo)."
+                    },
+                    "changed_line_details_max": {
+                        "type": "integer",
+                        "description":
+                            "Cap on how many entries 'changed_line_details' carries; \
+                             'changed_line_details_truncated':true is set when the cap \
+                             was hit. Default: 50."
+                    },
+                    "ops": {
+                        "type": "array",
+                        "description":
+                            "Batch mode: several substitutions applied in order to one \
+                             file in a single atomic write. Mutually exclusive with a \
+                             top-level 'pattern'/'replacement'. Each entry accepts the \
+                             same pattern, pattern_format, replacement, \
+                             replacement_format, expand_escapes, regex, multiline, and \
+                             allow_no_match fields documented below, plus an optional \
+                             'label' echoed back beside that op's count. A zero-match op \
+                             without its own allow_no_match refuses the whole batch and \
+                             leaves the file untouched.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {
+                                    "type": "string",
+                                    "description":
+                                        "Optional name for this op, echoed back with its \
+                                         match count so the result reads as a tally."
+                                },
+                                "pattern": { "type": "string" },
+                                "pattern_format": {
+                                    "type": "string",
+                                    "enum": ["hex", "base64", "encoded"]
+                                },
+                                "replacement": { "type": "string" },
+                                "replacement_format": {
+                                    "type": "string",
+                                    "enum": ["hex", "base64", "encoded"]
+                                },
+                                "expand_escapes": { "type": "boolean" },
+                                "regex": { "type": "boolean" },
+                                "multiline": { "type": "boolean" },
+                                "allow_no_match": { "type": "boolean" }
+                            },
+                            "required": ["pattern", "replacement"]
+                        }
                     },
                     "pattern": {
                         "type": "string",
@@ -688,7 +776,11 @@ pub fn list() -> Value {
                              are ignored.  Default: false."
                     }
                 },
-                "required": ["file", "pattern", "replacement"]
+                "required": ["file"],
+                "oneOf": [
+                    { "required": ["pattern", "replacement"] },
+                    { "required": ["ops"] }
+                ]
             },
             "annotations": { "readOnlyHint": false, "destructiveHint": false }
         },
@@ -730,7 +822,14 @@ pub fn list() -> Value {
                  Text mode (binary: false, default):\n\
                    Positions are 1-based line numbers. Data is UTF-8 text with LF endings.\n\n\
                  Binary mode (binary: true):\n\
-                   Positions are 0-based byte offsets. Data is raw or encoded bytes.",
+                   Positions are 0-based byte offsets. Data is raw or encoded bytes.\n\n\
+                 LINE ENDINGS: this edit is targeted -- it rewrites only the lines it \
+                 touches, so a 'line_ending' argument re-ends only those lines and can \
+                 leave the file with mixed endings. When the resulting file's endings \
+                 disagree with git's expected convention for its path, or are mixed with \
+                 no policy to judge them by, the status trailer carries an `eol_warning`. \
+                 Check for that field rather than assuming a plain success means the file \
+                 is committable.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -809,8 +908,17 @@ pub fn list() -> Value {
                         "type": "string",
                         "enum": ["lf", "crlf", "cr"],
                         "description":
-                            "Override the output line ending in text mode. Omit to use definite \
-                             Git policy or preserve the file's existing convention. Conflicts \
+                            "Terminator for the lines this call writes -- NOT a whole-file \
+                             conversion. A line-mode edit is targeted, so this re-ends only \
+                             the edited / inserted / appended lines and leaves every other \
+                             line's terminator byte-for-byte intact; setting it on a file \
+                             whose other lines use a different convention produces a MIXED \
+                             file. To convert an entire file, use tpu_write_file or \
+                             tpu_replace_in_file with a line_ending instead. It also \
+                             outranks a definite .gitattributes / core.autocrlf policy: \
+                             when the result no longer conforms, the status trailer carries \
+                             an `eol_warning` rather than failing. Omit to use definite Git \
+                             policy or preserve the file's existing convention. Conflicts \
                              with binary: true."
                     },
                     "git_root": {
@@ -1104,6 +1212,17 @@ pub fn list() -> Value {
                  reported. Pattern matches are always reported when patterns are supplied. \n\n\
                  File metadata (encoding name, BOM presence, line-ending style) is always \
                  included in the result under 'encoding', 'bom', and 'line_ending'. \n\n\
+                 LINE ENDINGS: 'line_ending' is 'LF', 'CRLF', 'CR', or 'MIXED' when the \
+                 file contains more than one convention. A mixed file is reported as \
+                 MIXED rather than as its dominant convention, because a file with even \
+                 one stray CRLF in an LF-only repository is one git will reject at commit \
+                 time. The exact per-convention terminator counts are always included as \
+                 'lf_count', 'crlf_count', and 'cr_count', so this tool can be used as \
+                 positive byte evidence that a write landed with the endings you intended \
+                 -- reach for it instead of shelling out to PowerShell to count 0x0D. To \
+                 check conformance against the repository's own policy (.gitattributes / \
+                 core.autocrlf / core.eol) rather than just observing what is there, use \
+                 tpu_doctor. \n\n\
                  Returns a JSON object with the requested counts. When patterns are \
                  supplied their results appear in a 'patterns' sub-object keyed by label \
                  (e.g. {\"patterns\": {\"my-label\": 3}}).",
@@ -1159,9 +1278,9 @@ pub fn list() -> Value {
                         "type": "boolean",
                         "description":
                             "Accepted for compatibility; has no effect. File metadata \
-                             (encoding name, BOM presence, line-ending style) is always \
-                             present in the result under the 'encoding', 'bom', and \
-                             'line_ending' keys."
+                             (encoding name, BOM presence, line-ending style, and the \
+                             'lf_count' / 'crlf_count' / 'cr_count' terminator counts) is \
+                             always present in the result."
                     },
                     "message_format": {
                         "type": "string",
@@ -1620,11 +1739,19 @@ pub fn list() -> Value {
         {
             "name": "tpu_doctor",
             "description":
-                "Diagnose (and optionally repair) mojibake and encoding damage in one or \
-                 more files. Use this when a file looks garbled (`Ã©` instead of `é`, \
+                "Conformance check for text files: diagnose (and optionally repair) BOTH \
+                 mojibake / encoding damage AND git line-ending mismatches. This is the \
+                 tool to reach for to answer 'is this file in a committable state?' -- not \
+                 only 'is this file corrupted?'. Do not shell out to PowerShell or `git \
+                 ls-files --eol` to verify line endings; call this instead. \n\n\
+                 The report carries a top-level `verdict` of \"clean\" or \"issues\", so a \
+                 pure verification can read one field without walking `files`. Pair it \
+                 with `quiet: true` for a terse verdict-and-summary answer. \n\n\
+                 Use it when a file looks garbled (`Ã©` instead of `é`, \
                  `â€\"` instead of `—`, `â\"€` instead of `─`, stray `Â ` before \
-                 numbers, …) or when a `tpu_read_file` call surfaced a `note: ... \
-                 file appears to contain mojibake` warning. \n\n\
+                 numbers, …), when a `tpu_read_file` call surfaced a `note:` warning \
+                 about mojibake or line endings, or after any write whose line endings \
+                 matter. \n\n\
                  SCANS ONLY by default — returns a structured JSON report listing \
                  every flagged file with its detected encoding, per-pattern match counts, \
                  line/column locations, and whether a one-layer 'peel' repair would \
@@ -1652,10 +1779,15 @@ pub fn list() -> Value {
                  nothing to suppress is omitted entirely, same as any other clean file. \n\n\
                  LINE ENDINGS: repository discovery is automatic. Files whose on-disk line \
                  endings differ from git's expected convention for their path (per \
-                 .gitattributes / core.autocrlf / core.eol); such files are flagged with \
-                 an `eol_mismatch` object in the report. Call with `fix: \"eol\"` (line \
+                 .gitattributes / core.autocrlf / core.eol) are flagged with an \
+                 `eol_mismatch` object in the report -- including files that are only \
+                 partly non-conforming, where `actual` names the offending ending rather \
+                 than the dominant one. Call with `fix: \"eol\"` (line \
                  endings only) or `fix: \"all\"` (peel + line endings) to normalise them \
-                 atomically with a `.bak` backup, including UTF-16 files. \n\n\
+                 atomically with a `.bak` backup, including UTF-16 files. Each file \
+                 reports `mojibake_repaired`, `eol_repaired`, and their union \
+                 `any_repaired`, so a successful line-ending fix is never misread as a \
+                 no-op from the legacy mojibake-only `repaired` field. \n\n\
                  When a teammate or another tool (e.g. PowerShell `Get-Content` / \
                  `Set-Content`, a misconfigured generator) appears to have introduced \
                  corruption, `git log -p -- <file>` will identify the introducing commit \
@@ -1703,6 +1835,13 @@ pub fn list() -> Value {
                             "How to handle per-entry walk errors (e.g. an inaccessible \
                              subdirectory). `warn` (default) collects warnings into the \
                              report and continues; `fail` stops on the first error."
+                    },
+                    "quiet": {
+                        "type": "boolean",
+                        "description":
+                            "Suppress per-file detail lines, leaving the `verdict` and \
+                             the summary. Use this when you only need a conformance \
+                             answer rather than a repair report. Default: false."
                     }
                 },
                 "required": [],
@@ -1843,6 +1982,18 @@ fn eol_write_override(
     )
 }
 
+/// Attach a post-write line-ending conformance warning to a mutating tool's
+/// status trailer (see [`tpu::git::write_warning`]).
+fn attach_eol_warning(status: &mut Value, file: &str) {
+    let warning = tpu::git::write_warning(
+        std::path::Path::new(file),
+        "Run tpu_doctor with fix: \"eol\" to normalise.",
+    );
+    if let Some(warning) = warning {
+        status["eol_warning"] = Value::String(warning);
+    }
+}
+
 fn call_read_file(args: &Value) -> ToolResult {
     let header = invocation_header("tpu_read_file", args);
     let inner = || -> Result<(String, Option<String>), Box<dyn std::error::Error>> {
@@ -1907,12 +2058,12 @@ fn call_write_file(args: &Value, config: &ServerConfig) -> ToolResult {
             tpu::cmd::validate::run_all(&pairs, path, false, tpu::IoMode::Buffered)?;
         }
 
-        let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
+        let diff = optional_bool(args, "diff")?;
         let mut diff_buf: Vec<u8> = Vec::new();
         let diff_out: Option<&mut dyn std::io::Write> =
             if diff { Some(&mut diff_buf) } else { None };
 
-        let policy = mojibake_policy_from_args(args);
+        let policy = mojibake_policy_from_args(args)?;
         tpu::cmd::write::run(
             path,
             &content,
@@ -1926,13 +2077,14 @@ fn call_write_file(args: &Value, config: &ServerConfig) -> ToolResult {
         delete_bak_if_exists(&file);
         let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
         let content_version = current_version(&file)?;
-        let status = serde_json::json!({
+        let mut status = serde_json::json!({
             "status": "success",
             "file": file,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
             "content_version": content_version,
         });
+        attach_eol_warning(&mut status, &file);
         let status_line = serde_json::to_string(&status)?;
         if diff && !diff_buf.is_empty() {
             let diff_text = String::from_utf8_lossy(&diff_buf);
@@ -1955,7 +2107,7 @@ fn call_create_file(args: &Value, config: &ServerConfig) -> ToolResult {
         let path = std::path::Path::new(&file);
 
         let le_override = eol_write_override(args, &file, config)?;
-        let policy = mojibake_policy_from_args(args);
+        let policy = mojibake_policy_from_args(args)?;
 
         tpu::cmd::create::run(
             path,
@@ -1967,12 +2119,16 @@ fn call_create_file(args: &Value, config: &ServerConfig) -> ToolResult {
             policy,
         )?;
         let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
-        let status = serde_json::json!({
+        let mut status = serde_json::json!({
             "status": "success",
             "file": file,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
         });
+        // A new file with an explicit `line_ending` can be born already
+        // violating the repository's policy, and this tool owes the same
+        // conformance answer as every other mutating one.
+        attach_eol_warning(&mut status, &file);
         let status_line = serde_json::to_string(&status)?;
         Ok(ToolResult::ok(format!("{header}\n{status_line}")))
     };
@@ -1981,6 +2137,9 @@ fn call_create_file(args: &Value, config: &ServerConfig) -> ToolResult {
 
 fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_replace_in_file", args);
+    if args.get("ops").is_some() {
+        return call_replace_batch(args, config, &header);
+    }
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
         reject_removed_fixed_strings_arg(args)?;
         let file = resolve_file_arg(args)?;
@@ -1988,22 +2147,13 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
         let replacement = decode_replacement_arg(args)?;
         let path = std::path::Path::new(&file);
 
-        let multiline = args
-            .get("multiline")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
+        let multiline = optional_bool(args, "multiline")?;
+        let regex = optional_bool(args, "regex")?;
         let le_override = eol_write_override(args, &file, config)?;
-        let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
-        let count = args.get("count").and_then(|v| v.as_bool()).unwrap_or(false);
-        let dry_run = args
-            .get("dry_run")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let allow_no_match = args
-            .get("allow_no_match")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let diff = optional_bool(args, "diff")?;
+        let count = optional_bool(args, "count")?;
+        let dry_run = optional_bool(args, "dry_run")?;
+        let allow_no_match = optional_bool(args, "allow_no_match")?;
 
         // Real writes take the cross-process write lock, held across the CAS
         // re-check AND the swap so two tpu instances cannot interleave and
@@ -2046,6 +2196,9 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             .get("echo_max_lines")
             .and_then(|v| v.as_u64())
             .unwrap_or(5) as usize;
+        let want_changed_lines = changed_line_details_requested(args, false)?;
+        reject_details_with_count(args, count)?;
+        let changed_lines_max = changed_line_details_max(args);
         let mut regions: Vec<tpu::cmd::replace::ChangedRegion> = Vec::new();
         let regions_req = if count {
             None
@@ -2061,7 +2214,7 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             })
         };
 
-        let n = tpu::cmd::replace::run(
+        let outcome = tpu::cmd::replace::run(
             path,
             &pattern,
             replacement.as_bytes(),
@@ -2074,21 +2227,33 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
                 count_only: count,
                 dry_run,
                 io_mode: tpu::IoMode::Buffered,
-                policy: mojibake_policy_from_args(args),
+                policy: mojibake_policy_from_args(args)?,
+                changed_lines: want_changed_lines,
+                changed_lines_max: Some(changed_lines_max),
             },
         )?;
+        let n = outcome.total();
 
         if count {
             let line = serde_json::to_string(&serde_json::json!({
-                "status": "success", "count": n,
+                "status": "success",
+                "count": n,
+                "line_endings": line_endings_json(&outcome),
             }))?;
             return Ok(ToolResult::ok(format!("{header}\n{line}")));
         }
         if dry_run {
-            let status_line = serde_json::to_string(&serde_json::json!({
-                "status": if diff_buf.is_empty() { "success" } else { "success" },
-                "changed": !diff_buf.is_empty(),
-            }))?;
+            let mut status = serde_json::json!({
+                "status": "success",
+                // From the outcome, not the diff: the diff is computed in
+                // LF-normalised space, where a pure line-ending rewrite is
+                // invisible even though the write would touch every line.
+                "changed": outcome.would_write,
+                "count": n,
+                "line_endings": line_endings_json(&outcome),
+            });
+            attach_changed_lines(&mut status, &outcome);
+            let status_line = serde_json::to_string(&status)?;
             if diff_buf.is_empty() {
                 return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
             }
@@ -2120,13 +2285,11 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
                  count:true / dry_run:true to probe without writing.",
             ));
         }
-        // A real write only happened if something matched, or a
-        // line_ending_override forced a rewrite despite zero matches (see
-        // the zero-match short-circuit doc on `replace::run`). Only clean
-        // up a `.bak` when a write actually occurred -- otherwise this
-        // "no-op" turns a pre-existing `<file>.bak` into a destructive
-        // filesystem change.
-        let wrote = n > 0 || le_override.is_some();
+        // A real write only happened if bytes actually reached the disk: an
+        // identity substitution matches but produces byte-identical output,
+        // which the write path skips. Cleaning up a `.bak` or stamping mtime
+        // on that would turn a no-op into a filesystem change.
+        let wrote = outcome.wrote;
         if wrote {
             delete_bak_if_exists(&file);
         }
@@ -2157,8 +2320,10 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
             "size": stamp.size,
             "count": n,
             "changed_lines": changed_lines,
+            "line_endings": line_endings_json(&outcome),
             "content_version": content_version,
         });
+        attach_changed_lines(&mut status, &outcome);
         // Reaching here with n == 0 means the caller either passed
         // allow_no_match:true or supplied a line_ending_override that rewrote
         // the file anyway; the hard-error case returned above. Keep the
@@ -2172,6 +2337,11 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
                  default; pass regex:true for regex)"
             );
         }
+        // Unconditional: the documented contract is that a plain success
+        // without this field means "committable". A run that matched but wrote
+        // nothing still leaves a non-conforming file non-conforming, and this
+        // check only reads.
+        attach_eol_warning(&mut status, &file);
         if !should_echo {
             status["diff_omitted"] = serde_json::json!(true);
         }
@@ -2198,6 +2368,271 @@ fn call_replace_in_file(args: &Value, config: &ServerConfig) -> ToolResult {
     inner().unwrap_or_else(|e| ToolResult::error(&header, &e.to_string()))
 }
 
+/// Resolve `tpu_replace_in_file`'s `ops` array.
+///
+/// The array's contents are decoded by [`tpu::cmd::replace::ops_from_json`],
+/// which the `tpu replace --ops FILE` CLI path also calls — the two front ends
+/// accept the same objects because they share one decoder, not because two
+/// implementations agree today.
+fn decode_replace_ops(
+    args: &Value,
+) -> Result<Vec<tpu::cmd::replace::OwnedReplaceOp>, Box<dyn std::error::Error>> {
+    // Every one of these is a per-op field in batch mode. Accepting them at
+    // the top level would silently apply none of them -- a caller who set
+    // regex:true alongside ops would get literal matching and a success.
+    for key in [
+        "pattern",
+        "replacement",
+        "pattern_format",
+        "replacement_format",
+        "expand_escapes",
+        "regex",
+        "multiline",
+        "allow_no_match",
+    ] {
+        if args.get(key).is_some() {
+            return Err(format!(
+                "'ops' cannot be combined with a top-level '{key}': it is a per-op field in \
+                 batch mode. Move it into the ops entry it applies to, or drop ops and use \
+                 the single-op form."
+            )
+            .into());
+        }
+    }
+    if args.get("echo_max_lines").is_some() {
+        return Err(
+            "'ops' cannot be combined with 'echo_max_lines': batch mode has no \
+                    changed-region echo to size. Use changed_line_details / \
+                    changed_line_details_max, or diff:true."
+                .into(),
+        );
+    }
+    let ops = args.get("ops").ok_or("argument 'ops' is required")?;
+    tpu::cmd::replace::ops_from_json(ops).map_err(Into::into)
+}
+
+/// Per-op `{label?, count}` tally, positionally aligned with the request.
+fn render_op_counts(owned: &[tpu::cmd::replace::OwnedReplaceOp], counts: &[usize]) -> Value {
+    owned
+        .iter()
+        .zip(counts)
+        .map(|(op, count)| match &op.label {
+            Some(label) => serde_json::json!({ "label": label, "count": count }),
+            None => serde_json::json!({ "count": count }),
+        })
+        .collect()
+}
+
+/// Before/after terminator census for a replace.
+///
+/// Always reported, because a whole-file replace rewrites every terminator to
+/// one convention: an edit about something else entirely will silently
+/// collapse a mixed file, and `normalized: true` is the only place that is
+/// visible before `git commit`.
+fn line_endings_json(outcome: &tpu::cmd::replace::ReplaceOutcome) -> Value {
+    serde_json::json!({
+        "before": outcome.before.to_json(),
+        "after": outcome.after.to_json(),
+        "normalized": outcome.normalized_line_endings(),
+    })
+}
+
+/// Whether the caller asked for `changed_line_details`, falling back to
+/// `default` when the argument is absent.
+///
+/// A present-but-non-boolean value is an error rather than a silent default:
+/// the single-op and batch paths previously disagreed on this, so a caller who
+/// sent `"true"` was told about it in one shape of the call and quietly
+/// ignored in the other.
+fn changed_line_details_requested(
+    args: &Value,
+    default: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    match args.get("changed_line_details") {
+        None | Some(Value::Null) => Ok(default),
+        Some(Value::Bool(b)) => Ok(*b),
+        Some(other) => Err(format!(
+            "argument 'changed_line_details' must be a JSON boolean (true/false), got {other}"
+        )
+        .into()),
+    }
+}
+
+/// Refuse `changed_line_details` in count mode rather than ignoring it.
+///
+/// `count:true` performs no substitution, so there is no before/after to
+/// describe; honouring the request is impossible and dropping it silently
+/// would leave the caller believing they had asked for something.
+fn reject_details_with_count(args: &Value, count: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if count && matches!(args.get("changed_line_details"), Some(Value::Bool(true))) {
+        return Err(
+            "'changed_line_details' cannot be combined with 'count': counting \
+                    performs no substitution, so there are no changed lines to image. Use \
+                    dry_run:true to preview the change instead."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+fn changed_line_details_max(args: &Value) -> usize {
+    args.get("changed_line_details_max")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(50) as usize
+}
+
+/// Attach the per-line before/after images, when the caller asked for them.
+fn attach_changed_lines(status: &mut Value, outcome: &tpu::cmd::replace::ReplaceOutcome) {
+    if outcome.changed_lines.is_empty() && !outcome.changed_lines_truncated {
+        return;
+    }
+    status["changed_line_details"] = outcome
+        .changed_lines
+        .iter()
+        .map(tpu::cmd::replace::ChangedLine::to_json)
+        .collect();
+    if outcome.changed_lines_truncated {
+        status["changed_line_details_truncated"] = serde_json::json!(true);
+    }
+}
+
+/// `tpu_replace_in_file` with an `ops` array: N substitutions, one write.
+///
+/// Kept separate from the single-op path rather than folded into it because
+/// the two differ in what they can honestly report — a batch has no meaningful
+/// changed-region echo (see [`tpu::cmd::replace::run_batch`]) and reports a
+/// per-op tally instead.
+fn call_replace_batch(args: &Value, config: &ServerConfig, header: &str) -> ToolResult {
+    let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
+        reject_removed_fixed_strings_arg(args)?;
+        let file = resolve_file_arg(args)?;
+        let path = std::path::Path::new(&file);
+        let owned = decode_replace_ops(args)?;
+
+        let le_override = eol_write_override(args, &file, config)?;
+        let diff = optional_bool(args, "diff")?;
+        let count = optional_bool(args, "count")?;
+        reject_details_with_count(args, count)?;
+        let dry_run = optional_bool(args, "dry_run")?;
+
+        let _write_lock = if !count && !dry_run {
+            tpu::acquire_write_lock(path)
+        } else {
+            None
+        };
+        if !count
+            && !dry_run
+            && let Some(conflict) = cas_conflict(args, &file, header)?
+        {
+            return Ok(conflict);
+        }
+
+        let ops: Vec<tpu::cmd::replace::ReplaceOp<'_>> = tpu::cmd::replace::as_ops(&owned);
+
+        let mut diff_buf: Vec<u8> = Vec::new();
+        let diff_out: Option<&mut dyn std::io::Write> = if count {
+            None
+        } else if diff || dry_run {
+            Some(&mut diff_buf)
+        } else {
+            None
+        };
+
+        let outcome = tpu::cmd::replace::run_batch(
+            path,
+            &ops,
+            diff_out,
+            tpu::cmd::replace::ReplaceOptions {
+                multiline: false,
+                regex: false,
+                line_ending_override: le_override,
+                count_only: count,
+                dry_run,
+                io_mode: tpu::IoMode::Buffered,
+                policy: mojibake_policy_from_args(args)?,
+                // A batch has no changed-region echo, so the per-line images
+                // are its only content-level check: default them on, unless a
+                // full diff was requested instead. An explicit request always
+                // wins over that default.
+                changed_lines: changed_line_details_requested(args, !diff)?,
+                changed_lines_max: Some(changed_line_details_max(args)),
+            },
+        )?;
+        let total = outcome.total();
+        let op_counts = render_op_counts(&owned, &outcome.counts);
+
+        if count {
+            let line = serde_json::to_string(&serde_json::json!({
+                "status": "success",
+                "count": total,
+                "ops": op_counts,
+                "line_endings": line_endings_json(&outcome),
+            }))?;
+            return Ok(ToolResult::ok(format!("{header}\n{line}")));
+        }
+        if dry_run {
+            let mut status = serde_json::json!({
+                "status": "success",
+                // See the single-op path: an LF-space diff cannot see a pure
+                // line-ending rewrite.
+                "changed": outcome.would_write,
+                "count": total,
+                "ops": op_counts,
+                "line_endings": line_endings_json(&outcome),
+            });
+            attach_changed_lines(&mut status, &outcome);
+            let status_line = serde_json::to_string(&status)?;
+            if diff_buf.is_empty() {
+                return Ok(ToolResult::ok(format!("{header}\n{status_line}")));
+            }
+            let diff_text = String::from_utf8_lossy(&diff_buf);
+            let sep = diff_separator(&diff_text);
+            return Ok(ToolResult::ok(format!(
+                "{header}\n{diff_text}{sep}{status_line}"
+            )));
+        }
+
+        // Every op is guaranteed to have matched (a zero-match op without
+        // allow_no_match already failed the whole batch), but an identity
+        // substitution still produces byte-identical output, which the write
+        // path skips -- so key the stamp off what actually reached the disk.
+        let wrote = outcome.wrote;
+        if wrote {
+            delete_bak_if_exists(&file);
+        }
+        let stamp = if wrote {
+            stamp_and_verify(path, config.verify_delay_ms)?
+        } else {
+            read_stamp(path)?
+        };
+        let content_version = current_version(&file)?;
+        let mut status = serde_json::json!({
+            "status": "success",
+            "file": file,
+            "mtime_epoch_ms": stamp.mtime_epoch_ms,
+            "size": stamp.size,
+            "count": total,
+            "ops": op_counts,
+            "line_endings": line_endings_json(&outcome),
+            "content_version": content_version,
+        });
+        attach_changed_lines(&mut status, &outcome);
+        // See the single-op path: a bare success is documented to mean
+        // committable, so this cannot be gated on whether a write happened.
+        attach_eol_warning(&mut status, &file);
+        let status_line = serde_json::to_string(&status)?;
+        if diff && !diff_buf.is_empty() {
+            let diff_text = String::from_utf8_lossy(&diff_buf);
+            let sep = diff_separator(&diff_text);
+            return Ok(ToolResult::ok(format!(
+                "{header}\n{diff_text}{sep}{status_line}"
+            )));
+        }
+        Ok(ToolResult::ok(format!("{header}\n{status_line}")))
+    };
+    inner().unwrap_or_else(|e| ToolResult::error(header, &e.to_string()))
+}
+
 fn call_edit_file(args: &Value, config: &ServerConfig) -> ToolResult {
     let header = invocation_header("tpu_edit_file", args);
     let inner = || -> Result<ToolResult, Box<dyn std::error::Error>> {
@@ -2212,10 +2647,7 @@ fn call_edit_file(args: &Value, config: &ServerConfig) -> ToolResult {
             return Ok(conflict);
         }
 
-        let binary = args
-            .get("binary")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let binary = optional_bool(args, "binary")?;
 
         let le_override = eol_write_override(args, &file, config)?;
 
@@ -2345,7 +2777,7 @@ fn call_edit_file(args: &Value, config: &ServerConfig) -> ToolResult {
             }
         }
 
-        let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
+        let diff = optional_bool(args, "diff")?;
         let mut diff_buf: Vec<u8> = Vec::new();
         let diff_out: Option<&mut dyn std::io::Write> = if diff && !binary {
             Some(&mut diff_buf)
@@ -2360,18 +2792,21 @@ fn call_edit_file(args: &Value, config: &ServerConfig) -> ToolResult {
             le_override,
             diff_out,
             tpu::IoMode::Buffered,
-            mojibake_policy_from_args(args),
+            mojibake_policy_from_args(args)?,
         )?;
         delete_bak_if_exists(&file);
         let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
         let content_version = current_version(&file)?;
-        let status = serde_json::json!({
+        let mut status = serde_json::json!({
             "status": "success",
             "file": file,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
             "content_version": content_version,
         });
+        if !binary {
+            attach_eol_warning(&mut status, &file);
+        }
         let status_line = serde_json::to_string(&status)?;
         if diff && !diff_buf.is_empty() {
             let diff_text = String::from_utf8_lossy(&diff_buf);
@@ -2573,10 +3008,10 @@ fn call_count_file(args: &Value) -> ToolResult {
         let file = resolve_file_arg(args)?;
         let path = std::path::Path::new(&file);
 
-        let lines = args.get("lines").and_then(|v| v.as_bool()).unwrap_or(false);
-        let words = args.get("words").and_then(|v| v.as_bool()).unwrap_or(false);
-        let chars = args.get("chars").and_then(|v| v.as_bool()).unwrap_or(false);
-        let bytes = args.get("bytes").and_then(|v| v.as_bool()).unwrap_or(false);
+        let lines = optional_bool(args, "lines")?;
+        let words = optional_bool(args, "words")?;
+        let chars = optional_bool(args, "chars")?;
+        let bytes = optional_bool(args, "bytes")?;
         // Stats (encoding/bom/line_ending) are always emitted by the MCP tool
         // regardless of the caller-supplied flag, matching the advertised contract.
         let stats = true;
@@ -2637,6 +3072,9 @@ fn call_count_file(args: &Value) -> ToolResult {
             s.insert("encoding");
             s.insert("bom");
             s.insert("line_ending");
+            s.insert("lf_count");
+            s.insert("crlf_count");
+            s.insert("cr_count");
             s
         };
 
@@ -2720,17 +3158,25 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
         let file = resolve_file_arg(args)?;
         let content = decode_content_arg(args, "content")?;
         let path = std::path::Path::new(&file);
+        // `diff` is a preview: append::run emits the diff and returns without
+        // touching the file. Read it before the lock so a preview neither
+        // takes the cross-process lock nor runs the CAS check, matching how
+        // replace treats count/dry_run.
+        let diff = optional_bool(args, "diff")?;
 
         // Hold the cross-process write lock across the CAS re-check AND the
         // swap so two tpu instances cannot interleave and clobber each other.
-        let _write_lock = tpu::acquire_write_lock(path);
+        let _write_lock = if diff {
+            None
+        } else {
+            tpu::acquire_write_lock(path)
+        };
 
-        if let Some(conflict) = cas_conflict(args, &file, &header)? {
+        if !diff && let Some(conflict) = cas_conflict(args, &file, &header)? {
             return Ok(conflict);
         }
 
         let le_override = eol_write_override(args, &file, config)?;
-        let diff = args.get("diff").and_then(|v| v.as_bool()).unwrap_or(false);
 
         // Run validate guards before any modification.
         if let Some(validates) = args.get("validate").and_then(|v| v.as_array()) {
@@ -2746,11 +3192,12 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
                 le_override,
                 Some(&mut diff_buf),
                 tpu::IoMode::Buffered,
-                mojibake_policy_from_args(args),
+                mojibake_policy_from_args(args)?,
             )?;
-            // The append committed a write, so report the new content_version
-            // regardless of whether a diff was emitted — same as the non-diff
-            // path, so CAS chaining doesn't need a follow-up read.
+            // Nothing was written, so this is the file's unchanged version and
+            // there is no post-write conformance answer to give: an
+            // `eol_warning` here would describe the current file while reading
+            // as though the preview had done something.
             let content_version = current_version(&file)?;
             let changed = !diff_buf.is_empty();
             let status = serde_json::json!({
@@ -2776,18 +3223,19 @@ fn call_append_file(args: &Value, config: &ServerConfig) -> ToolResult {
             le_override,
             None,
             tpu::IoMode::Buffered,
-            mojibake_policy_from_args(args),
+            mojibake_policy_from_args(args)?,
         )?;
         delete_bak_if_exists(&file);
         let stamp = stamp_and_verify(path, config.verify_delay_ms)?;
         let content_version = current_version(&file)?;
-        let status = serde_json::json!({
+        let mut status = serde_json::json!({
             "status": "success",
             "file": file,
             "mtime_epoch_ms": stamp.mtime_epoch_ms,
             "size": stamp.size,
             "content_version": content_version,
         });
+        attach_eol_warning(&mut status, &file);
         let status_line = serde_json::to_string(&status)?;
         Ok(ToolResult::ok(format!("{header}\n{status_line}")))
     };
@@ -2843,7 +3291,7 @@ fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
             );
         }
 
-        let regex = args.get("regex").and_then(|v| v.as_bool()).unwrap_or(false);
+        let regex = optional_bool(args, "regex")?;
         let multiline = args
             .get("multiline")
             .and_then(|v| v.as_bool())
@@ -2864,7 +3312,7 @@ fn call_find(args: &Value, config: &ServerConfig) -> ToolResult {
             .get("numbers")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        let count = args.get("count").and_then(|v| v.as_bool()).unwrap_or(false);
+        let count = optional_bool(args, "count")?;
         let after = args.get("after").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let before = args.get("before").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
@@ -3124,7 +3572,7 @@ fn call_render_file(args: &Value, config: &ServerConfig) -> ToolResult {
                 }
             },
         };
-        let policy = mojibake_policy_from_args(args);
+        let policy = mojibake_policy_from_args(args)?;
         let report = tpu::cmd::render::run(
             std::path::Path::new(&output),
             template_inline,
@@ -3239,6 +3687,7 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
             },
         };
         let git_root = git_root_arg(args);
+        let quiet = optional_bool(args, "quiet")?;
 
         let on_error = match args.get("on_error") {
             None => config.default_on_error,
@@ -3320,19 +3769,35 @@ fn call_doctor(args: &Value, config: &ServerConfig) -> ToolResult {
                     "peel_suggested": issue.peel_suggested.is_some(),
                     "peel_declined_reason": issue.peel_declined_reason,
                     "repaired": issue.repaired,
+                    "mojibake_repaired": issue.repaired,
                     "eol_mismatch": issue.eol_mismatch.map(|m| serde_json::json!({
                         "expected": tpu::git::line_ending_name(m.expected),
                         "actual": tpu::git::line_ending_name(m.actual),
                     })),
                     "eol_repaired": issue.eol_repaired,
+                    "any_repaired": issue.repaired || issue.eol_repaired,
                     "mojibake_marker_suppressed": issue.mojibake_marker_suppressed,
                     "replacement_char_marker_suppressed": issue.replacement_char_marker_suppressed,
                 })
             })
             .collect();
 
+        // `quiet` trades the per-file detail for a terse conformance answer:
+        // the paths are still named (otherwise "issues" is unactionable) but
+        // the match lists, offsets, and repair flags are dropped.
+        let files: Value = if quiet {
+            report
+                .issues
+                .iter()
+                .map(|issue| Value::String(issue.path.display().to_string()))
+                .collect()
+        } else {
+            Value::Array(files)
+        };
+
         let doc = serde_json::json!({
             "reason": "x-tpu-mcp-result",
+            "verdict": report.verdict(),
             "files": files,
             "total_files_scanned": report.total_files_scanned,
             "total_issues": report.total_issues(),
@@ -3655,13 +4120,7 @@ fn delete_bak_if_exists(file: &str) {
 /// input.  Without this, stray CRLF in JSON strings would produce `\r\r\n`
 /// on CRLF-target files or inject CRLF into LF-target files.
 fn normalize_to_lf(s: &str) -> std::borrow::Cow<'_, str> {
-    if !s.contains('\r') {
-        // Fast path -- no CR bytes at all; nothing to do.
-        std::borrow::Cow::Borrowed(s)
-    } else {
-        // Replace CRLF first (greedy), then any remaining bare CR.
-        std::borrow::Cow::Owned(s.replace("\r\n", "\n").replace('\r', "\n"))
-    }
+    tpu::encoding::normalize_to_lf(s)
 }
 
 /// Expand C-style backslash escape sequences in a regex replacement template.
@@ -3688,30 +4147,7 @@ fn normalize_to_lf(s: &str) -> std::borrow::Cow<'_, str> {
 /// or `\r\n` sequences introduced by `\r`/`\n` unescape are folded to LF
 /// before the normalised tpu view sees them.
 fn unescape_replacement(s: &str) -> String {
-    if !s.contains('\\') {
-        // Fast path — no backslashes at all; nothing to do.
-        return s.to_owned();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('n') => out.push('\n'),
-                Some('r') => out.push('\r'),
-                Some('t') => out.push('\t'),
-                Some('\\') => out.push('\\'),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'), // trailing backslash: preserve
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
+    tpu::cmd::replace::unescape_replacement(s)
 }
 
 /// Normalize all line endings in a byte slice to LF (`\n`).
@@ -3719,23 +4155,7 @@ fn unescape_replacement(s: &str) -> String {
 /// Same semantics as [`normalize_to_lf`] but operates on raw bytes.  Used
 /// for edit-op data that is already extracted as `Vec<u8>`.
 fn normalize_bytes_to_lf(bytes: Vec<u8>) -> Vec<u8> {
-    if !bytes.contains(&b'\r') {
-        return bytes;
-    }
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut iter = bytes.iter().copied().peekable();
-    while let Some(b) = iter.next() {
-        if b == b'\r' {
-            out.push(b'\n');
-            // Skip the \n in a \r\n pair.
-            if iter.peek() == Some(&b'\n') {
-                iter.next();
-            }
-        } else {
-            out.push(b);
-        }
-    }
-    out
+    tpu::encoding::normalize_bytes_to_lf(&bytes)
 }
 
 /// Flatten an array of `{"selector": "...", "value": "..."}` objects into a
@@ -3760,15 +4180,7 @@ fn flatten_validate_pairs(validates: &[Value]) -> Result<Vec<String>, Box<dyn st
 
 /// Parse a data-format name into a [`tpu::data_format::DataFormat`] value.
 fn parse_data_format(s: &str) -> Result<tpu::data_format::DataFormat, Box<dyn std::error::Error>> {
-    match s {
-        "hex" => Ok(tpu::data_format::DataFormat::Hex),
-        "base64" => Ok(tpu::data_format::DataFormat::Base64),
-        "encoded" => Ok(tpu::data_format::DataFormat::Encoded),
-        other => Err(format!(
-            "unrecognised data_format value {other:?}; expected hex, base64, or encoded"
-        )
-        .into()),
-    }
+    tpu::data_format::DataFormat::from_name(s).map_err(Into::into)
 }
 
 /// Resolve a text payload argument, honouring an optional `{key}_format`
@@ -4028,16 +4440,14 @@ fn render_changed_regions(regions: &[tpu::cmd::replace::ChangedRegion]) -> Strin
     out
 }
 
-fn mojibake_policy_from_args(args: &Value) -> tpu::mojibake::WritePolicy {
-    let allow = args
-        .get("allow_mojibake")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    if allow {
+fn mojibake_policy_from_args(
+    args: &Value,
+) -> Result<tpu::mojibake::WritePolicy, Box<dyn std::error::Error>> {
+    Ok(if optional_bool(args, "allow_mojibake")? {
         tpu::mojibake::WritePolicy::permissive()
     } else {
         tpu::mojibake::WritePolicy::default()
-    }
+    })
 }
 
 /// Extract the `file` argument and normalise it to an OS path string.
@@ -4129,8 +4539,19 @@ fn cas_conflict(
     file: &str,
     header: &str,
 ) -> Result<Option<ToolResult>, Box<dyn std::error::Error>> {
-    let Some(expected) = args.get("if_match").and_then(|v| v.as_str()) else {
-        return Ok(None);
+    // A present-but-non-string value is an error, never "no precondition":
+    // this is the one argument whose whole purpose is preventing a silent
+    // clobber, so silently disarming it is the worst possible reading.
+    let expected = match args.get("if_match") {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.as_str(),
+        Some(other) => {
+            return Err(format!(
+                "argument 'if_match' must be the content_version string from the read your \
+                 change is based on, got {other}"
+            )
+            .into());
+        }
     };
     let actual = current_version(file)?;
     if actual.as_deref() == Some(expected) {
@@ -4422,15 +4843,23 @@ mod tests {
 
     #[test]
     fn mojibake_policy_from_args_respects_allow_mojibake_flag() {
-        let allowed = mojibake_policy_from_args(&serde_json::json!({"allow_mojibake": true}));
+        let allowed =
+            mojibake_policy_from_args(&serde_json::json!({"allow_mojibake": true})).unwrap();
         assert!(!allowed.reject_introduced_mojibake);
 
-        let default_off = mojibake_policy_from_args(&serde_json::json!({}));
+        let default_off = mojibake_policy_from_args(&serde_json::json!({})).unwrap();
         assert!(default_off.reject_introduced_mojibake);
 
         let explicit_false =
-            mojibake_policy_from_args(&serde_json::json!({"allow_mojibake": false}));
+            mojibake_policy_from_args(&serde_json::json!({"allow_mojibake": false})).unwrap();
         assert!(explicit_false.reject_introduced_mojibake);
+    }
+
+    /// A mistyped guard flag must be refused, not read as "leave the guard
+    /// on": the caller is owed the news that their flag did nothing.
+    #[test]
+    fn mojibake_policy_from_args_rejects_a_stringly_typed_flag() {
+        assert!(mojibake_policy_from_args(&serde_json::json!({"allow_mojibake": "true"})).is_err());
     }
 
     // ── ServerConfig::to_wire / from_wire ────────────────────────────────────
@@ -6063,6 +6492,437 @@ mod integration_tests {
         assert_eq!(std::str::from_utf8(&bytes).unwrap(), "a\nb\nc\nd\n");
 
         drop(dir);
+    }
+
+    /// A targeted line-mode edit re-ends only the lines it touches, so a
+    /// `line_ending` override can leave the file mixed. The write succeeds,
+    /// but the status trailer must say so rather than reporting a bare
+    /// success that is indistinguishable from a correct one.
+    #[test]
+    fn edit_that_produces_mixed_line_endings_reports_eol_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("targeted.txt");
+        fs::write(&f, b"1\n2\n3\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "line_ending": "crlf",
+            "ops": [{ "op": "splice", "range": "2", "data": "T" }],
+        });
+        let out = call("tpu_edit_file", &args).expect("tpu_edit_file must succeed");
+
+        assert_eq!(fs::read(&f).unwrap(), b"1\nT\r\n3\n");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap())
+            .expect("status trailer must be JSON");
+        assert_eq!(status["status"], "success");
+        let warning = status["eol_warning"]
+            .as_str()
+            .expect("mixed result must carry eol_warning");
+        assert!(warning.contains("crlf_count=1"), "{warning}");
+        assert!(warning.contains("lf_count=2"), "{warning}");
+    }
+
+    /// The same edit that leaves a single convention must NOT warn — a plain
+    /// success has to keep meaning "committable".
+    #[test]
+    fn edit_that_preserves_one_convention_has_no_eol_warning() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("uniform.txt");
+        fs::write(&f, b"1\n2\n3\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [{ "op": "splice", "range": "2", "data": "T" }],
+        });
+        let out = call("tpu_edit_file", &args).expect("tpu_edit_file must succeed");
+
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap())
+            .expect("status trailer must be JSON");
+        assert!(
+            status["eol_warning"].is_null(),
+            "uniform result must not warn: {status}"
+        );
+    }
+
+    /// A client validating its expectations needs the census on every reply,
+    /// and needs to be told when the write homogenised a mixed file.
+    #[test]
+    fn replace_reports_the_line_ending_census_and_flags_normalisation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("mixed.txt");
+        fs::write(&f, b"alpha\nbeta\r\ngamma\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "replacement": "ALPHA",
+        });
+        let out = call("tpu_replace_in_file", &args).expect("replace must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        let le = &status["line_endings"];
+        assert_eq!(le["before"]["uniformity"], "mixed");
+        assert_eq!(le["before"]["lf"], 2);
+        assert_eq!(le["before"]["crlf"], 1);
+        assert_eq!(le["before"]["cr"], 0);
+        assert_eq!(le["after"]["uniformity"], "uniform");
+        assert_eq!(le["after"]["dominant"], "LF");
+        assert_eq!(le["after"]["lf"], 3);
+        assert_eq!(
+            le["normalized"], true,
+            "collapsing a mixed file is the caller's to know about: {status}"
+        );
+    }
+
+    #[test]
+    fn replace_count_mode_still_reports_the_census() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("mixed.txt");
+        fs::write(&f, b"alpha\nbeta\r\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "replacement": "ALPHA",
+            "count": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("count must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(status["count"], 1);
+        assert_eq!(status["line_endings"]["before"]["uniformity"], "mixed");
+        assert_eq!(fs::read(&f).unwrap(), b"alpha\nbeta\r\n");
+    }
+
+    #[test]
+    fn replace_changed_lines_gives_before_and_after_images_with_positions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("lines.txt");
+        fs::write(&f, "one\ntwo\nthree\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "two",
+            "replacement": "TWO",
+            "changed_line_details": true,
+        });
+        let out = call("tpu_replace_in_file", &args).expect("replace must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(
+            status["changed_line_details"],
+            serde_json::json!([
+                { "old_line": 2, "new_line": 2, "old_text": "two", "new_text": "TWO" }
+            ])
+        );
+    }
+
+    /// Batch mode has no changed-region echo, so the per-line images are on
+    /// by default there — that is its only content-level check.
+    #[test]
+    fn replace_batch_includes_changed_line_details_by_default() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("batch.txt");
+        fs::write(&f, "one\ntwo\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [{ "label": "rename", "pattern": "two", "replacement": "TWO" }],
+        });
+        let out = call("tpu_replace_in_file", &args).expect("batch must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        let details = status["changed_line_details"]
+            .as_array()
+            .expect("batch must carry per-line details by default");
+        assert_eq!(details.len(), 1);
+        assert_eq!(details[0]["old_text"], "two");
+        assert_eq!(details[0]["new_text"], "TWO");
+        assert_eq!(status["line_endings"]["after"]["uniformity"], "uniform");
+    }
+
+    /// `tpu_append_file`'s `diff` is a genuine preview: `append::run` emits
+    /// the diff and returns before `atomic_write`. Two reviewers independently
+    /// asserted the opposite, so pin it — and pin that a preview carries no
+    /// post-write `eol_warning`, which would describe the untouched file while
+    /// reading as though the preview had done something.
+    #[test]
+    fn append_diff_is_a_preview_that_writes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "one\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "two\n",
+            "diff": true,
+        });
+        let out = call("tpu_append_file", &args).expect("preview must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(status["changed"], true, "the diff is non-empty");
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "one\n",
+            "a preview must not append"
+        );
+        assert_eq!(
+            fs::metadata(&f).unwrap().modified().unwrap(),
+            before,
+            "a preview must not stamp the file"
+        );
+        assert!(
+            status["eol_warning"].is_null(),
+            "a preview has no post-write conformance answer to give: {status}"
+        );
+        assert!(
+            !dir.path().join("a.txt.bak").exists(),
+            "a preview writes nothing, so there is no backup to leave behind"
+        );
+    }
+
+    /// A mistyped `dry_run` must never be read as "do it for real": that
+    /// turns a preview into a write, which is the corruption path this server
+    /// exists to close.
+    #[test]
+    fn replace_rejects_a_stringly_typed_dry_run_instead_of_writing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "replacement": "beta",
+            "dry_run": "true",
+        });
+        assert!(call("tpu_replace_in_file", &args).is_err());
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "alpha\n",
+            "a refused call must not write"
+        );
+    }
+
+    /// `binary` reinterprets every offset from a line number to a byte
+    /// offset, so defaulting a mistyped value silently edits the wrong span.
+    #[test]
+    fn edit_rejects_a_stringly_typed_binary_flag() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "one\ntwo\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "binary": "true",
+            "ops": [{ "op": "delete", "range": "1" }],
+        });
+        assert!(call("tpu_edit_file", &args).is_err());
+        assert_eq!(fs::read_to_string(&f).unwrap(), "one\ntwo\n");
+    }
+
+    /// `tpu_create_file` writes, so it owes the same conformance answer as
+    /// every other mutating tool; the field must at least be reachable.
+    #[test]
+    fn create_file_participates_in_the_eol_warning_contract() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("new.txt");
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "content": "a\nb\n",
+            "line_ending": "crlf",
+        });
+        let out = call("tpu_create_file", &args).expect("create must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+        assert_eq!(status["status"], "success");
+        assert_eq!(fs::read(&f).unwrap(), b"a\r\nb\r\n");
+        assert!(
+            status["eol_warning"].is_null(),
+            "uniform CRLF under no policy is conforming: {status}"
+        );
+    }
+
+    /// A bulk rename — the job that otherwise gets written as a PowerShell
+    /// loop — must land as one call, one write, and a per-op tally.
+    #[test]
+    fn replace_ops_batch_reports_a_per_op_tally_in_one_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("batch.rs");
+        fs::write(&f, "start_barrier(2);\ngate.wait();\ngate.wait();\n").unwrap();
+        let before = fs::metadata(&f).unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [
+                { "label": "start_barrier-calls", "pattern": "start_barrier(", "replacement": "start_gate(" },
+                { "label": "gate-waits", "pattern": "gate.wait();", "replacement": "let _ = gate.arrive_and_wait();" },
+            ],
+        });
+        let out = call("tpu_replace_in_file", &args).expect("batch must succeed");
+
+        assert_eq!(
+            fs::read_to_string(&f).unwrap(),
+            "start_gate(2);\nlet _ = gate.arrive_and_wait();\nlet _ = gate.arrive_and_wait();\n"
+        );
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap())
+            .expect("status trailer must be JSON");
+        assert_eq!(status["count"], 3);
+        assert_eq!(
+            status["ops"],
+            serde_json::json!([
+                { "label": "start_barrier-calls", "count": 1 },
+                { "label": "gate-waits", "count": 2 },
+            ])
+        );
+        assert!(
+            fs::metadata(&f).unwrap().len() != before.len(),
+            "the batch must actually have written"
+        );
+    }
+
+    /// One mis-anchored pattern refuses the whole batch. This is the failure
+    /// the shell version hides: `String::replace` is silent on zero matches.
+    #[test]
+    fn replace_ops_batch_refuses_everything_when_one_op_matches_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("batch.rs");
+        fs::write(&f, "alpha\nbeta\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "ops": [
+                { "label": "a", "pattern": "alpha", "replacement": "ALPHA" },
+                { "label": "typo", "pattern": "nowhere", "replacement": "X" },
+            ],
+        });
+        let out = call("tpu_replace_in_file", &args);
+
+        assert!(out.is_err(), "a zero-match op must fail the batch: {out:?}");
+        assert_eq!(fs::read_to_string(&f).unwrap(), "alpha\nbeta\n");
+    }
+
+    #[test]
+    fn replace_ops_batch_rejects_a_top_level_pattern() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("batch.rs");
+        fs::write(&f, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "replacement": "beta",
+            "ops": [{ "pattern": "alpha", "replacement": "beta" }],
+        });
+        assert!(call("tpu_replace_in_file", &args).is_err());
+    }
+
+    /// Every single-op knob is a per-op field under `ops`. Accepting one at
+    /// the top level would apply none of it and still report success.
+    #[test]
+    fn replace_ops_batch_rejects_silently_inapplicable_top_level_args() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("batch.rs");
+
+        for key in [
+            "regex",
+            "multiline",
+            "allow_no_match",
+            "expand_escapes",
+            "pattern_format",
+            "replacement_format",
+            "echo_max_lines",
+        ] {
+            fs::write(&f, "alpha\n").unwrap();
+            let mut args = serde_json::json!({
+                "file": f.to_str().unwrap(),
+                "ops": [{ "pattern": "alpha", "replacement": "beta" }],
+            });
+            args[key] = if key == "echo_max_lines" {
+                serde_json::json!(5)
+            } else if key.ends_with("_format") {
+                serde_json::json!("base64")
+            } else {
+                serde_json::json!(true)
+            };
+            assert!(
+                call("tpu_replace_in_file", &args).is_err(),
+                "top-level {key:?} must be refused under ops"
+            );
+            assert_eq!(
+                fs::read_to_string(&f).unwrap(),
+                "alpha\n",
+                "a refused call must not write"
+            );
+        }
+    }
+
+    /// Counting performs no substitution, so there is nothing to image.
+    /// Silently dropping the request would leave the caller believing they
+    /// had asked for something.
+    #[test]
+    fn replace_rejects_changed_line_details_with_count() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "alpha\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "replacement": "beta",
+            "count": true,
+            "changed_line_details": true,
+        });
+        assert!(call("tpu_replace_in_file", &args).is_err());
+    }
+
+    /// An identity substitution matches but writes nothing; stamping mtime or
+    /// clearing a `.bak` on that turns a no-op into a filesystem change.
+    #[test]
+    fn replace_identity_substitution_does_not_stamp_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, "alpha\n").unwrap();
+        let before = fs::metadata(&f).unwrap().modified().unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "pattern": "alpha",
+            "replacement": "alpha",
+        });
+        let out = call("tpu_replace_in_file", &args).expect("must succeed");
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+
+        assert_eq!(status["count"], 1, "it matched");
+        assert_eq!(
+            fs::metadata(&f).unwrap().modified().unwrap(),
+            before,
+            "a byte-identical result must not bump mtime: {status}"
+        );
+    }
+
+    #[test]
+    fn replace_ops_batch_count_only_is_a_dry_tally() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let f = dir.path().join("batch.rs");
+        fs::write(&f, "alpha alpha beta\n").unwrap();
+
+        let args = serde_json::json!({
+            "file": f.to_str().unwrap(),
+            "count": true,
+            "ops": [
+                { "label": "a", "pattern": "alpha", "replacement": "x" },
+                { "label": "b", "pattern": "beta", "replacement": "y" },
+            ],
+        });
+        let out = call("tpu_replace_in_file", &args).expect("count must succeed");
+
+        let status: Value = serde_json::from_str(out.lines().next_back().unwrap()).unwrap();
+        assert_eq!(status["count"], 3);
+        assert_eq!(status["ops"][0]["count"], 2);
+        assert_eq!(status["ops"][1]["count"], 1);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "alpha alpha beta\n");
     }
 
     /// NL-IT-9: `tpu_replace_in_file` with `--` prefixed replacement text

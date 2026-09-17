@@ -8875,13 +8875,14 @@ fn cn_count_json_default_emits_ndjson_metrics() {
         "finished message must have success:true: {last:?}"
     );
 
-    // In JSON mode stats (encoding, bom, line_ending) are always prepended:
-    // 3 stats + 4 standard metrics = 7 data messages.
+    // In JSON mode stats are always prepended: encoding, bom, line_ending and
+    // the three per-convention terminator counts = 6 stats + 4 standard
+    // metrics = 10 data messages.
     let data: Vec<&serde_json::Value> = messages.iter().filter(|m| reason(m) == "data").collect();
     assert_eq!(
         data.len(),
-        7,
-        "JSON mode must emit 3 stats + 4 metric data messages; got: {data:?}"
+        10,
+        "JSON mode must emit 6 stats + 4 metric data messages; got: {data:?}"
     );
 
     // Full emission order: encoding, bom, line_ending, lines, words, chars, bytes
@@ -8895,6 +8896,9 @@ fn cn_count_json_default_emits_ndjson_metrics() {
             "encoding",
             "bom",
             "line_ending",
+            "lf_count",
+            "crlf_count",
+            "cr_count",
             "lines",
             "words",
             "chars",
@@ -8915,9 +8919,16 @@ fn cn_count_json_default_emits_ndjson_metrics() {
         "LF",
         "line_ending must be LF"
     );
+    assert_eq!(data[3]["count"].as_u64().unwrap(), 2, "lf_count must be 2");
+    assert_eq!(
+        data[4]["count"].as_u64().unwrap(),
+        0,
+        "crlf_count must be 0"
+    );
+    assert_eq!(data[5]["count"].as_u64().unwrap(), 0, "cr_count must be 0");
 
-    // Verify individual metric values (skip the first 3 stats messages)
-    let by_name: std::collections::HashMap<&str, u64> = data[3..]
+    // Verify individual metric values (skip the leading stats messages)
+    let by_name: std::collections::HashMap<&str, u64> = data[6..]
         .iter()
         .map(|m| (m["metric"].as_str().unwrap(), m["count"].as_u64().unwrap()))
         .collect();
@@ -8945,6 +8956,270 @@ fn cn_count_json_default_emits_ndjson_metrics() {
             "subcommand must be 'count': {msg:?}"
         );
     }
+}
+
+/// A file with more than one line-ending convention must be reported as
+/// `MIXED`, never as its dominant convention: "LF" for a file that also
+/// contains CRLF is a clean bill of health for a file git rejects at commit.
+#[test]
+fn cn_count_reports_mixed_line_endings_with_exact_counts() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("mixed.txt");
+    fs::write(&path, b"1\nT\r\n3\n").unwrap();
+
+    let o = ok(tpu().arg("--message-format=json").arg("count").arg(&path));
+    let data: Vec<serde_json::Value> = parse_ndjson(&o.stdout)
+        .into_iter()
+        .filter(|m| reason(m) == "data")
+        .collect();
+    let by_name: std::collections::HashMap<&str, &serde_json::Value> = data
+        .iter()
+        .map(|m| (m["metric"].as_str().unwrap(), m))
+        .collect();
+
+    assert_eq!(by_name["line_ending"]["value"].as_str().unwrap(), "MIXED");
+    assert_eq!(by_name["lf_count"]["count"].as_u64().unwrap(), 2);
+    assert_eq!(by_name["crlf_count"]["count"].as_u64().unwrap(), 1);
+    assert_eq!(by_name["cr_count"]["count"].as_u64().unwrap(), 0);
+}
+
+/// `--changed-lines` is the CLI's half of the MCP `changed_line_details`
+/// contract; without it the CLI had no way to see a before/after image.
+#[test]
+fn rp_replace_changed_lines_reports_both_images_with_positions() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("lines.txt");
+    fs::write(&target, "one\ntwo\nthree\n").unwrap();
+
+    let o = ok(tpu()
+        .arg("--message-format=json")
+        .arg("replace")
+        .arg(&target)
+        .arg("two")
+        .arg("TWO")
+        .arg("--changed-lines"));
+
+    let changed: Vec<serde_json::Value> = parse_ndjson(&o.stdout)
+        .into_iter()
+        .filter(|m| m["metric"] == "changed_line")
+        .collect();
+    assert_eq!(changed.len(), 1, "one line changed: {changed:?}");
+    assert_eq!(changed[0]["old_line"], 2);
+    assert_eq!(changed[0]["new_line"], 2);
+    assert_eq!(changed[0]["old_text"], "two");
+    assert_eq!(changed[0]["new_text"], "TWO");
+}
+
+/// The census must be machine-readable in JSON mode and must flag that a
+/// replace collapsed a mixed file onto one convention.
+#[test]
+fn rp_replace_json_reports_the_line_ending_census() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("mixed.txt");
+    fs::write(&target, b"a\nb\r\nc\n").unwrap();
+
+    let o = ok(tpu()
+        .arg("--message-format=json")
+        .arg("replace")
+        .arg(&target)
+        .arg("a")
+        .arg("A"));
+
+    let census = parse_ndjson(&o.stdout)
+        .into_iter()
+        .find(|m| m["metric"] == "line_endings")
+        .expect("census must be emitted in JSON mode");
+    assert_eq!(census["before"]["uniformity"], "mixed");
+    assert_eq!(census["before"]["lf"], 2);
+    assert_eq!(census["before"]["crlf"], 1);
+    assert_eq!(census["after"]["uniformity"], "uniform");
+    assert_eq!(census["normalized"], true);
+}
+
+/// Diagnostics reach a Windows console under whatever code page is active, so
+/// every byte tpu writes to stderr must be ASCII.
+#[test]
+fn rp_replace_normalisation_warning_is_ascii_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("mixed.txt");
+    fs::write(&target, b"a\nb\r\nc\n").unwrap();
+
+    let o = ok(tpu().arg("replace").arg(&target).arg("a").arg("A"));
+
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(
+        stderr.contains("line endings were mixed"),
+        "expected the normalisation warning: {stderr}"
+    );
+    assert!(
+        o.stderr.iter().all(|b| b.is_ascii()),
+        "stderr must be ASCII-only: {stderr}"
+    );
+}
+
+/// `--ops` takes the MCP tool's `ops` array verbatim and prints the same
+/// `label: count` tally a hand-rolled shell loop would have.
+#[test]
+fn rp_replace_ops_file_applies_a_batch_and_prints_the_tally() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch.rs");
+    fs::write(&target, "start_barrier(2);\ngate.wait();\ngate.wait();\n").unwrap();
+    let ops = dir.path().join("ops.json");
+    fs::write(
+        &ops,
+        r#"[
+          { "label": "start_barrier-calls", "pattern": "start_barrier(", "replacement": "start_gate(" },
+          { "label": "gate-waits", "pattern": "gate.wait();", "replacement": "let _ = gate.arrive_and_wait();" }
+        ]"#,
+    )
+    .unwrap();
+
+    let o = ok(tpu().arg("replace").arg(&target).arg("--ops").arg(&ops));
+
+    assert_eq!(
+        fs::read_to_string(&target).unwrap(),
+        "start_gate(2);\nlet _ = gate.arrive_and_wait();\nlet _ = gate.arrive_and_wait();\n"
+    );
+    let stdout = String::from_utf8_lossy(&o.stdout);
+    assert!(stdout.contains("substitutions by op:"), "{stdout}");
+    assert!(stdout.contains("start_barrier-calls  1"), "{stdout}");
+    assert!(stdout.contains("gate-waits           2"), "{stdout}");
+}
+
+/// One mis-anchored op refuses the whole batch; the file must not be left
+/// half-transformed.
+/// `--message-format=json` must yield the report as one structured NDJSON
+/// record. It used to wrap the *human* rendering in a `content` string, so a
+/// caller following the global convention got JSON-looking output it could
+/// not actually query.
+#[test]
+fn dr_doctor_message_format_json_emits_a_structured_record() {
+    let dir = tempfile::tempdir().unwrap();
+    // Valid UTF-8 that decodes to the canonical latin1 mojibake digraph.
+    fs::write(dir.path().join("bad.txt"), "caf\u{c3}\u{a9}\n").unwrap();
+
+    let o = tpu()
+        .arg("--message-format=json")
+        .arg("doctor")
+        .arg(dir.path())
+        .output()
+        .expect("spawn tpu");
+
+    let record = parse_ndjson(&o.stdout)
+        .into_iter()
+        .find(|m| m["subcommand"] == "doctor")
+        .expect("a doctor record must be emitted");
+    assert!(
+        record["content"].is_null(),
+        "the report must not be wrapped in an opaque text blob: {record}"
+    );
+    assert_eq!(record["verdict"], "issues");
+    assert!(record["files"].is_array(), "{record}");
+    assert_eq!(record["total_files_scanned"], 1);
+    assert!(
+        record["rendered"]
+            .as_str()
+            .unwrap()
+            .contains("doctor: scanned"),
+        "the human rendering rides along in `rendered`: {record}"
+    );
+}
+
+/// A bare number under a labelled tally says nothing about what it counts.
+/// The batch total is labelled; a single substitution stays a bare, pipeable
+/// number.
+#[test]
+fn rp_replace_ops_count_labels_the_total_but_single_op_stays_bare() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch.txt");
+    fs::write(&target, "aa\nbb\ncc\n").unwrap();
+    let ops = dir.path().join("ops.json");
+    fs::write(
+        &ops,
+        r#"[
+          { "label": "a", "pattern": "aa", "replacement": "AA" },
+          { "label": "c", "pattern": "cc", "replacement": "CC" }
+        ]"#,
+    )
+    .unwrap();
+
+    let batch = ok(tpu()
+        .arg("replace")
+        .arg(&target)
+        .arg("--ops")
+        .arg(&ops)
+        .arg("--count"));
+    let stdout = String::from_utf8_lossy(&batch.stdout);
+    assert!(stdout.contains("substitutions by op:"), "{stdout}");
+    assert!(stdout.contains("a      1"), "{stdout}");
+    assert!(stdout.contains("total  2"), "{stdout}");
+
+    let single = ok(tpu()
+        .arg("replace")
+        .arg(&target)
+        .arg("aa")
+        .arg("AA")
+        .arg("--count"));
+    assert_eq!(String::from_utf8_lossy(&single.stdout).trim_end(), "1");
+}
+
+#[test]
+fn rp_replace_ops_file_refuses_the_batch_on_a_zero_match_op() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch.txt");
+    fs::write(&target, "alpha\nbeta\n").unwrap();
+    let ops = dir.path().join("ops.json");
+    fs::write(
+        &ops,
+        r#"[
+          { "label": "a", "pattern": "alpha", "replacement": "ALPHA" },
+          { "label": "typo", "pattern": "nowhere", "replacement": "X" }
+        ]"#,
+    )
+    .unwrap();
+
+    let o = err(tpu().arg("replace").arg(&target).arg("--ops").arg(&ops));
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "alpha\nbeta\n");
+    let stderr = String::from_utf8_lossy(&o.stderr);
+    assert!(stderr.contains("matched 0 times"), "{stderr}");
+}
+
+/// `--ops` reads the array from stdin so a batch can be piped.
+#[test]
+fn rp_replace_ops_reads_the_array_from_stdin() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch.txt");
+    fs::write(&target, "alpha\n").unwrap();
+
+    ok_stdin(
+        tpu().arg("replace").arg(&target).arg("--ops").arg("-"),
+        br#"[{ "pattern": "alpha", "replacement": "beta" }]"#,
+    );
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "beta\n");
+}
+
+/// `--ops` is a different argument from the positional REPLACEMENT and does
+/// not inherit its shell-friendly escape decoding.
+#[test]
+fn rp_replace_ops_replacement_is_verbatim_unless_expand_escapes() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("batch.txt");
+    fs::write(&target, "x\ny\n").unwrap();
+    let ops = dir.path().join("ops.json");
+    fs::write(
+        &ops,
+        r#"[
+          { "pattern": "x", "replacement": "a\\nb" },
+          { "pattern": "y", "replacement": "c\\nd", "expand_escapes": true }
+        ]"#,
+    )
+    .unwrap();
+
+    ok(tpu().arg("replace").arg(&target).arg("--ops").arg(&ops));
+
+    assert_eq!(fs::read_to_string(&target).unwrap(), "a\\nb\nc\nd\n");
 }
 
 /// CN-IT-17: `--message-format=json` with `--pattern --label` — the custom

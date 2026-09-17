@@ -873,6 +873,74 @@ pub fn line_ending_name(le: LineEnding) -> &'static str {
     }
 }
 
+/// Count each line-ending convention present in raw worktree `bytes`.
+///
+/// Prefer [`crate::TextLayout::analyze`] on already-decoded text; this exists
+/// for callers that hold only raw bytes (a post-write check, where decoding
+/// again would mean a second read). UTF-16 content is transcoded first so its
+/// `000D 000A` code-unit pairs are counted as terminators rather than as
+/// stray bytes; this mirrors what [`detect_with_policy`] analyses.
+pub fn line_ending_counts(bytes: &[u8]) -> crate::TextLayout {
+    let analysis = eol_analysis_bytes(bytes, None);
+    crate::TextLayout::analyze(&String::from_utf8_lossy(&analysis))
+}
+
+/// Describe a line-ending problem in a file that was just written, or `None`
+/// when the result is fine.
+///
+/// A write can leave a file git will reject without the write itself failing:
+/// an explicit line-ending override outranks a definite `.gitattributes`
+/// policy, and a targeted line-mode edit re-ends only the lines it touched, so
+/// it can weld a CRLF block into an LF file. Both report plain success. The
+/// same argument that makes a zero-match replace an error applies here — a
+/// silent success is indistinguishable from a correct one — so the outcome is
+/// surfaced at write time instead of at `git commit`.
+///
+/// This is a warning, never a refusal, and it does not try to attribute blame:
+/// pre-existing non-conformance is reported too, because the caller has just
+/// written the file and this is the cheapest moment to learn about it.
+///
+/// `remedy` is appended verbatim so each front end can name its own repair
+/// route (`tpu doctor --fix=eol` for the CLI, `tpu_doctor` for MCP).
+pub fn write_warning(file: &Path, remedy: &str) -> Option<String> {
+    let bytes = std::fs::read(file).ok()?;
+    // Resolve policy once and analyse through it: a BOM-less UTF-16 file whose
+    // encoding is declared by `working-tree-encoding` has its CRLF pairs split
+    // into lone CR and lone LF by a byte-level scan, which would report every
+    // such file as mixed.
+    let policy = policy_for_path(file).ok()?;
+    let analysis = eol_analysis_bytes(&bytes, policy.working_tree_encoding.as_ref());
+    let counts = crate::TextLayout::analyze(&String::from_utf8_lossy(&analysis));
+    let breakdown = format!(
+        "lf_count={}, crlf_count={}, cr_count={}",
+        counts.lf, counts.crlf, counts.cr
+    );
+    if let Some(mismatch) = detect_with_policy(&policy, &bytes) {
+        return Some(format!(
+            "the file's line endings ({}) differ from git's expected {} for this path \
+             (per .gitattributes / core.autocrlf / core.eol); {breakdown}. {remedy}",
+            line_ending_name(mismatch.actual),
+            line_ending_name(mismatch.expected),
+        ));
+    }
+    if counts.is_mixed() {
+        // `detect_with_policy` also returns None when a policy exists but
+        // `text=auto` classified the content as binary, so "no policy" would
+        // be a false claim and point at the wrong remedy.
+        let why = if policy.line_ending.is_none() {
+            "No git policy applies to this path"
+        } else {
+            "Git's policy for this path does not apply to content it classifies as binary"
+        };
+        return Some(format!(
+            "the file now contains mixed line endings ({breakdown}). {why}, so nothing was \
+             normalized; rewrite the whole file with an explicit line ending if a single \
+             convention was intended."
+        ));
+    }
+    None
+}
+
 /// Read-time advisory for git line-ending mismatches.
 ///
 /// When `git_root` points at a repository and `file`'s on-disk line endings
@@ -1063,6 +1131,44 @@ mod tests {
         let m = git.detect(&file, bytes).unwrap().expect("mismatch");
         assert_eq!(m.expected, LineEnding::CrLf);
         assert_eq!(m.actual, LineEnding::Lf);
+    }
+
+    #[test]
+    fn line_ending_counts_separates_conventions_instead_of_picking_a_winner() {
+        // A dominant-convention label calls this "LF" and hides the CRLF that
+        // git would reject in an LF-only repository.
+        let counts = line_ending_counts(b"1\nT\r\n3\n");
+        assert_eq!(counts.lf, 2);
+        assert_eq!(counts.crlf, 1);
+        assert_eq!(counts.cr, 0);
+        assert!(counts.is_mixed());
+        assert_eq!(counts.dominant(), Some(LineEnding::Lf));
+    }
+
+    #[test]
+    fn line_ending_counts_single_convention_is_not_mixed() {
+        let counts = line_ending_counts(b"a\r\nb\r\n");
+        assert_eq!((counts.lf, counts.crlf, counts.cr), (0, 2, 0));
+        assert!(!counts.is_mixed());
+        assert!(!line_ending_counts(b"no terminators").is_mixed());
+        assert_eq!(line_ending_counts(b"no terminators").dominant(), None);
+    }
+
+    #[test]
+    fn write_warning_reports_a_partly_non_conforming_file() {
+        let dir = init_repo(Some("*.txt text eol=lf\n"), "");
+        let file = write_file(dir.path(), "a.txt", b"1\nT\r\n3\n");
+        let warning = write_warning(&file, "REMEDY").expect("mixed file must warn");
+        assert!(warning.contains("crlf_count=1"), "{warning}");
+        assert!(warning.contains("lf_count=2"), "{warning}");
+        assert!(warning.contains("REMEDY"), "{warning}");
+    }
+
+    #[test]
+    fn write_warning_is_silent_for_a_conforming_file() {
+        let dir = init_repo(Some("*.txt text eol=lf\n"), "");
+        let file = write_file(dir.path(), "a.txt", b"1\n2\n3\n");
+        assert_eq!(write_warning(&file, "REMEDY"), None);
     }
 
     #[test]

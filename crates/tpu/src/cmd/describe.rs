@@ -94,9 +94,9 @@ pub fn run(file: &Path, io_mode: IoMode) -> Result<DescribeResult, Box<dyn std::
     let encoding_label = decoded.encoding.name();
     let line_count = decoded.layout.line_count;
     let seen = LineEndingSeen {
-        lf: decoded.layout.has_lf,
-        crlf: decoded.layout.has_crlf,
-        cr: decoded.layout.has_cr,
+        lf: decoded.layout.has_lf(),
+        crlf: decoded.layout.has_crlf(),
+        cr: decoded.layout.has_cr(),
     };
 
     let line_ending = seen.as_str();

@@ -22,9 +22,79 @@ use tpu::IoMode;
 // the lib and bin crate contexts) can use `crate::open_as_branch` etc.
 pub use tpu::git;
 pub use tpu::{
-    atomic_create_new, atomic_write, open_as_branch, open_source, read_raw_bytes, read_text_file,
-    recover_stranded_backup, retry_io, source_from_branch, source_from_branch_with_policy,
+    TextLayout, atomic_create_new, atomic_write, open_as_branch, open_source, read_raw_bytes,
+    read_text_file, recover_stranded_backup, retry_io, source_from_branch,
+    source_from_branch_with_policy,
 };
+
+/// Emit the before/after line-ending census for a replace.
+///
+/// The JSON record is emitted in every mode — it is the machine-readable
+/// answer to "did this write leave the file the way I expected". Its
+/// `rendered` is deliberately empty so human mode keeps `--count`'s stdout a
+/// bare number and a plain replace's stdout empty; a human is told only when
+/// there is something to tell (see the `normalized` warning at the call site).
+fn emit_line_ending_census(out: &mut dyn output::Output, outcome: &cmd::replace::ReplaceOutcome) {
+    out.emit_json(
+        "replace",
+        None,
+        None,
+        &serde_json::json!({
+            "reason": "data",
+            "subcommand": "replace",
+            "metric": "line_endings",
+            "before": outcome.before.to_json(),
+            "after": outcome.after.to_json(),
+            "normalized": outcome.normalized_line_endings(),
+            "rendered": "",
+        }),
+    );
+}
+
+/// Emit the per-line before/after images requested by `--changed-lines`.
+///
+/// Human rendering is `N - old` / `N + new`, ASCII only: these lines reach a
+/// Windows console under whatever code page is active.
+fn emit_changed_lines(out: &mut dyn output::Output, outcome: &cmd::replace::ReplaceOutcome) {
+    for line in &outcome.changed_lines {
+        let mut rendered = String::new();
+        if let (Some(number), Some(text)) = (line.old_line, line.old_text.as_deref()) {
+            rendered.push_str(&format!("{number:>6} - {text}\n"));
+        }
+        if let (Some(number), Some(text)) = (line.new_line, line.new_text.as_deref()) {
+            rendered.push_str(&format!("{number:>6} + {text}\n"));
+        }
+        out.emit_json(
+            "replace",
+            None,
+            None,
+            &serde_json::json!({
+                "reason": "data",
+                "subcommand": "replace",
+                "metric": "changed_line",
+                "old_line": line.old_line,
+                "new_line": line.new_line,
+                "old_text": line.old_text,
+                "new_text": line.new_text,
+                "rendered": rendered,
+            }),
+        );
+    }
+    if outcome.changed_lines_truncated {
+        out.emit_json(
+            "replace",
+            None,
+            None,
+            &serde_json::json!({
+                "reason": "data",
+                "subcommand": "replace",
+                "metric": "changed_lines_truncated",
+                "value": true,
+                "rendered": "... (truncated; raise --changed-lines-max to see more)\n",
+            }),
+        );
+    }
+}
 
 /// Resolve the line-ending override for a mutating write
 /// (`write`/`replace`/`edit`/`append`).
@@ -386,16 +456,46 @@ enum Commands {
 
         /// Pattern to search for. Treated as a fixed literal string unless
         /// --regex is passed.
-        #[arg(allow_hyphen_values = true)]
-        pattern: String,
+        #[arg(
+            allow_hyphen_values = true,
+            required_unless_present = "ops",
+            conflicts_with = "ops"
+        )]
+        pattern: Option<String>,
 
         /// Replacement template.  Capture groups ($0/$1/$name, literal $ via
         /// $$) are expanded only when the pattern has a capturing group;
         /// otherwise $ is literal.  By default backslash escapes (`\n`, `\t`,
         /// `\r`, `\\`, `\0`, `\xHH`, `\uXXXX`, `\UXXXXXXXX`) are decoded into
         /// their corresponding bytes; pass `--literal-replacement` to disable.
-        #[arg(allow_hyphen_values = true)]
-        replacement: String,
+        #[arg(
+            allow_hyphen_values = true,
+            required_unless_present = "ops",
+            conflicts_with = "ops"
+        )]
+        replacement: Option<String>,
+
+        /// Apply several substitutions from a JSON file, in order, as a single
+        /// atomic write.  PATH holds a JSON array of substitution objects —
+        /// byte-for-byte the same value as the MCP `tpu_replace_in_file`
+        /// tool's `ops` argument, so a batch can be moved between the two
+        /// unchanged.  Pass `-` to read the array from stdin.
+        ///
+        /// Each object takes `pattern` and `replacement` plus the optional
+        /// `label`, `regex`, `multiline`, `allow_no_match`, `expand_escapes`,
+        /// `pattern_format`, and `replacement_format` fields.  Note that an
+        /// op's `replacement` is VERBATIM by default (set `expand_escapes` to
+        /// decode `\n`), which is the opposite of the positional REPLACEMENT
+        /// argument's shell-friendly default.
+        ///
+        /// A count of 0 for any op without its own `allow_no_match` refuses
+        /// the whole batch and leaves the file untouched.
+        #[arg(
+            long,
+            value_name = "PATH",
+            conflicts_with_all = ["regex", "literal_replacement", "multiline"]
+        )]
+        ops: Option<PathBuf>,
 
         /// Interpret `pattern` as a regex (regex::bytes syntax, applied to the
         /// LF-normalised view). Without this flag `pattern` is a fixed literal
@@ -437,6 +537,22 @@ enum Commands {
         /// Mutually exclusive with --count.
         #[arg(long, conflicts_with = "count")]
         dry_run: bool,
+
+        /// Report a before/after image of every changed line, with its line
+        /// number in the file as read and in the file as written.  Costs a
+        /// whole-file line diff.  Mutually exclusive with --count, which
+        /// performs no substitution to describe.
+        #[arg(long, conflicts_with = "count")]
+        changed_lines: bool,
+
+        /// Cap on how many changed lines --changed-lines reports.
+        #[arg(
+            long,
+            value_name = "N",
+            default_value_t = 50,
+            requires = "changed_lines"
+        )]
+        changed_lines_max: usize,
 
         /// Override the output line ending. Without this flag definite Git
         /// policy applies, or the file's dominant convention is preserved.
@@ -907,19 +1023,19 @@ enum Commands {
         /// (the current directory) when omitted.
         paths: Vec<String>,
 
-        /// Output format.
+        /// Output format for the report itself.
         ///
-        ///   human — per-file lines plus a one-line summary (default).
+        ///   human — per-file lines plus a one-line summary.
         ///
         ///   json  — a single pretty-printed JSON document with the
         ///           documented schema (see `cmd::doctor` module docs).
-        #[arg(
-            long,
-            value_name = "FORMAT",
-            default_value = "human",
-            value_parser = ["human", "json"]
-        )]
-        format: String,
+        ///
+        /// Omit to follow the global `--message-format`.  Under
+        /// `--message-format=json` the report is emitted as a structured
+        /// NDJSON record regardless, so this flag is only needed to get a
+        /// standalone JSON document out of an otherwise-human run.
+        #[arg(long, value_name = "FORMAT", value_parser = ["human", "json"])]
+        format: Option<String>,
 
         /// Repair mode.
         ///
@@ -1414,12 +1530,15 @@ fn run(
             file,
             pattern,
             replacement,
+            ops,
             literal_replacement,
             multiline,
             diff,
             count,
             dry_run,
             regex,
+            changed_lines,
+            changed_lines_max,
             line_ending,
             allow_mojibake,
         } => {
@@ -1435,33 +1554,118 @@ fn run(
                 cli.git_root.as_deref(),
                 eol_normalize,
             )?;
-            // Decode backslash escapes in the replacement string unless the
-            // caller asked for raw/literal handling.  This is the default
-            // because users typically write `\n` expecting a real newline.
-            let decoded_replacement =
-                cmd::replace::decode_replacement(&replacement, literal_replacement)
-                    .map_err(|e| format!("replace: {e}"))?;
-            let n = cmd::replace::run(
-                &file,
-                &pattern,
-                &decoded_replacement,
-                diff_out,
-                None,
-                cmd::replace::ReplaceOptions {
-                    multiline,
-                    regex,
-                    line_ending_override: le_override,
-                    count_only: count,
-                    dry_run,
-                    io_mode: IoMode::Mmap,
-                    policy: if allow_mojibake {
-                        mojibake::WritePolicy::permissive()
-                    } else {
-                        mojibake::WritePolicy::default()
+            let policy = if allow_mojibake {
+                mojibake::WritePolicy::permissive()
+            } else {
+                mojibake::WritePolicy::default()
+            };
+            // Set by the batch path so the total can be rendered as a labelled
+            // row lining up under the per-op tally.
+            let mut tally_width: Option<usize> = None;
+            let outcome = if let Some(ops_path) = ops {
+                let owned = cmd::replace::ops_from_file(&ops_path)?;
+                let outcome = cmd::replace::run_batch(
+                    &file,
+                    &cmd::replace::as_ops(&owned),
+                    diff_out,
+                    cmd::replace::ReplaceOptions {
+                        multiline: false,
+                        regex: false,
+                        line_ending_override: le_override,
+                        count_only: count,
+                        dry_run,
+                        io_mode: IoMode::Mmap,
+                        policy,
+                        changed_lines,
+                        changed_lines_max: Some(changed_lines_max),
                     },
-                },
-            )?;
+                )?;
+                // The per-op tally is the verification a batch offers in place
+                // of a changed-region echo, so emit it in every mode. Human
+                // rendering is a labelled, aligned block: a bare column of
+                // numbers does not say what it is counting.
+                let width = owned
+                    .iter()
+                    .map(|op| {
+                        op.label
+                            .as_deref()
+                            .unwrap_or(op.pattern.as_str())
+                            .chars()
+                            .count()
+                    })
+                    .chain(std::iter::once("total".len()))
+                    .max()
+                    .unwrap_or(5);
+                tally_width = Some(width);
+                for (index, (op, count)) in owned.iter().zip(&outcome.counts).enumerate() {
+                    let label = op.label.as_deref().unwrap_or(op.pattern.as_str());
+                    // The header rides on the first row rather than being its
+                    // own record, so JSON consumers see only real op records.
+                    let header = if index == 0 {
+                        "substitutions by op:\n"
+                    } else {
+                        ""
+                    };
+                    out.emit_json(
+                        "replace",
+                        None,
+                        None,
+                        &serde_json::json!({
+                            "reason": "data",
+                            "subcommand": "replace",
+                            "metric": label,
+                            // Ops legitimately repeat a pattern (each sees the
+                            // evolving buffer), so the label alone does not
+                            // identify a row.
+                            "op_index": index,
+                            "count": count,
+                            "rendered": format!("{header}  {label:<width$}  {count}\n"),
+                        }),
+                    );
+                }
+                outcome
+            } else {
+                // Unreachable via clap: the positionals are required unless
+                // --ops is present.
+                let pattern = pattern.ok_or("replace: PATTERN is required without --ops")?;
+                let replacement =
+                    replacement.ok_or("replace: REPLACEMENT is required without --ops")?;
+                // Decode backslash escapes in the replacement string unless the
+                // caller asked for raw/literal handling.  This is the default
+                // because users typically write `\n` expecting a real newline.
+                let decoded_replacement =
+                    cmd::replace::decode_replacement(&replacement, literal_replacement)
+                        .map_err(|e| format!("replace: {e}"))?;
+                cmd::replace::run(
+                    &file,
+                    &pattern,
+                    &decoded_replacement,
+                    diff_out,
+                    None,
+                    cmd::replace::ReplaceOptions {
+                        multiline,
+                        regex,
+                        line_ending_override: le_override,
+                        count_only: count,
+                        dry_run,
+                        io_mode: IoMode::Mmap,
+                        policy,
+                        changed_lines,
+                        changed_lines_max: Some(changed_lines_max),
+                    },
+                )?
+            };
+            let n = outcome.total();
+            emit_line_ending_census(&mut *out, &outcome);
+            emit_changed_lines(&mut *out, &outcome);
             if count {
+                // A bare number is right for a single substitution (it is the
+                // whole result, and stays pipeable); under --ops it would be an
+                // unlabelled figure dangling below a labelled tally.
+                let rendered = match tally_width {
+                    Some(width) => format!("  {:<width$}  {n}\n", "total"),
+                    None => format!("{n}\n"),
+                };
                 out.emit_json(
                     "replace",
                     None,
@@ -1470,7 +1674,7 @@ fn run(
                         "reason": "count",
                         "subcommand": "replace",
                         "count": n,
-                        "rendered": format!("{n}\n"),
+                        "rendered": rendered,
                     }),
                 );
                 return Ok(());
@@ -1490,7 +1694,7 @@ fn run(
                         }),
                     );
                 }
-                if n > 0 {
+                if outcome.would_write {
                     std::process::exit(1);
                 }
                 return Ok(());
@@ -1512,12 +1716,39 @@ fn run(
             shell.status(
                 "replace",
                 format!(
-                    "{}: {} replacement{}",
+                    "{}: {} replacement{}{}",
                     file.display(),
                     n,
-                    if n == 1 { "" } else { "s" }
+                    if n == 1 { "" } else { "s" },
+                    // A substitution can match and still produce byte-identical
+                    // output; saying so beats implying the file was rewritten.
+                    if outcome.wrote || n == 0 {
+                        ""
+                    } else {
+                        " (file unchanged: result was byte-identical)"
+                    },
                 ),
             )?;
+            // A replace rewrites the whole file, so a mixed file is collapsed
+            // onto one convention by an edit that had nothing to do with line
+            // endings. That is a change the caller did not ask for.
+            if outcome.normalized_line_endings() {
+                // ASCII only: this lands on a Windows console under whatever
+                // code page is active, where a non-ASCII dash arrives mangled.
+                shell.warn(format!(
+                    "{}: line endings were mixed (lf={} crlf={} cr={}) and are now uniform {}; \
+                     a replace rewrites every terminator",
+                    file.display(),
+                    outcome.before.lf,
+                    outcome.before.crlf,
+                    outcome.before.cr,
+                    outcome
+                        .after
+                        .dominant()
+                        .map(git::line_ending_name)
+                        .unwrap_or("none"),
+                ))?;
+            }
             Ok(())
         }
 
@@ -1632,6 +1863,14 @@ fn run(
                     if n == 1 { "" } else { "s" }
                 ),
             )?;
+            // A line-mode edit re-ends only the lines it touches, so it can
+            // leave a file git will reject even though the edit succeeded.
+            if !binary
+                && let Some(warning) =
+                    git::write_warning(&file, "Run 'tpu doctor --fix=eol' to normalize.")
+            {
+                shell.warn(format!("{}: {warning}", file.display()))?;
+            }
             Ok(())
         }
 
@@ -2069,8 +2308,13 @@ fn run(
             guess,
         } => {
             let path_refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            // Under --message-format=json the report is emitted as a structured
+            // record below, so the buffer only ever needs the human rendering;
+            // asking doctor for its JSON document here would nest JSON inside
+            // JSON and force consumers to parse twice.
+            let want_json_document = format.as_deref() == Some("json") && !json_mode;
             let opts = cmd::doctor::DoctorOptions {
-                format: if format == "json" {
+                format: if want_json_document {
                     cmd::doctor::DoctorFormat::Json
                 } else {
                     cmd::doctor::DoctorFormat::Human
@@ -2106,7 +2350,15 @@ fn run(
             let report = result?;
             let content =
                 String::from_utf8(buf).map_err(|e| format!("doctor: non-UTF-8 output: {e}"))?;
-            out.emit("doctor", None, None, format_args!("{content}"));
+            if json_mode {
+                let mut record = cmd::doctor::report_to_json(&report);
+                record["reason"] = serde_json::json!("data");
+                record["subcommand"] = serde_json::json!("doctor");
+                record["rendered"] = serde_json::json!(content);
+                out.emit_json("doctor", None, None, &record);
+            } else {
+                out.emit("doctor", None, None, format_args!("{content}"));
+            }
             if report.total_issues() > 0 {
                 std::process::exit(1);
             }
