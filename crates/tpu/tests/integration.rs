@@ -9010,6 +9010,44 @@ fn rp_replace_changed_lines_reports_both_images_with_positions() {
     assert_eq!(changed[0]["new_text"], "TWO");
 }
 
+/// The human `rendered` line reaches a Windows console under whatever code
+/// page is active, so it is escaped to 7-bit ASCII. The machine-readable
+/// `old_text`/`new_text` stay verbatim.
+#[test]
+fn rp_replace_changed_lines_escapes_non_ascii_in_the_human_rendering() {
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("accented.txt");
+    fs::write(&target, "caf\u{e9} \u{2014} na\u{ef}ve\n").unwrap();
+
+    let o = ok(tpu()
+        .arg("--message-format=json")
+        .arg("replace")
+        .arg(&target)
+        .arg("na\u{ef}ve")
+        .arg("plain")
+        .arg("--changed-lines"));
+
+    let changed = parse_ndjson(&o.stdout)
+        .into_iter()
+        .find(|m| m["metric"] == "changed_line")
+        .expect("a changed_line record");
+
+    assert_eq!(
+        changed["old_text"], "caf\u{e9} \u{2014} na\u{ef}ve",
+        "the JSON payload is verbatim"
+    );
+
+    let rendered = changed["rendered"].as_str().expect("rendered");
+    assert!(
+        rendered.is_ascii(),
+        "the human rendering must be 7-bit clean: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("caf\\u00E9 \\u2014 na\\u00EFve"),
+        "non-ASCII must be escaped, not dropped: {rendered:?}"
+    );
+}
+
 /// The census must be machine-readable in JSON mode and must flag that a
 /// replace collapsed a mixed file onto one convention.
 #[test]
