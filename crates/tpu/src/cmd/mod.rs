@@ -4,7 +4,6 @@ pub mod append;
 pub mod copy;
 pub mod count;
 pub mod create;
-pub mod describe;
 pub mod doctor;
 pub mod edit;
 pub mod find;

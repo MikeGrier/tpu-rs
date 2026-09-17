@@ -886,24 +886,6 @@ pub fn line_ending_name(le: LineEnding) -> &'static str {
     }
 }
 
-/// Count each line-ending convention present in raw worktree `bytes`.
-///
-/// Prefer [`crate::TextLayout::analyze`] on already-decoded text; this exists
-/// for callers that hold only raw bytes (a post-write check, where decoding
-/// again would mean a second read). UTF-16 is recognised by its BOM and
-/// transcoded first, so its `000D 000A` code-unit pairs are counted as
-/// terminators rather than as stray bytes.
-///
-/// BOM-less UTF-16 declared only through `working-tree-encoding` is **not**
-/// recognised here, because the attribute is not available at this call: its
-/// interleaved NUL bytes would split each `\r\n` and be miscounted as a lone
-/// CR plus a lone LF. Use [`detect_with_policy`], which resolves the
-/// attribute, when the bytes may be BOM-less UTF-16.
-pub fn line_ending_counts(bytes: &[u8]) -> crate::TextLayout {
-    let analysis = eol_analysis_bytes(bytes, None);
-    crate::TextLayout::analyze(&String::from_utf8_lossy(&analysis))
-}
-
 /// Describe a line-ending problem in a file that was just written, or `None`
 /// when the result is fine.
 ///
@@ -1152,21 +1134,12 @@ mod tests {
     fn line_ending_counts_separates_conventions_instead_of_picking_a_winner() {
         // A dominant-convention label calls this "LF" and hides the CRLF that
         // git would reject in an LF-only repository.
-        let counts = line_ending_counts(b"1\nT\r\n3\n");
+        let counts = crate::TextLayout::analyze("1\nT\r\n3\n");
         assert_eq!(counts.lf, 2);
         assert_eq!(counts.crlf, 1);
         assert_eq!(counts.cr, 0);
         assert!(counts.is_mixed());
         assert_eq!(counts.dominant(), Some(LineEnding::Lf));
-    }
-
-    #[test]
-    fn line_ending_counts_single_convention_is_not_mixed() {
-        let counts = line_ending_counts(b"a\r\nb\r\n");
-        assert_eq!((counts.lf, counts.crlf, counts.cr), (0, 2, 0));
-        assert!(!counts.is_mixed());
-        assert!(!line_ending_counts(b"no terminators").is_mixed());
-        assert_eq!(line_ending_counts(b"no terminators").dominant(), None);
     }
 
     #[test]
