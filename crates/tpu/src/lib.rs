@@ -580,6 +580,25 @@ pub fn acquire_write_lock(file: &Path) -> Option<WriteLock> {
     }
 }
 
+/// Existence check that does not mistake a transient AV error for absence.
+///
+/// [`Path::exists`] is `fs::metadata(..).is_ok()`, so a Defender sharing
+/// violation on a just-written file reads as "not there" — and every caller
+/// here uses existence to decide whether to do the *careful* thing (capture
+/// old bytes for the mojibake guard, detect an existing file's encoding,
+/// refuse to clobber). A false negative silently takes the cheap branch.
+///
+/// `NotFound` is answered immediately; anything else goes through
+/// [`retry_io`], and a probe that never succeeds answers `true`, so the
+/// caller's careful branch runs and fails loudly rather than being skipped.
+pub fn path_exists(path: &Path) -> bool {
+    match retry_io(|| fs::metadata(path)) {
+        Ok(_) => true,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
+        Err(_) => true,
+    }
+}
+
 /// Retry a closure that returns [`io::Result<T>`] up to 5 retries on transient
 /// Windows AV/Defender errors (sharing violation or access denied), sleeping
 /// 25 ms between attempts (6 total attempts).  Returns immediately on any
@@ -625,6 +644,40 @@ fn is_transient_io_error(e: &io::Error) -> bool {
     {
         let _ = e;
         false
+    }
+}
+
+#[cfg(test)]
+mod path_exists_tests {
+    use super::*;
+
+    #[test]
+    fn path_exists_answers_for_a_present_and_an_absent_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let present = dir.path().join("here.txt");
+        fs::write(&present, b"x").unwrap();
+        assert!(path_exists(&present));
+        assert!(!path_exists(&dir.path().join("gone.txt")));
+    }
+
+    /// The whole point of the helper: unlike `Path::exists`, an error that is
+    /// not `NotFound` must never be reported as absence, because every caller
+    /// uses a `false` answer to skip the careful branch.
+    #[test]
+    fn a_non_not_found_error_is_not_reported_as_absence() {
+        // A path with an interior NUL cannot be opened, and the resulting
+        // error is InvalidInput rather than NotFound.
+        let bad = std::path::PathBuf::from("bad\0name");
+        assert!(fs::metadata(&bad).is_err());
+        assert_ne!(
+            fs::metadata(&bad).unwrap_err().kind(),
+            io::ErrorKind::NotFound,
+        );
+        assert!(
+            path_exists(&bad),
+            "a non-NotFound probe failure must not read as 'absent'"
+        );
+        assert!(!bad.exists(), "which is exactly where Path::exists differs");
     }
 }
 

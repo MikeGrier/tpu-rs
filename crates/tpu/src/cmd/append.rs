@@ -62,7 +62,7 @@ pub fn run(
     policy: WritePolicy,
 ) -> Result<AppendOutcome, Box<dyn std::error::Error>> {
     let _ = crate::recover_stranded_backup(file);
-    if !file.exists() {
+    if !crate::path_exists(file) {
         return Err(format!(
             "append: file does not exist: {}; use 'tpu write' to create new files",
             file.display()

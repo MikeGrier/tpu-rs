@@ -113,7 +113,7 @@ pub fn run(
     }
 
     // Append to dest (creating it if absent).
-    if dest.exists() {
+    if crate::path_exists(dest) {
         let dest_bytes = fs::read(dest)?;
         let mut dest_content = String::from_utf8(dest_bytes)
             .map_err(|_| format!("dest file is not valid UTF-8: {}", dest.display()))?;
