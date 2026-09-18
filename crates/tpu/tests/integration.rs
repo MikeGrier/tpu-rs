@@ -9234,6 +9234,42 @@ fn rp_replace_warns_when_an_override_leaves_a_file_git_will_reject() {
     assert_eq!(fs::read(&target).unwrap(), b"ALPHA\r\nbeta\r\n");
 }
 
+/// The post-write conformance check is a contract for every mutating text
+/// command, not just replace and edit: an explicit `--line-ending` outranks
+/// git policy on all of them. (`render` has no override flag -- it always
+/// resolves policy itself -- so it cannot be driven non-conforming this way.)
+#[test]
+fn rp_every_mutating_text_command_warns_when_an_override_breaks_policy() {
+    for label in ["write", "create", "append"] {
+        let dir = tempfile::tempdir().unwrap();
+        gix::init(dir.path()).expect("git init");
+        fs::write(dir.path().join(".gitattributes"), "*.txt text eol=lf\n").unwrap();
+        let target = dir.path().join("a.txt");
+
+        let mut cmd = tpu();
+        match label {
+            "write" => {
+                fs::write(&target, b"seed\n").unwrap();
+                cmd.arg("write").arg(&target).arg("alpha\nbeta\n");
+            }
+            "create" => {
+                cmd.arg("create").arg(&target).arg("alpha\nbeta\n");
+            }
+            _ => {
+                fs::write(&target, b"seed\n").unwrap();
+                cmd.arg("append").arg(&target).arg("--data").arg("more\n");
+            }
+        }
+        let o = ok(cmd.arg("--line-ending").arg("crlf"));
+
+        let stderr = String::from_utf8_lossy(&o.stderr);
+        assert!(
+            stderr.contains("differ from git's expected LF"),
+            "{label} must warn when an override breaks policy: {stderr}"
+        );
+    }
+}
+
 /// The CLI reported "content appended" unconditionally, so a byte-identical
 /// append claimed a mutation that never reached the disk.
 #[test]

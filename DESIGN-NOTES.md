@@ -491,8 +491,15 @@ explicit repair*.  Both halves are implemented:
    (`tpu_create_file`, `tpu_write_file`, `tpu_replace_in_file`, `tpu_edit_file`,
    `tpu_append_file`, `tpu_render_file`) runs a post-write conformance check and adds
    an `eol_warning` field to its status trailer when the result does not conform.  The
-   CLI equivalents warn on stderr.  A plain `"status":"success"` with no `eol_warning`
-   is what means "committable".
+   CLI equivalents (`write`, `create`, `append`, `replace`, line-mode `edit`, `render`)
+   warn on stderr.  A plain `"status":"success"` with no `eol_warning` is what means
+   "committable".
+
+   Binary writes are exempt — there is no line-ending convention to conform to — and
+   preview paths (`--diff` on `append`, `--dry-run` / `--count` on `replace`) write
+   nothing, so they never warn.  `render` has no line-ending override and always
+   resolves policy itself, so in practice its check only reports pre-existing
+   non-conformance.
 
 2. **Explicit repair.**  `tpu doctor --fix=eol` (`fix: "eol"` over MCP) normalizes a
    file's endings to git's expected convention; `--fix=all` also peels mojibake.  A

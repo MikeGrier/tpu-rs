@@ -1471,6 +1471,13 @@ fn run(
                 )
             };
             result?;
+            // Binary writes have no line-ending convention to conform to.
+            if !binary
+                && let Some(warning) =
+                    git::write_warning(&file, "Run 'tpu doctor --fix=eol' to normalize.")
+            {
+                shell.warn(format!("{}: {warning}", file.display()))?;
+            }
             if diff && !diff_buf.is_empty() {
                 let content = String::from_utf8_lossy(&diff_buf).into_owned();
                 out.emit_json(
@@ -1534,6 +1541,13 @@ fn run(
                     mojibake::WritePolicy::default()
                 },
             )?;
+            // A new file born with an explicit --line-ending can already
+            // violate the repository's policy.
+            if let Some(warning) =
+                git::write_warning(&file, "Run 'tpu doctor --fix=eol' to normalize.")
+            {
+                shell.warn(format!("{}: {warning}", file.display()))?;
+            }
             Ok(())
         }
 
@@ -2221,6 +2235,13 @@ fn run(
                 "no bytes changed; file left untouched"
             };
             shell.status("append", format!("{}: {summary}", file.display()))?;
+            // An explicit --line-ending outranks git policy, so a successful
+            // append can still leave a file git will reject.
+            if let Some(warning) =
+                git::write_warning(&file, "Run 'tpu doctor --fix=eol' to normalize.")
+            {
+                shell.warn(format!("{}: {warning}", file.display()))?;
+            }
             Ok(())
         }
 
@@ -2507,6 +2528,11 @@ fn run(
                     if report.referenced == 1 { "" } else { "s" },
                 ),
             )?;
+            if let Some(warning) =
+                git::write_warning(&output, "Run 'tpu doctor --fix=eol' to normalize.")
+            {
+                shell.warn(format!("{}: {warning}", output.display()))?;
+            }
             Ok(())
         }
 
