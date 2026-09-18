@@ -452,11 +452,14 @@ LF before processing.
 > **Scope correction.**  This section originally said `replace` and `edit` both leave
 > a pre-existing mixed file mixed.  That is true of line-mode `edit`, which re-ends
 > only the lines it touches and preserves every other line byte-for-byte.  It is
-> **not** true of `replace`: any run with at least one match re-encodes the whole file
-> and therefore emits every terminator in a single convention, so a mixed file comes
-> out uniform whether or not `line_ending` was passed.  That is why a replace reports
-> `normalized: true` and a before/after terminator census — the side effect is
-> surfaced rather than prevented.  The reasoning below still governs `edit` and the
+> **not** true of `replace`: any run with at least one match re-encodes the whole file,
+> so every terminator it writes is emitted in one convention — a mixed file normally
+> comes out uniform, with or without `line_ending`.  The exception is a replacement
+> that deletes the terminators themselves, which leaves the census `none`; that is an
+> absence of any convention rather than a normalization onto one, and `normalized`
+> stays false for it.  A replace reports `normalized: true` only when a mixed file
+> actually ended up uniform, alongside a before/after terminator census — the side
+> effect is surfaced rather than prevented.  The reasoning below still governs `edit` and the
 > decision not to normalize *deliberately*; it is not a claim that `replace` leaves
 > terminators untouched.
 
