@@ -77,8 +77,9 @@ pub fn run(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let _ = crate::recover_stranded_backup(file);
     // Capture old bytes if needed for diff computation OR the mojibake guard.
-    let need_old_bytes = diff_out.is_some() || (policy.reject_introduced_mojibake && file.exists());
-    let old_bytes: Option<Vec<u8>> = if need_old_bytes && file.exists() {
+    let need_old_bytes =
+        diff_out.is_some() || (policy.reject_introduced_mojibake && crate::path_exists(file));
+    let old_bytes: Option<Vec<u8>> = if need_old_bytes && crate::path_exists(file) {
         Some(crate::retry_io(|| fs::read(file))?)
     } else {
         None
@@ -225,7 +226,7 @@ fn detect_target(
             false,
         )
     };
-    if !file.exists() {
+    if !crate::path_exists(file) {
         return Ok(policy_defaults());
     }
 
@@ -311,7 +312,7 @@ pub fn run_binary(
     let _ = crate::recover_stranded_backup(file);
 
     // Read old bytes for diff (before any overwrite).
-    let old_bytes: Option<Vec<u8>> = if diff_out.is_some() && file.exists() {
+    let old_bytes: Option<Vec<u8>> = if diff_out.is_some() && crate::path_exists(file) {
         Some(crate::retry_io(|| fs::read(file))?)
     } else {
         None
