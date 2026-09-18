@@ -4,7 +4,7 @@
      examples for documentation purposes) -->
 
 <!-- tpu-mcp:setup:begin -->
-<!-- tpu-mcp:setup:version=5.0.0 -->
+<!-- tpu-mcp:setup:version=6.0.0 -->
 
 ## File I/O — use `tpu_*` MCP tools, never PowerShell or shell
 
