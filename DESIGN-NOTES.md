@@ -449,18 +449,25 @@ LF before processing.
 
 ### Why not proactively normalize entire files?
 
-`replace` and `edit` operate on raw source bytes for unmodified regions — only the
-replacement or inserted data passes through denormalization.  A file with pre-existing
-mixed line endings will remain mixed after a replace or edit (unless `line_ending` is
-explicitly specified, which triggers a whole-file normalization pass in `replace`).
+> **Scope correction.**  This section originally said `replace` and `edit` both leave
+> a pre-existing mixed file mixed.  That is true of line-mode `edit`, which re-ends
+> only the lines it touches and preserves every other line byte-for-byte.  It is
+> **not** true of `replace`: any run with at least one match re-encodes the whole file
+> and therefore emits every terminator in a single convention, so a mixed file comes
+> out uniform whether or not `line_ending` was passed.  That is why a replace reports
+> `normalized: true` and a before/after terminator census — the side effect is
+> surfaced rather than prevented.  The reasoning below still governs `edit` and the
+> decision not to normalize *deliberately*; it is not a claim that `replace` leaves
+> terminators untouched.
 
 We deliberately chose **not** to add automatic whole-file line-ending normalization as
 a side effect of every edit.  Reasons:
 
-1. **Minimal surprise.**  If the caller asks to replace "foo" with "bar", the diff
-   should show exactly that change.  Silently normalizing every line ending in the file
-   would produce a noisy diff that touches lines the caller never asked to change,
-   making code review harder.
+1. **Minimal surprise.**  If the caller asks to insert a line, the diff should show
+   exactly that change.  Silently normalizing every line ending in the file would
+   produce a noisy diff that touches lines the caller never asked to change, making
+   code review harder.  This is why line-mode `edit` is targeted; `replace`, which
+   re-encodes the whole file, pays this cost and reports it as `normalized`.
 
 2. **Already solvable when desired.**  The `line_ending` override parameter forces
    whole-file normalization in `replace`.  Callers that want to fix mixed endings can
@@ -476,9 +483,10 @@ a side effect of every edit.  Reasons:
    silently as a side effect of an unrelated edit obscures the real change in version
    control.
 
-If whole-file normalization is ever needed as a first-class action, the right form is
-a separate explicit tool (e.g. `tpu normalize` or a `tpu_normalize_line_endings` MCP
-tool) rather than an implicit side effect.
+Whole-file normalization as a first-class action is the right form, and it now exists:
+`tpu doctor --fix=eol` (`fix: "eol"` over MCP).  It is deliberately *not* a separate
+`tpu normalize` / `tpu_normalize_line_endings` tool — see the next section for why
+doctor owns it.
 
 ### Mixed line ending detection and normalization
 
