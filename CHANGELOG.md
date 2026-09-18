@@ -1,5 +1,44 @@
 # Changelog
 
+## [6.0.0](https://github.com/MikeGrier/tpu-rs/compare/v5.0.0...v6.0.0) (2026-09-18)
+
+
+### ⚠ BREAKING CHANGES
+
+* `tpu::cmd::describe` and `tpu::git::line_ending_counts` are removed. Use `tpu::cmd::count` (or the `tpu_count_file` MCP tool) for file metadata and the terminator census, and `tpu::TextLayout::analyze` for a census over decoded text.
+* **replace:** `tpu::cmd::replace::run` and `run_batch` return `ReplaceOutcome` rather than `usize` / `Vec<usize>`, and `ReplaceOptions` gained `changed_lines` and `changed_lines_max`. `TextLayout`'s `has_lf` / `has_crlf` / `has_cr` fields became methods, and the struct now carries `lf` / `crlf` / `cr` counts. `tpu doctor --format` is optional and defers to the global `--message-format`. MCP tool arguments declared as booleans are now rejected when sent as another JSON type instead of silently defaulting to false.
+
+### Features
+
+* **describe:** report the terminator census, not just a label ([3fbb335](https://github.com/MikeGrier/tpu-rs/commit/3fbb335b894e7c6491b77fdc5761ea69a6870b77))
+* **replace:** batch ops, line-ending census, and honest previews ([d5e5224](https://github.com/MikeGrier/tpu-rs/commit/d5e5224c6bfc2c00afdbbcf77daee9420010c73b))
+
+
+### Bug Fixes
+
+* a path below a plain file is absent, not a probe failure ([bbc4b0a](https://github.com/MikeGrier/tpu-rs/commit/bbc4b0a6e9499e21a40e1d3ea4dc8c6bb216c20b))
+* **append:** give the diff preview an honest write decision ([d50a695](https://github.com/MikeGrier/tpu-rs/commit/d50a695ba0bcbfb14da634a3f3e12b9f41b114d5))
+* **append:** honour the no-op outcome in both callers ([494640c](https://github.com/MikeGrier/tpu-rs/commit/494640cd13767c557f556bf9a40bdee5071d7989))
+* **cli:** run the post-write conformance check on every mutating text command ([584e533](https://github.com/MikeGrier/tpu-rs/commit/584e53310888cd9444fe952c5b9477e3b5a118ad))
+* **copy:** do not let an unresolved existence probe skip the copy ([87328e9](https://github.com/MikeGrier/tpu-rs/commit/87328e914a5ddc6346ea87ec30f6fbe5c8af9fd3))
+* **doctor:** base the exit status on what remains, not on what was found ([b7f7779](https://github.com/MikeGrier/tpu-rs/commit/b7f7779902cfe59663e7addd909c86ed6c30e89c))
+* **doctor:** report line endings for encoding-invalid files in human output ([07215db](https://github.com/MikeGrier/tpu-rs/commit/07215db8b096e485e7fa129512d3a3546b895ade))
+* **git:** distinguish an explicit -text path from having no EOL policy ([e94fea7](https://github.com/MikeGrier/tpu-rs/commit/e94fea772eda9df44944d2cf651994c12300c4ce))
+* **git:** stop pointing the no-policy warning at a repair that cannot run ([05487a2](https://github.com/MikeGrier/tpu-rs/commit/05487a2be892b2f62340489b5162b1af4c1c3b58))
+* **mcp:** lock the remaining single-file mutators, correct the locking note ([798fe6d](https://github.com/MikeGrier/tpu-rs/commit/798fe6de3e64300cdfdc8654b506b2bfc19e4bc8))
+* **replace:** escape non-ASCII in the CLI changed-line rendering ([ace617b](https://github.com/MikeGrier/tpu-rs/commit/ace617b5ac4ee88f0b39234c75cddc8594e7065f))
+* **replace:** make count previews answer the write question ([6dc7aa7](https://github.com/MikeGrier/tpu-rs/commit/6dc7aa7a41d8ab541c265627cdd0b391e3fbbe21))
+* **replace:** normalize replacements in apply and reject per-op batch options ([a8debdd](https://github.com/MikeGrier/tpu-rs/commit/a8debdd5d271411d4a677b9f483facf0e65d0a78))
+* **replace:** refuse an empty literal pattern in every front end ([e6ace52](https://github.com/MikeGrier/tpu-rs/commit/e6ace52ceec44c8a7546e5cdd798f063dde25fd0))
+* **replace:** surface would_write to CLI clients and stop defaulting details in count mode ([1914b00](https://github.com/MikeGrier/tpu-rs/commit/1914b00c91ece88099cb8362c3e0ecb8dd4eb53d))
+* restore the eol remedy, warn on CLI replace, and report unresolved over MCP ([e662c95](https://github.com/MikeGrier/tpu-rs/commit/e662c953d0fc69f6d914fbbe9ee5df3ba5634bea))
+* stop treating a transient AV error as file absence ([5c468aa](https://github.com/MikeGrier/tpu-rs/commit/5c468aa40b355ad319e8174d6e447809f27b9cf7))
+
+
+### Code Refactoring
+
+* remove cmd::describe and git::line_ending_counts ([f879583](https://github.com/MikeGrier/tpu-rs/commit/f8795832b584960ebddae80771cf5cb87c255841))
+
 ## [5.0.0](https://github.com/MikeGrier/tpu-rs/compare/v4.1.0...v5.0.0) (2026-09-14)
 
 
