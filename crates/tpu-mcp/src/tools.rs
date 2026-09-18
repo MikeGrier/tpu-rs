@@ -1846,8 +1846,10 @@ pub fn list() -> Value {
                     "git_root": {
                         "type": "string",
                         "description":
-                            "Optional absolute path to pin Git repository context. Repository \
-                             discovery is automatic when omitted. Doctor reports files whose \
+                            "Optional legacy repository hint retained for compatibility. It does \
+                             NOT pin repository context: a scan can span several repositories, so \
+                             policy is discovered per file from its own nearest repository. \
+                             Doctor reports files whose \
                              on-disk line endings differ from git's expected convention \
                              (per .gitattributes / core.autocrlf / core.eol) via an \
                              `eol_mismatch` field."
@@ -6805,6 +6807,10 @@ mod integration_tests {
             status["would_write"], true,
             "but the terminators would change: {status}"
         );
+        // `after` is the census the write *would* produce, not a copy of
+        // `before` -- that is what makes a preview worth reading.
+        assert_eq!(status["line_endings"]["before"]["dominant"], "LF");
+        assert_eq!(status["line_endings"]["after"]["dominant"], "CRLF");
         assert_eq!(fs::read(&f).unwrap(), b"a\nb\n", "a count must not write");
     }
 

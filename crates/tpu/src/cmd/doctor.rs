@@ -328,7 +328,8 @@ pub struct DoctorReport {
 }
 
 impl DoctorReport {
-    /// Number of flagged files (mojibake- or encoding-invalid).  Excludes
+    /// Number of flagged files: mojibake-suspected, invalid in their detected
+    /// encoding, or carrying a git line-ending mismatch.  Excludes
     /// marker-suppression-only entries (see [`DoctorIssue::is_problem`]).
     pub fn total_issues(&self) -> usize {
         self.issues.iter().filter(|i| i.is_problem()).count()

@@ -238,8 +238,9 @@ pub struct ReplaceOutcome {
     /// Terminator census of the file as it was read.
     pub before: crate::TextLayout,
     /// Terminator census of the file as written — or as it *would* be written
-    /// under `dry_run` / `count_only`. Equal to `before` when no write
-    /// happened.
+    /// under `dry_run` / `count_only`, which is the whole point of reporting it
+    /// for a preview. Equal to `before` only when nothing would be rewritten:
+    /// no substitution matched and no `line_ending_override` was given.
     pub after: crate::TextLayout,
     /// Per-line before/after images, when [`ReplaceOptions::changed_lines`]
     /// asked for them.
