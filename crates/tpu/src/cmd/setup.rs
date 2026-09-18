@@ -193,7 +193,9 @@ differences.
   matches
   zero times without its own `allow_no_match: true`, the **whole batch** is
   refused and the file is left untouched, so a batch can never leave a
-  half-transformed file. That refusal is *unconditional* for a real write:
+  half-transformed file. `count: true` and `dry_run: true` are exempt — they
+  write nothing, so zero is a legitimate answer and the preview succeeds with
+  the tally. That refusal is *unconditional* for a real write:
   unlike the single-op form, a `line_ending` override does **not** exempt it,
   because converting terminators says nothing about whether your patterns
   were right. The response carries the per-op tally as

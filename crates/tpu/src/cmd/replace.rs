@@ -21,10 +21,10 @@
 //! When the pattern matches zero times, no `line_ending_override` is set,
 //! and the caller is not asking for a count-only or dry-run preview,
 //! [`run`] returns a [`ReplaceOutcome`] whose `total()` is 0 and whose
-//! `wrote`/`would_write` are false, without rewriting the file: no
-//! `materialize`, no atomic rewrite, no `<file>.bak`, no mtime bump.  (The
-//! file is still read and decoded -- that is how the count is known -- so
-//! this is a write short-circuit, not a read one.)  This makes an unmatched
+//! `wrote`/`would_write` are false, without rewriting the file: no atomic
+//! rewrite, no `<file>.bak`, no mtime bump.  The file is still read,
+//! materialised, and decoded -- that is how the count is known -- so this is a
+//! write short-circuit, not a read one.  It makes an unmatched
 //! pattern observably distinct from a real edit at the file-system level,
 //! and avoids one wasted full-file rewrite per call whose result would have
 //! been byte-identical.
@@ -387,6 +387,9 @@ pub struct ReplaceOp<'a> {
 /// the entire batch and leaves the file untouched — a mis-anchored pattern in
 /// the middle of a rename is exactly the mistake a silent no-op hides, and
 /// unlike the single-op path there is no caller left to notice it per-op.
+/// The refusal applies to real writes only: `count_only` and `dry_run` are
+/// introspection modes where zero is a legitimate answer, so they report the
+/// zero count and succeed.
 ///
 /// [`ChangedRegion`] echoes are deliberately not offered here: a region's line
 /// numbers refer to the buffer as that op saw it, and once an earlier op has
@@ -1177,6 +1180,29 @@ mod tests {
 
     /// `regex`/`multiline` are per-op in a batch. Silently dropping them gave
     /// a caller literal, non-multiline matching after asking for the opposite.
+    /// A preview writes nothing, so a zero match is a legitimate answer rather
+    /// than the mis-anchored pattern the real-write refusal guards against.
+    #[test]
+    fn run_batch_previews_do_not_refuse_a_zero_match() {
+        for opts in [
+            ReplaceOptions {
+                count_only: true,
+                ..Default::default()
+            },
+            ReplaceOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        ] {
+            let f = scratch("alpha\n");
+            let outcome = run_batch(f.path(), &[batch_op("nowhere", b"X")], None, opts)
+                .expect("a preview must report zero, not refuse");
+            assert_eq!(outcome.total(), 0);
+            assert!(!outcome.wrote);
+            assert_eq!(fs::read_to_string(f.path()).unwrap(), "alpha\n");
+        }
+    }
+
     #[test]
     fn run_batch_refuses_options_that_are_per_op() {
         let f = scratch("alpha\n");
