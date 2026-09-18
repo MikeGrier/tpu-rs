@@ -40,7 +40,7 @@ impl DataFormat {
             "base64" => Ok(Self::Base64),
             "encoded" => Ok(Self::Encoded),
             other => Err(format!(
-                "unrecognised data_format value {other:?}; expected hex, base64, or encoded"
+                "unrecognised format value {other:?}; expected hex, base64, or encoded"
             )),
         }
     }
