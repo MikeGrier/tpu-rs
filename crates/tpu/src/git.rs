@@ -904,7 +904,10 @@ pub fn line_ending_name(le: LineEnding) -> &'static str {
 /// `remedy` is appended verbatim so each front end can name its own repair
 /// route (`tpu doctor --fix=eol` for the CLI, `tpu_doctor` for MCP).
 pub fn write_warning(file: &Path, remedy: &str) -> Option<String> {
-    let bytes = std::fs::read(file).ok()?;
+    // Retried: this runs immediately after an atomic write, inside the window
+    // where Defender can still hold the file. A bare `.ok()?` there reads as
+    // "conforming" and drops the warning the caller asked for.
+    let bytes = crate::retry_io(|| std::fs::read(file)).ok()?;
     // Resolve policy once and analyse through it: a BOM-less UTF-16 file whose
     // encoding is declared by `working-tree-encoding` has its CRLF pairs split
     // into lone CR and lone LF by a byte-level scan, which would report every

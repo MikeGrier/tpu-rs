@@ -24,7 +24,7 @@ pub use tpu::git;
 pub use tpu::{
     TextLayout, atomic_create_new, atomic_write, open_as_branch, open_source, path_exists,
     read_raw_bytes, read_text_file, recover_stranded_backup, retry_io, source_from_branch,
-    source_from_branch_with_policy,
+    source_from_branch_with_policy, try_path_exists,
 };
 
 /// Emit the before/after line-ending census for a replace.

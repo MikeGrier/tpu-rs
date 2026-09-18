@@ -2737,7 +2737,9 @@ fn call_edit_file(args: &Value, config: &ServerConfig) -> ToolResult {
                         }
                     }
                 }
-                first.map(parse_data_format).transpose()?
+                first
+                    .map(|s| parse_data_format("data_format", s))
+                    .transpose()?
             } else {
                 None
             };
@@ -4230,8 +4232,14 @@ fn flatten_validate_pairs(validates: &[Value]) -> Result<Vec<String>, Box<dyn st
 }
 
 /// Parse a data-format name into a [`tpu::data_format::DataFormat`] value.
-fn parse_data_format(s: &str) -> Result<tpu::data_format::DataFormat, Box<dyn std::error::Error>> {
-    tpu::data_format::DataFormat::from_name(s).map_err(Into::into)
+///
+/// `key` names the argument the value came from, so an invalid
+/// `pattern_format` does not report a `data_format` the caller never sent.
+fn parse_data_format(
+    key: &str,
+    s: &str,
+) -> Result<tpu::data_format::DataFormat, Box<dyn std::error::Error>> {
+    tpu::data_format::DataFormat::from_name(s).map_err(|e| format!("{key}: {e}").into())
 }
 
 /// Resolve a text payload argument, honouring an optional `{key}_format`
@@ -4253,7 +4261,7 @@ fn decode_content_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::er
     let format_key = format!("{key}_format");
     let text = match optional_format_str(args, &format_key)? {
         Some(fmt_str) => {
-            let fmt = parse_data_format(fmt_str)?;
+            let fmt = parse_data_format(&format_key, fmt_str)?;
             let raw = require_str(args, key)?;
             let bytes =
                 tpu::data_format::decode(&fmt, raw).map_err(|e| format!("{format_key}: {e}"))?;
@@ -4273,7 +4281,7 @@ fn decode_pattern_arg(args: &Value, key: &str) -> Result<String, Box<dyn std::er
     let format_key = format!("{key}_format");
     match optional_format_str(args, &format_key)? {
         Some(fmt_str) => {
-            let fmt = parse_data_format(fmt_str)?;
+            let fmt = parse_data_format(&format_key, fmt_str)?;
             let raw = require_str(args, key)?;
             let bytes =
                 tpu::data_format::decode(&fmt, raw).map_err(|e| format!("{format_key}: {e}"))?;
@@ -4315,7 +4323,7 @@ fn decode_replacement_arg(args: &Value) -> Result<String, Box<dyn std::error::Er
                      exact bytes, or expand_escapes alone on a plain-text replacement)."
                     .into());
             }
-            let fmt = parse_data_format(fmt_str)?;
+            let fmt = parse_data_format("replacement_format", fmt_str)?;
             let raw = require_str(args, "replacement")?;
             let bytes = tpu::data_format::decode(&fmt, raw)
                 .map_err(|e| format!("replacement_format: {e}"))?;

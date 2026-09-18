@@ -580,23 +580,29 @@ pub fn acquire_write_lock(file: &Path) -> Option<WriteLock> {
     }
 }
 
-/// Existence check that does not mistake a transient AV error for absence.
+/// Existence probe that reports *why* it could not answer.
 ///
 /// [`Path::exists`] is `fs::metadata(..).is_ok()`, so a Defender sharing
-/// violation on a just-written file reads as "not there" — and every caller
-/// here uses existence to decide whether to do the *careful* thing (capture
-/// old bytes for the mojibake guard, detect an existing file's encoding,
-/// refuse to clobber). A false negative silently takes the cheap branch.
-///
-/// `NotFound` is answered immediately; anything else goes through
-/// [`retry_io`], and a probe that never succeeds answers `true`, so the
-/// caller's careful branch runs and fails loudly rather than being skipped.
-pub fn path_exists(path: &Path) -> bool {
+/// violation on a just-written file reads as "not there". Only `NotFound`
+/// means absent here; anything else is retried via [`retry_io`] and then
+/// surfaced, so a caller can decide rather than guess.
+pub fn try_path_exists(path: &Path) -> io::Result<bool> {
     match retry_io(|| fs::metadata(path)) {
-        Ok(_) => true,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(_) => true,
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
     }
+}
+
+/// [`try_path_exists`] for callers whose `true` branch is the careful one.
+///
+/// An unresolved probe answers `true`, so the caller captures old bytes,
+/// detects the existing file's encoding, or refuses to clobber — and fails
+/// loudly downstream if the file really is unreadable. Callers whose `true`
+/// branch *skips* work must use [`try_path_exists`] instead: there, a wrong
+/// `true` silently does nothing at all.
+pub fn path_exists(path: &Path) -> bool {
+    try_path_exists(path).unwrap_or(true)
 }
 
 /// Retry a closure that returns [`io::Result<T>`] up to 5 retries on transient
@@ -650,6 +656,19 @@ fn is_transient_io_error(e: &io::Error) -> bool {
 #[cfg(test)]
 mod path_exists_tests {
     use super::*;
+
+    /// The two probes must disagree on an unresolved error, because their
+    /// callers want opposite defaults: `path_exists` guards work that should
+    /// happen, `try_path_exists` guards work that should be skipped.
+    #[test]
+    fn the_two_probes_diverge_on_an_unresolved_error() {
+        let bad = std::path::PathBuf::from("bad\0name");
+        assert!(path_exists(&bad), "conservative: assume it is there");
+        assert!(
+            try_path_exists(&bad).is_err(),
+            "explicit: let the caller decide"
+        );
+    }
 
     #[test]
     fn path_exists_answers_for_a_present_and_an_absent_file() {

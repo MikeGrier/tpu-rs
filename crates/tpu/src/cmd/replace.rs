@@ -29,6 +29,13 @@
 //! and avoids one wasted full-file rewrite per call whose result would have
 //! been byte-identical.
 //!
+//! One exception applies to *every* mode, previews included: opening the file
+//! runs [`crate::recover_stranded_backup`], so a `<file>.bak` left behind by a
+//! previously crashed write is restored over the file and consumed.  That is a
+//! repair of an earlier operation, not an effect of this one, and it
+//! deliberately happens before any read so a preview describes the same
+//! content a subsequent write would see.
+//!
 //! When `line_ending_override` is set, the short-circuit is skipped: the
 //! override is itself a real change to the file even with zero
 //! substitutions (CRLF -> LF etc.), so the normal write path runs.
@@ -602,9 +609,9 @@ fn op_format(
 ) -> Result<Option<crate::data_format::DataFormat>, String> {
     match entry.get(key) {
         None | Some(serde_json::Value::Null) => Ok(None),
-        Some(serde_json::Value::String(s)) => {
-            crate::data_format::DataFormat::from_name(s).map(Some)
-        }
+        Some(serde_json::Value::String(s)) => crate::data_format::DataFormat::from_name(s)
+            .map(Some)
+            .map_err(|e| format!("'{key}': {e}")),
         Some(other) => Err(format!(
             "'{key}' must be a JSON string naming a data format, got {other}"
         )),

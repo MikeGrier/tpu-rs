@@ -358,7 +358,9 @@ fn copy_one(
         report.skipped += 1;
         return Ok(());
     }
-    if crate::path_exists(dst) && !opts.overwrite {
+    // A probe failure must not read as "exists": that would skip the copy and
+    // report success.
+    if crate::try_path_exists(dst)? && !opts.overwrite {
         report.skipped += 1;
         return Ok(());
     }
@@ -411,7 +413,7 @@ fn copy_one(
                     // rename.  A truly atomic "rename-if-not-exists" is not
                     // portable, but this avoids the obvious concurrent-creator
                     // case without adding platform-specific syscalls.
-                    if !opts.overwrite && crate::path_exists(dst) {
+                    if !opts.overwrite && crate::try_path_exists(dst)? {
                         let _ = fs::remove_file(&tmp);
                         report.skipped += 1;
                         return Ok(());
