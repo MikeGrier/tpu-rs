@@ -246,8 +246,11 @@ pub struct ReplaceOutcome {
     pub before: crate::TextLayout,
     /// Terminator census of the file as written — or as it *would* be written
     /// under `dry_run` / `count_only`, which is the whole point of reporting it
-    /// for a preview. Equal to `before` only when nothing would be rewritten:
-    /// no substitution matched and no `line_ending_override` was given.
+    /// for a preview. This counts terminators only, so it is equal to `before`
+    /// for any substitution that leaves line endings alone — `alpha` → `ALPHA`
+    /// rewrites the file and reports an unchanged census. Use
+    /// [`Self::would_write`] to ask whether bytes change; this field answers
+    /// only whether the *line endings* do.
     pub after: crate::TextLayout,
     /// Per-line before/after images, when [`ReplaceOptions::changed_lines`]
     /// asked for them.
@@ -264,8 +267,9 @@ pub struct ReplaceOutcome {
     pub wrote: bool,
     /// Whether the resulting bytes differ from what is on disk.
     ///
-    /// Equal to [`Self::wrote`] for a real run; under `dry_run` it is the
-    /// answer `wrote` cannot give. Callers deriving "would anything change"
+    /// Equal to [`Self::wrote`] for a real run; under either preview mode
+    /// (`dry_run` or `count_only`, neither of which writes) it is the answer
+    /// `wrote` cannot give. Callers deriving "would anything change"
     /// must use this rather than an empty diff: the diff is computed in
     /// LF-normalised space, where a pure line-ending rewrite looks identical.
     pub would_write: bool,
@@ -1189,6 +1193,32 @@ mod tests {
     /// a caller literal, non-multiline matching after asking for the opposite.
     /// A preview writes nothing, so a zero match is a legitimate answer rather
     /// than the mis-anchored pattern the real-write refusal guards against.
+    /// The census counts terminators only, so an ordinary substitution
+    /// rewrites the file while leaving `before` and `after` identical.
+    /// `would_write` is the field that tells those apart.
+    #[test]
+    fn an_ordinary_substitution_leaves_the_terminator_census_unchanged() {
+        let f = scratch("alpha\nbeta\n");
+        let outcome = run(
+            f.path(),
+            "alpha",
+            b"ALPHA",
+            None,
+            None,
+            ReplaceOptions::default(),
+        )
+        .expect("replace");
+
+        assert!(outcome.wrote, "the file was rewritten");
+        assert!(outcome.would_write);
+        assert_eq!(
+            (outcome.before.lf, outcome.before.crlf, outcome.before.cr),
+            (outcome.after.lf, outcome.after.crlf, outcome.after.cr),
+            "yet the census is unchanged, which is what it measures",
+        );
+        assert_eq!(fs::read_to_string(f.path()).unwrap(), "ALPHA\nbeta\n");
+    }
+
     #[test]
     fn run_batch_previews_do_not_refuse_a_zero_match() {
         for opts in [
