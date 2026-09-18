@@ -583,13 +583,23 @@ pub fn acquire_write_lock(file: &Path) -> Option<WriteLock> {
 /// Existence probe that reports *why* it could not answer.
 ///
 /// [`Path::exists`] is `fs::metadata(..).is_ok()`, so a Defender sharing
-/// violation on a just-written file reads as "not there". Only `NotFound`
-/// means absent here; anything else is retried via [`retry_io`] and then
-/// surfaced, so a caller can decide rather than guess.
+/// violation on a just-written file reads as "not there". Here only a
+/// definitively absent path is `Ok(false)`: `NotFound`, and `NotADirectory`
+/// for a path whose parent is a plain file — which cannot contain the target,
+/// and which Windows already reports as `NotFound`. Anything else is retried
+/// via [`retry_io`] and then surfaced, so a caller can decide rather than
+/// guess.
 pub fn try_path_exists(path: &Path) -> io::Result<bool> {
     match retry_io(|| fs::metadata(path)) {
         Ok(_) => Ok(true),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            Ok(false)
+        }
         Err(e) => Err(e),
     }
 }
@@ -656,6 +666,23 @@ fn is_transient_io_error(e: &io::Error) -> bool {
 #[cfg(test)]
 mod path_exists_tests {
     use super::*;
+
+    /// A path under a plain file cannot exist. Unix reports `NotADirectory`
+    /// where Windows reports `NotFound`, and treating that as an error made
+    /// `copy` fail a destination it should simply have created.
+    #[test]
+    fn a_path_below_a_plain_file_is_absent_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("blocker");
+        fs::write(&blocker, b"not a directory").unwrap();
+
+        let under = blocker.join("child.txt");
+        assert_eq!(
+            try_path_exists(&under).expect("must answer, not error"),
+            false
+        );
+        assert!(!path_exists(&under));
+    }
 
     /// The two probes must disagree on an unresolved error, because their
     /// callers want opposite defaults: `path_exists` guards work that should

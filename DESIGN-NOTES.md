@@ -1039,3 +1039,29 @@ bounded by `atomic_write` — the loser's content wins wholesale rather than the
 file being interleaved or truncated — but it is a genuine lost update.
 
 Revisit this as its own change, with the two-process harness built first.
+
+### Stranded-backup recovery is deliberately unlocked
+
+`recover_stranded_backup` renames `<file>.bak` back over `<file>` when the file
+is missing and the backup is not.  It is a *mutation*, and it runs unlocked —
+including from `open_as_branch`, so every read and every preview performs it.
+
+The window this leaves is narrow and real: the atomic swap renames
+`<file>` → `<file>.bak` before persisting the temp file, so a concurrent reader
+can observe "file missing, backup present" mid-write and recover from a backup
+the writer is still relying on as its rollback.  The writer's own persist then
+wins, so the file content is correct, but that writer no longer has a `.bak` if
+it subsequently fails.
+
+Taking the write lock inside recovery is not the fix.  `cmd::write`,
+`cmd::append`, and `cmd::edit` call recovery *at the top of their own
+mutations*, which on the MCP server already run inside `acquire_write_lock` for
+that same path.  A second acquire would contend with the caller's own lock,
+spin to `LOCK_WAIT_CAP`, and — since locking is best-effort — proceed unlocked
+anyway.  Closing this properly needs a reentrancy-aware lock, which is the same
+work the CLI-locking item above defers.
+
+Recovery stays unlocked and best-effort because the alternative is worse: a
+file stranded at `<file>.bak` by a crashed write is unreadable until something
+recovers it, and making that conditional on acquiring a lock would leave the
+data inaccessible in exactly the situation it exists to rescue.
